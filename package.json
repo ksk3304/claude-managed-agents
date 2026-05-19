@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Self-hosted Claude Managed Agent runner on Cloudflare using the Sandbox SDK",
+  "description": "Self-hosted Claude Managed Agent control plane on Cloudflare using the Sandbox SDK",
   "scripts": {
     "deploy": "npm run build && wrangler deploy",
     "postdeploy": "npm run db:migrate:remote",

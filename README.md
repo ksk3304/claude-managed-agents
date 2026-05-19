@@ -1,16 +1,16 @@
 # Claude Managed Agents on Cloudflare
 
-Run Claude Managed Agents on Cloudflare.
+Run Claude Managed Agents (CMA) on Cloudflare.
 
 This repo provides a customizable control plane that allows you to:
-- Run sandboxes on full containers or light-weight isolates
+- Run CMA sandboxes on both full containers and light-weight isolates
 - Customize the container size and image your agents use
 - Get better observability into agent sandboxes
-- Apply custom egress controls for zero-trust credential injection and connectivity to private services over Workers VPC
-- Extend your Agents with [Browser Run](https://developers.cloudflare.com/browser-run), [Email](https://developers.cloudflare.com/email-service/), and other custom tools using the [Cloudflare Developer Platform](https://workers.cloudflare.com/products#all)
+- Apply custom egress controls for [zero-trust credential injection](https://blog.cloudflare.com/sandbox-auth/) and connectivity to private services over [Workers VPC](https://developers.cloudflare.com/workers-vpc/)
+- Extend your Agents with [Browser Run](https://developers.cloudflare.com/browser-run), [Email](https://developers.cloudflare.com/email-service/), and any other custom tools using the [Cloudflare Developer Platform](https://workers.cloudflare.com/products#all)
  your needs.
 
-Follow the Onboarding Guide to get started.
+Follow the [Onboarding Guide](#onboarding-guide) to get started.
 
 > **You need a Paid or Enterprise Cloudflare account to run Managed Agents.**
 > [Cloudflare Containers](https://developers.cloudflare.com/containers/)
