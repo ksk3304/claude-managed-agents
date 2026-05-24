@@ -544,14 +544,21 @@ export async function recordSentMessage(
   sessionId: string,
   agentId: string,
   toAddr: string,
+  rfc822MessageId?: string,
 ): Promise<void> {
+  // `rfc822_msgid` is optional so existing Cloudflare Email Routing
+  // callers (which only know the cf_email_send-issued message_id) stay
+  // unchanged. AgentMail bridge callers pass the normalized RFC 822
+  // Message-ID so inbound In-Reply-To / References routing can find it
+  // through `findSessionByRfc822MessageId`.
+  const rfc822 = rfc822MessageId && rfc822MessageId.length > 0 ? rfc822MessageId : null;
   await db
     .prepare(
       `INSERT OR REPLACE INTO sent_messages
-         (message_id, session_id, agent_id, to_addr, sent_at_ms)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
+         (message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
     )
-    .bind(messageId, sessionId, agentId, toAddr, Date.now())
+    .bind(messageId, sessionId, agentId, toAddr, Date.now(), rfc822)
     .run();
 }
 
@@ -567,6 +574,29 @@ export async function findSessionByMessageId(
       `SELECT session_id, agent_id FROM sent_messages WHERE message_id = ?`,
     )
     .bind(messageId)
+    .first<{ session_id: string; agent_id: string }>();
+  if (!row) return null;
+  return { sessionId: row.session_id, agentId: row.agent_id };
+}
+
+// AgentMail bridge path: look up by the RFC 822 Message-ID we put in
+// the outbound `Message-ID:` header. This is the column inbound
+// `In-Reply-To` / `References` values match against — distinct from
+// the cf_email_send `message_id` PK that `findSessionByMessageId` uses.
+//
+// Caller is expected to normalize the input id (lowercase, strip angle
+// brackets) before passing — the column stores the normalized form.
+// Returns null when no match.
+export async function findSessionByRfc822MessageId(
+  db: D1Database,
+  rfc822MessageId: string,
+): Promise<{ sessionId: string; agentId: string } | null> {
+  const row = await db
+    .prepare(
+      `SELECT session_id, agent_id FROM sent_messages
+         WHERE rfc822_msgid = ?`,
+    )
+    .bind(rfc822MessageId)
     .first<{ session_id: string; agent_id: string }>();
   if (!row) return null;
   return { sessionId: row.session_id, agentId: row.agent_id };
