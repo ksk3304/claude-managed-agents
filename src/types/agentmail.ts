@@ -155,9 +155,16 @@ export type AgentMailMessageReceivedEvent = AgentMailWebhookEvent<{
  * (line ~3776) plus continuation thread heads (`in_reply_to_message_id`).
  */
 export interface EmailSendMarker {
-  /** Recipient list. Must be non-empty. */
-  to: string[];
+  /**
+   * Single recipient email address. The Python parser at
+   * `cma_gchat_bot.py:_handle_email_send_marker` (Round 3 O3) enforces
+   * single-string `to` and rejects arrays — the bridge follows that
+   * contract so on-the-wire behaviour is identical.
+   */
+  to: string;
+  /** Already-normalized to string[]; the JSON may carry string or list. */
   cc?: string[];
+  /** Already-normalized to string[]; the JSON may carry string or list. */
   bcc?: string[];
   subject: string;
   /** Plain-text body. The bridge does not synthesize HTML. */
