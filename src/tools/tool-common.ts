@@ -24,6 +24,8 @@
  * Source-of-truth: `scripts/cma_lib.py` (lines noted per function below).
  */
 
+import { assertBridgeEgressAllowed } from '../lib/egress-guard';
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_5XX_RETRIES = 2;
 const DEFAULT_5XX_BACKOFF_MS = [1_000, 3_000];
@@ -243,6 +245,11 @@ export async function googleApiFetch(
   init: RequestInit,
   options: GoogleApiFetchOptions,
 ): Promise<Response> {
+  // Egress hard-allowlist (層 8). Throws BridgeEgressDeniedError if
+  // the URL hostname drifts out of MAKOTO_BRIDGE_EGRESS_ALLOWLIST.
+  // Surfaces as a tool-side failure so the agent sees the denial
+  // verbatim and we don't quietly call an un-audited host.
+  assertBridgeEgressAllowed(url, 'tool-common:googleApiFetch');
   const fetcher = options.fetcher ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const backoffSchedule = options.backoffMsSchedule ?? DEFAULT_5XX_BACKOFF_MS;

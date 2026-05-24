@@ -26,6 +26,7 @@ import type {
   AgentMailMessage,
   EmailSendAttachment,
 } from '../types/agentmail';
+import { assertBridgeEgressAllowed } from './egress-guard';
 
 const DEFAULT_BASE_URL = 'https://api.agentmail.to/v0';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -200,6 +201,10 @@ export class AgentMailClient {
     body?: unknown,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    // Egress hard-allowlist (層 8). Caught + re-thrown as-is — the
+    // outer dispatcher logs and skips the marker if AgentMail's host
+    // somehow drifts off the allowlist.
+    assertBridgeEgressAllowed(url, 'agentmail-api:request');
     let attempt = 0;
     while (true) {
       attempt += 1;

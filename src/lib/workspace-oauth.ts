@@ -22,6 +22,7 @@ import {
   putRefreshToken,
   deleteRefreshToken,
 } from './oauth-vault';
+import { assertBridgeEgressAllowed } from './egress-guard';
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
@@ -117,6 +118,10 @@ export async function getAccessToken(
 
   // Exchange with Google.
   const fetchImpl = deps.fetchImpl ?? fetch;
+  // Egress hard-allowlist (層 8). `GOOGLE_TOKEN_URL` is the constant
+  // `oauth2.googleapis.com/token`; the check is here so a future
+  // overridable-URL refactor doesn't silently leak.
+  assertBridgeEgressAllowed(GOOGLE_TOKEN_URL, 'workspace-oauth:refresh');
   const params = new URLSearchParams({
     grant_type: 'refresh_token',
     client_id: deps.clientId,
@@ -214,6 +219,9 @@ export async function revokeUser(
   if (refreshToken) {
     const fetchImpl = deps.fetchImpl ?? fetch;
     const params = new URLSearchParams({ token: refreshToken });
+    // Egress hard-allowlist (層 8). Same rationale as the refresh
+    // path above.
+    assertBridgeEgressAllowed(GOOGLE_REVOKE_URL, 'workspace-oauth:revoke');
     const resp = await fetchImpl(`${GOOGLE_REVOKE_URL}?${params.toString()}`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
