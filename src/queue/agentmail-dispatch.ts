@@ -365,17 +365,20 @@ function buildInitialUserMessage(msg: AgentMailMessage, isContinuationByDepth: b
 }
 
 /**
- * Pull `data.inbox_id` out of the webhook envelope, accepting both
- * snake_case and camelCase since AgentMail's serialization is not
- * always consistent. Returns empty string when absent.
+ * Pull `inbox_id` out of the webhook envelope. AgentMail payload format
+ * (https://docs.agentmail.to/events): `inbox_id` lives at
+ * `event.message.inbox_id`, not `event.data.inbox_id` (earlier code was
+ * an unverified fixture, fixed 2026-05-25 with the consumer drift).
+ * Accepts both snake_case and camelCase since serialization can vary.
  */
 function extractInboxId(event: AgentMailDispatchContext['event']): string {
-  const data = (event && typeof event === 'object' ? event.data : null) as
-    | { inbox_id?: unknown; inboxId?: unknown }
+  const eventObj = (event && typeof event === 'object' ? event : null) as
+    | { message?: { inbox_id?: unknown; inboxId?: unknown } }
     | null;
-  if (!data) return '';
+  const msg = eventObj?.message;
+  if (!msg) return '';
   for (const k of ['inbox_id', 'inboxId'] as const) {
-    const v = data[k];
+    const v = (msg as Record<string, unknown>)[k];
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return '';

@@ -121,23 +121,27 @@ export async function handleAgentMailMessage(
   const event = body.event;
 
   // Step 1. Pull the inbound message and its RFC 822 Message-ID.
-  // AgentMail emits multiple event types (`message.received`,
-  // `message.sent`, …); we only act on those that carry a message
-  // payload with an RFC 822 id we can thread-dedupe.
-  const data = (event && typeof event === 'object' ? event.data : null) as
-    | { message?: AgentMailMessage }
+  // AgentMail webhook payload format (verified 2026-05-25 against
+  // https://docs.agentmail.to/events): `{ type: "event", event_type:
+  // "message.received" | ..., event_id, message: {...}, thread: {...} }`
+  // — `message` is at the event root, NOT under `data.message`. The
+  // earlier `data.message` assumption was an unverified fixture
+  // (Issue #186 cutover bug, fixed 2026-05-25).
+  const eventObj = (event && typeof event === 'object' ? event : null) as
+    | { event_type?: string; type?: string; message?: AgentMailMessage }
     | null;
-  const inboundMessage = data?.message;
+  const eventType = eventObj?.event_type ?? eventObj?.type;
+  const inboundMessage = eventObj?.message;
   if (!inboundMessage) {
     console.log(
-      `[agentmail-consumer] skip svixId=${body.svix_id} type=${event?.type} reason=no-message-payload`,
+      `[agentmail-consumer] skip svixId=${body.svix_id} type=${eventType} reason=no-message-payload`,
     );
     return;
   }
   const rfc822 = extractInboundRfc822MessageId(inboundMessage);
   if (!rfc822) {
     console.log(
-      `[agentmail-consumer] skip svixId=${body.svix_id} type=${event?.type} reason=no-rfc822-msgid`,
+      `[agentmail-consumer] skip svixId=${body.svix_id} type=${eventType} reason=no-rfc822-msgid`,
     );
     return;
   }

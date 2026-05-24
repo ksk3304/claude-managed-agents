@@ -89,7 +89,14 @@ export type AgentMailEventType =
  */
 export interface AgentMailMessage {
   /** AgentMail-opaque message id. */
-  id: string;
+  id?: string;
+  /**
+   * RFC 822 Message-ID. AgentMail webhook payload sends this as `message_id`
+   * (verified 2026-05-25 against https://docs.agentmail.to/events) — the
+   * `id` / `rfc822_message_id` field names were unverified fixtures from
+   * Phase 6 implementation.
+   */
+  message_id?: string;
   /**
    * Normalized RFC 822 Message-ID (angle brackets stripped). May be
    * absent on very old outbound rows (backwards-compat per

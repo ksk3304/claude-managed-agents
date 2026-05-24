@@ -155,6 +155,13 @@ export function extractBody(msg: AgentMailMessage): string {
  * the contract dedupe callers expect ("can't claim, must skip").
  */
 export function extractInboundRfc822MessageId(msg: AgentMailMessage): string {
+  // AgentMail webhook payload sends RFC 822 Message-ID as `message_id`
+  // (verified 2026-05-25 against https://docs.agentmail.to/events).
+  // `rfc822_message_id` was the unverified fixture field; kept as fallback
+  // for outbound rows / older code paths.
+  if (typeof msg.message_id === 'string' && msg.message_id.length > 0) {
+    return normalizeMessageId(msg.message_id);
+  }
   if (typeof msg.rfc822_message_id === 'string' && msg.rfc822_message_id.length > 0) {
     return normalizeMessageId(msg.rfc822_message_id);
   }
