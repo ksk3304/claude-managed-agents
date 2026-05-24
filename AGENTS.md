@@ -1,3 +1,7 @@
+# Claude Managed Agents
+
+For all design and implementation work on Claude Managed Agents, refer to Anthropic's official documentation first.
+
 # Cloudflare Workers
 
 STOP. Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any Workers, KV, R2, D1, Durable Objects, Queues, Vectorize, AI, or Agents SDK task.
