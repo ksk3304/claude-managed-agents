@@ -9,8 +9,8 @@ import { handleAgentMailWebhook } from "./webhooks/agentmail";
 import {
   handleAgentMailQueue,
   type AgentMailDispatcher,
-  defaultDispatcher,
 } from "./queue/agentmail-consumer";
+import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { isSessionId } from "./helpers";
@@ -50,10 +50,14 @@ export {
   ThreadLock,
 };
 
-// Layer 7 will swap in the real dispatcher (= session create + event
-// stream + EMAIL_SEND + AgentMail send + redactor). Until then the
-// default stub commits the claim so consumer retries don't loop.
-const agentmailDispatcher: AgentMailDispatcher = defaultDispatcher;
+// Layer 7-3 wire-up: route AgentMail Queue deliveries through the real
+// session / tool-dispatch / EMAIL_SEND pipeline. `agentmailDispatch`
+// owns sender resolution, sessions.create or thread continuation,
+// `agent.custom_tool_use` self-dispatch via the MAKOTO tool router,
+// EMAIL_SEND marker parsing, redactor scrub, and AgentMail send +
+// `sent_messages` recording. The framing layer (consumer) still owns
+// claim / lease / DO lock / commit_done.
+const agentmailDispatcher: AgentMailDispatcher = agentmailDispatch;
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
