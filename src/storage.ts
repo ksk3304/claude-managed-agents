@@ -676,3 +676,55 @@ export async function touchThread(
     .bind(agentId, counterparty, Date.now())
     .run();
 }
+
+// ----------------------------------------------------------------------------
+// AgentMail webhook transport-level dedupe.
+//
+// Records every svix delivery id we've handled. The webhook handler does
+// INSERT-OR-IGNORE on first sight, fast-paths 200 on duplicates. Kept
+// separate from `dedupe` (application-level RFC 822 fence) — see
+// `migrations/0003_agentmail_webhook_seen.sql` rationale.
+// ----------------------------------------------------------------------------
+
+const AGENTMAIL_WEBHOOK_SEEN_RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Record an AgentMail svix delivery id. Returns `true` on first sight
+ * (the caller should enqueue), `false` on duplicate (caller should
+ * fast-path 200 without enqueuing).
+ *
+ * Insert-or-ignore is atomic in D1 so the boolean reflects the actual
+ * winner of any parallel webhook deliveries.
+ */
+export async function markAgentMailWebhookSeen(
+  db: D1Database,
+  svixId: string,
+  now: number = Date.now(),
+  retainTtlMs: number = AGENTMAIL_WEBHOOK_SEEN_RETAIN_MS,
+): Promise<boolean> {
+  const ttlExp = now + retainTtlMs;
+  const r = await db
+    .prepare(
+      `INSERT OR IGNORE INTO agentmail_webhook_seen
+         (svix_id, received_at_ms, ttl_expires_at_ms)
+       VALUES (?1, ?2, ?3)`,
+    )
+    .bind(svixId, now, ttlExp)
+    .run();
+  return (r.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * Drop rows past `ttl_expires_at_ms`. Called from the daily cron handler
+ * alongside `pruneExpiredDedupe`.
+ */
+export async function pruneExpiredAgentMailWebhookSeen(
+  db: D1Database,
+  now: number = Date.now(),
+): Promise<number> {
+  const r = await db
+    .prepare(`DELETE FROM agentmail_webhook_seen WHERE ttl_expires_at_ms < ?`)
+    .bind(now)
+    .run();
+  return r.meta?.changes ?? 0;
+}

@@ -37,6 +37,10 @@
     "run_worker_first": [
       "/api/*",
       "/webhooks",
+      // AgentMail inbound webhook (Issue #186). Separate route from
+      // `/webhooks` so the asset router cannot intercept it before the
+      // Worker sees the svix-signed delivery.
+      "/webhooks/agentmail",
       "/ws/*",
       // OpenAPI spec at the conventional root path so CLI / agent
       // tooling can probe `/openapi.json` directly.
@@ -63,6 +67,14 @@
     },
     {
       "binding": "EGRESS_POLICIES",
+      "id": "",
+    },
+    // MAKOTO bridge KV (Issue #186): sender→user_slug→agent_id mapping,
+    // envelope-encrypted OAuth vault entries (`vault:oauth:<user>:*`),
+    // and per-confirm-token TTL nonces. `scripts/ensure-kv.mjs` patches
+    // the real id at prebuild.
+    {
+      "binding": "MAKOTO_KV",
       "id": "",
     },
   ],
@@ -103,6 +115,14 @@
       {
         "class_name": "IsolateRunner",
         "name": "IsolateRunner",
+      },
+      // MAKOTO bridge: per-RFC-822-message exclusion DO. One instance
+      // per thread key (`idFromName(eventKeyForRfc822(...))`) — guards
+      // against two consumers racing to call `sessions.create` +
+      // AgentMail send for the same inbound message.
+      {
+        "class_name": "ThreadLock",
+        "name": "MAKOTO_THREAD_LOCK",
       },
     ],
   },
@@ -159,10 +179,43 @@
       "new_sqlite_classes": ["Sandbox", "IsolateRunner"],
       "tag": "v1",
     },
+    // v2 adds the MAKOTO_THREAD_LOCK exclusion DO (no SQLite — pure
+    // in-memory locks; we still list it in `new_sqlite_classes` so the
+    // platform provisions per-name DO instances).
+    {
+      "new_sqlite_classes": ["ThreadLock"],
+      "tag": "v2",
+    },
   ],
   // Daily cleanup of webhook_events and sessions older than 24h.
+  // The same cron also prunes `dedupe` and `agentmail_webhook_seen`
+  // rows past their 30-day TTL (see `src/index.ts` `scheduled`).
   "triggers": {
     "crons": ["0 4 * * *"],
+  },
+  // Cloudflare Queues for the AgentMail bridge (Issue #186). One
+  // single-purpose queue carries verified webhook deliveries from the
+  // HTTP handler to the long-running consumer. The same Worker is
+  // both producer (handler) and consumer (`queue()` export); Cloudflare
+  // bills the consumer at the worker-invocation rate so there's no
+  // need for a second deploy. `max_batch_size` / `max_retries` are
+  // conservative defaults — tune in `wrangler dev` based on observed
+  // bursts.
+  "queues": {
+    "producers": [
+      {
+        "binding": "MAKOTO_QUEUE",
+        "queue": "makoto-agentmail-events",
+      },
+    ],
+    "consumers": [
+      {
+        "queue": "makoto-agentmail-events",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+      },
+    ],
   },
   // VPC + Mesh — declare bindings here when you want egress policies to be
   // able to attach a VPC service or network to a sandbox.

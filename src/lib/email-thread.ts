@@ -139,3 +139,34 @@ export function extractBody(msg: AgentMailMessage): string {
   }
   return '';
 }
+
+/**
+ * Pull the inbound message's own RFC 822 Message-ID, normalized.
+ *
+ * Lookup order (most-trusted first):
+ *   1. `msg.rfc822_message_id` — populated when AgentMail surfaces the
+ *      parsed RFC 822 header directly.
+ *   2. `msg.headers['message-id']` / `Message-ID` — falls back to the raw
+ *      headers map. Header keys are case-insensitive per RFC 5322; we
+ *      probe both common casings since AgentMail's serialization is not
+ *      consistently lowercased.
+ *
+ * Returns an empty string when no usable id is present. Empty-string is
+ * the contract dedupe callers expect ("can't claim, must skip").
+ */
+export function extractInboundRfc822MessageId(msg: AgentMailMessage): string {
+  if (typeof msg.rfc822_message_id === 'string' && msg.rfc822_message_id.length > 0) {
+    return normalizeMessageId(msg.rfc822_message_id);
+  }
+  const headers = msg.headers;
+  if (headers && typeof headers === 'object') {
+    for (const k of ['message-id', 'Message-ID', 'Message-Id'] as const) {
+      const v = (headers as Record<string, string | string[] | undefined>)[k];
+      const raw = Array.isArray(v) ? v[0] : v;
+      if (typeof raw === 'string' && raw.length > 0) {
+        return normalizeMessageId(raw);
+      }
+    }
+  }
+  return '';
+}

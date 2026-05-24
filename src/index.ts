@@ -5,8 +5,20 @@ import { Sandbox, getSessionSandbox } from "./microvm/sandbox";
 import { IsolateRunner } from "./isolate/runner";
 import { IsolateOutboundGateway } from "./isolate/gateway";
 import { handleWebhook, resolveBackend } from "./webhooks";
+import { handleAgentMailWebhook } from "./webhooks/agentmail";
+import {
+  handleAgentMailQueue,
+  type AgentMailDispatcher,
+  defaultDispatcher,
+} from "./queue/agentmail-consumer";
+import type { AgentMailQueueMessage } from "./webhooks/agentmail";
+import { ThreadLock } from "./durable-objects/thread-lock";
 import { isSessionId } from "./helpers";
-import { pruneOlderThan } from "./storage";
+import {
+  pruneExpiredAgentMailWebhookSeen,
+  pruneOlderThan,
+} from "./storage";
+import { pruneExpiredDedupe } from "./lib/dedupe";
 import { handleEmail, type ForwardableEmailMessage } from "./email-handler";
 
 // `ContainerProxy` must be re-exported from the worker entrypoint — the
@@ -25,7 +37,23 @@ import { handleEmail, type ForwardableEmailMessage } from "./email-handler";
 // `ctx.exports.IsolateOutboundGateway` inside the control plane DO. It's
 // required by the Cloudflare runtime's egress-control pattern — see
 // https://developers.cloudflare.com/dynamic-workers/usage/egress-control/
-export { Sandbox, IsolateRunner, IsolateOutboundGateway, ContainerProxy };
+//
+// `ThreadLock` is the per-RFC-822-message exclusion DO that the
+// AgentMail Queue consumer takes before any `sessions.create` /
+// AgentMail send work. Re-exported so wrangler can bind it; one DO
+// per thread key via `MAKOTO_THREAD_LOCK.idFromName(eventKey)`.
+export {
+  Sandbox,
+  IsolateRunner,
+  IsolateOutboundGateway,
+  ContainerProxy,
+  ThreadLock,
+};
+
+// Layer 7 will swap in the real dispatcher (= session create + event
+// stream + EMAIL_SEND + AgentMail send + redactor). Until then the
+// default stub commits the claim so consumer retries don't loop.
+const agentmailDispatcher: AgentMailDispatcher = defaultDispatcher;
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -39,6 +67,17 @@ export default {
 
     if (url.pathname === "/webhooks" && request.method === "POST") {
       return handleWebhook(request, env);
+    }
+
+    // AgentMail inbound webhook (svix protocol). Distinct from the
+    // Anthropic Console webhook on `/webhooks` — header names differ
+    // (`svix-*` vs `webhook-*`) and the consumer flow goes through
+    // Cloudflare Queues instead of the in-handler `drainWork` path.
+    if (
+      url.pathname === "/webhooks/agentmail" &&
+      request.method === "POST"
+    ) {
+      return handleAgentMailWebhook(request, env);
     }
 
     // PTY terminal WebSocket upgrade. The frontend opens
@@ -174,7 +213,34 @@ export default {
         } catch (error) {
           console.error("[cron] prune failed", error);
         }
+        // AgentMail bridge prunes — kept on the same daily tick so
+        // operators only need to look at one cron when checking
+        // dedupe-table growth. `dedupe` ttl is 30 days,
+        // `agentmail_webhook_seen` is also 30 days (set on insert).
+        try {
+          const dedupePruned = await pruneExpiredDedupe(env.DB);
+          const seenPruned = await pruneExpiredAgentMailWebhookSeen(env.DB);
+          console.log(
+            `[cron] agentmail-prune dedupe=${dedupePruned} webhook_seen=${seenPruned}`,
+          );
+        } catch (error) {
+          console.error("[cron] agentmail prune failed", error);
+        }
       })(),
     );
+  },
+
+  // Cloudflare Queues consumer entrypoint. Bound via
+  // `wrangler.jsonc` `queues.consumers[].queue = "<MAKOTO_QUEUE>"`.
+  // Long-running session / EMAIL_SEND / AgentMail send work runs here
+  // (Queues consumer wall budget = 15 min, CPU = 5 min), well past the
+  // Workers HTTP `waitUntil` 30-second ceiling that constrained the
+  // older Cloud Run path.
+  async queue(
+    batch: MessageBatch<AgentMailQueueMessage>,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    await handleAgentMailQueue(batch, env, ctx, agentmailDispatcher);
   },
 };
