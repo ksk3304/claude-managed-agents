@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "_comment": "INTERNAL_STATE_PATTERNS の単一正本 (Issue #177 Phase 1 中盤 B)。Python (scripts/cma_log_redaction.py) と TS (Phase 2 #186 で実装する src/redact/internal-state.ts) の両言語が import 時にこの JSON を読む。新パターン追加時は本 JSON のみ編集、両言語コードは自動追従。並行して .claude/rules/makoto-kun-verification.md §1.1 危険語句リスト (人手チェック用) も手動同期必須 (= 同 rule §1.1「実行時フィルタとの同期」段参照)。HIT 順序契約: literals 配列順 → regexes 配列順 (本文出現順ではない)、両言語の二段 loop で守る",
+  "literals": [
+    "未 attach",
+    "attach されていません",
+    "attach されていない",
+    "OAuth トークン",
+    "OAuthトークン",
+    "refresh token",
+    "memory store",
+    "workspace-adc-cma",
+    "Secret Manager",
+    "/mnt/memory",
+    "support_memory",
+    "workspace_token_unavailable",
+    "workspace_token",
+    "_DriveToolError",
+    "token_unavailable",
+    "_SheetsToolError",
+    "scope_insufficient",
+    "not attached",
+    "tool not available",
+    "権限不足",
+    "スコープが不足",
+    "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    "insufficient authentication scopes"
+  ],
+  "regexes": [
+    {"name": "learning_md_filename", "pattern": "learning_[A-Za-z0-9_]+\\.md"}
+  ]
+}
