@@ -152,3 +152,123 @@ function describe(v: unknown): string {
   if (Array.isArray(v)) return 'array';
   return typeof v;
 }
+
+// ---------------------------------------------------------------------------
+// cap / gate redaction (port mapping v1 §1 row #23)
+// ---------------------------------------------------------------------------
+
+/**
+ * cap (= tool_call_cap / max_iter / session_watchdog) 到達時に EMAIL_SEND
+ * を送信せず prefix の BCC アドレスだけ伏字化する。Cloud Run の
+ * `_redact_email_send_on_cap` (`cma_gchat_bot.py` l.1486) の TS port。
+ *
+ * 元の logic:
+ *   - cap でなければ素通り
+ *   - EMAIL_SEND marker 検出 → JSON parse → BCC を抽出
+ *   - prefix (= marker 直前まで) の BCC アドレスを `[BCC redacted]` 置換
+ *   - JSON parse 失敗 → BCC 特定不可 → 安全側として prefix 破棄
+ *
+ * 「送信は行わない」「✅ 送信完了」固定サマリは出さない (= 実送信なし)
+ * の表現は呼出側 (= reactive bot dispatcher) で行う。本関数は **prefix
+ * のテキスト変換のみ** を担う。
+ *
+ * Source: scripts/cma_gchat_bot.py l.1486-1524.
+ */
+export const CAP_STOP_REASONS = [
+  'tool_call_cap',
+  'max_iter',
+  'session_watchdog',
+] as const;
+export type CapStopReason = (typeof CAP_STOP_REASONS)[number];
+export const BCC_REDACTED_PLACEHOLDER = '[BCC redacted]';
+
+export interface RedactEmailSendOnCapResult {
+  /** redaction 適用後の prefix (= marker 直前まで、BCC 置換済 or 破棄)。 */
+  redactedPrefix: string;
+  /** cap でない場合は本来の `final_text`、それ以外は redacted prefix。 */
+  finalText: string;
+  /** EMAIL_SEND marker が検出されたか。 */
+  markerFound: boolean;
+  /** cap 判定 (stop_reason が _CAP_STOP_REASONS に含まれるか)。 */
+  isCap: boolean;
+  /** JSON parse 失敗で prefix 破棄したか (Python 安全側挙動)。 */
+  prefixDiscarded: boolean;
+}
+
+export function redactEmailSendOnCap(
+  finalText: string,
+  stopReason: string,
+): RedactEmailSendOnCapResult {
+  const isCap = (CAP_STOP_REASONS as readonly string[]).includes(stopReason);
+  if (!isCap) {
+    return {
+      redactedPrefix: finalText,
+      finalText,
+      markerFound: false,
+      isCap: false,
+      prefixDiscarded: false,
+    };
+  }
+  // module-level regex の lastIndex を踏まないよう per-call instance を作る。
+  const re = new RegExp(EMAIL_SEND_MARKER_RE.source, EMAIL_SEND_MARKER_RE.flags);
+  const match = re.exec(finalText);
+  if (!match) {
+    return {
+      redactedPrefix: finalText,
+      finalText,
+      markerFound: false,
+      isCap: true,
+      prefixDiscarded: false,
+    };
+  }
+  let prefix = finalText.slice(0, match.index).replace(/\s+$/, '');
+  let prefixDiscarded = false;
+  try {
+    const data = JSON.parse(match[1]!) as Record<string, unknown>;
+    const bccAddrs = normalizeAddresses(data.bcc);
+    if (bccAddrs.length > 0) {
+      for (const addr of bccAddrs) {
+        const escaped = addr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        prefix = prefix.replace(new RegExp(escaped, 'gi'), BCC_REDACTED_PLACEHOLDER);
+      }
+    }
+  } catch {
+    // BCC 特定不可 → 安全側として prefix 破棄 (Python l.1521-1523)
+    prefix = '';
+    prefixDiscarded = true;
+  }
+  return {
+    redactedPrefix: prefix,
+    finalText: prefix,
+    markerFound: true,
+    isCap: true,
+    prefixDiscarded,
+  };
+}
+
+/**
+ * 汎用 marker gate strip — Python `_strip_marker_on_gate`
+ * (`cma_gchat_bot.py` l.1437) の TS port。`gate=false` なら素通り、
+ * `gate=true` なら regex で marker を strip し、empty 時は fallback 挿入。
+ *
+ * EMAIL_SEND は専用 `redactEmailSendOnCap` を使う (BCC redact あり)。
+ * 本 helper は CHAT_POST / SCHEDULE_ACTION のような「単純 strip + 空時
+ * fallback」用途で使う (= callers can import from chat-post-marker /
+ * schedule-action-marker 等で再利用)。
+ */
+export function stripMarkerOnGate(
+  finalText: string,
+  markerRegex: RegExp,
+  options: { gate: boolean; emptyFallback?: string },
+): string {
+  if (!options.gate) return finalText;
+  // `g` flag 必須 (replace で global strip)、無ければ補う。
+  const re = markerRegex.global
+    ? markerRegex
+    : new RegExp(markerRegex.source, markerRegex.flags + 'g');
+  let stripped = finalText.replace(re, '').trim();
+  if (stripped === '' && options.emptyFallback !== undefined) {
+    stripped = options.emptyFallback;
+  }
+  return stripped;
+}
