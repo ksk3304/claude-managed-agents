@@ -7,115 +7,38 @@
   "observability": {
     "enabled": true,
   },
-  // Non-secret vars. Secrets go through `wrangler secret put`. Anything you
-  // put here is visible in the dashboard and stored in the deploy bundle.
+  // v4 (Issue #186): MAKOTOくん R-Mail bridge は AgentMail webhook +
+  // queue consumer + cron の 3 経路のみを提供する。self-hosted sandbox
+  // 系の bindings (assets/ASSETS, containers/Sandbox, DO Sandbox &
+  // IsolateRunner, worker_loaders PROXY_LOADER/LOADER, browser/BROWSER,
+  // ai/AI, r2/BACKUP_BUCKET, send_email/SEND_EMAIL, KV SECRETS &
+  // EGRESS_POLICIES) は v4 廃棄で全削除した。残る bindings は MAKOTO
+  // bridge 用 (MAKOTO_KV / DB / MAKOTO_THREAD_LOCK / queues) のみ。
   //
-  // EMAIL_DOMAIN / EMAIL_FROM are intentionally blank so a fork-and-deploy
-  // doesn't ship the maintainer's zone. The Deploy to Cloudflare button
-  // prompts for them at setup time (descriptions live in
-  // `package.json#cloudflare.bindings`). Local devs can either set the
-  // env vars before `npm run deploy` or edit the strings below directly.
-  //
-  // EMAIL_DOMAIN: zone the per-session inbox addresses are minted under.
-  // Set to your verified Email Routing zone (e.g. `agents.example.com`).
-  // Sessions can then receive at `<sessionId>@<EMAIL_DOMAIN>` once a
-  // catch-all route forwards into this Worker. Leaving it unset disables
-  // the inbox-side of the email tools (send still works if EMAIL_FROM /
-  // SEND_EMAIL are configured).
-
-  // "vars": {
-  //   "EMAIL_DOMAIN": "",
-  //   "EMAIL_FROM": "",
-  // },
-
-  // Static assets — Vite-built React + Kumo UI. The frontend is a SPA, so
-  // unmatched paths fall back to /index.html and react-router takes over
-  // client-side. Without this, /sandboxes/<id> would 404 on refresh.
-  "assets": {
-    "directory": "./public",
-    "binding": "ASSETS",
-    "run_worker_first": [
-      "/api/*",
-      "/webhooks",
-      // AgentMail inbound webhook (Issue #186). Separate route from
-      // `/webhooks` so the asset router cannot intercept it before the
-      // Worker sees the svix-signed delivery.
-      "/webhooks/agentmail",
-      "/ws/*",
-      // OpenAPI spec at the conventional root path so CLI / agent
-      // tooling can probe `/openapi.json` directly.
-      "/openapi.json",
-      "/openapi",
-    ],
-    "not_found_handling": "single-page-application",
-  },
-  // KV: SECRETS holds named secret values used by header-injection rules and
-  // the proxy function's env. EGRESS_POLICIES holds the policy JSON keyed by
-  // `policy:<id>`.
-  //
-  // The empty `"id": ""` placeholders are intentional. `scripts/ensure-kv.mjs`
-  // runs on `prebuild` and patches the real namespace IDs in place — either
-  // by adopting a namespace that already exists in the account (case the
-  // Workers Builds / Deploy to Cloudflare flow hits on its second deploy) or
-  // by creating a fresh one named `<worker-name>-<binding>`. Leaving the
-  // placeholders means wrangler.jsonc can be committed without account-
-  // specific IDs.
+  // 設計ノート: worktrees/issue-186/diary/2026/05/24/issue-186-
+  // cloudflare-phase2-rmail-bridge-ts/plan-draft-v4-cloud-env-only.md
   "kv_namespaces": [
-    {
-      "binding": "SECRETS",
-      "id": "",
-    },
-    {
-      "binding": "EGRESS_POLICIES",
-      "id": "",
-    },
     // MAKOTO bridge KV (Issue #186): sender→user_slug→agent_id mapping,
     // envelope-encrypted OAuth vault entries (`vault:oauth:<user>:*`),
     // and per-confirm-token TTL nonces. `scripts/ensure-kv.mjs` patches
     // the real id at prebuild.
     {
       "binding": "MAKOTO_KV",
-      "id": "",
+      "id": "1d58a2a715044909972de6cc2a0e9f40",
     },
   ],
-  // D1: webhook events + session metadata. `database_id` is patched on
-  // `prebuild` by `scripts/ensure-d1.mjs` (same lifecycle as the KV
-  // namespaces above).
+  // D1: AgentMail bridge dedupe / threads / sent_messages / audit logs.
+  // `database_id` is patched on `prebuild` by `scripts/ensure-d1.mjs`.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "claude-managed-agents-db",
-      "database_id": "",
+      "database_id": "bfcfeac4-38a2-476d-82c8-e3e89f0116dd",
       "migrations_dir": "./migrations",
-    },
-  ],
-  // Container DO — one sandbox per session, driven by webhooks.
-  "containers": [
-    {
-      "class_name": "Sandbox",
-      "image": "./Dockerfile",
-      "instance_type": "standard-1", // change this for larger or smaller containers
-      "name": "claude-managed-agents-sandbox",
-      "max_instances": 100, // change this for more concurrent agents
-      // 30-minute grace period for active sessions during a rollout — gives
-      // an in-flight agent run time to wind down before the old container
-      // is replaced with the new image.
-      "rollout_active_grace_period": 1800,
-      // Single-step 100% rollout: roll the new image to every container at
-      // once. The grace period above protects active sessions.
-      "rollout_step_percentage": [100],
     },
   ],
   "durable_objects": {
     "bindings": [
-      {
-        "class_name": "Sandbox",
-        "name": "Sandbox",
-      },
-      {
-        "class_name": "IsolateRunner",
-        "name": "IsolateRunner",
-      },
       // MAKOTO bridge: per-RFC-822-message exclusion DO. One instance
       // per thread key (`idFromName(eventKeyForRfc822(...))`) — guards
       // against two consumers racing to call `sessions.create` +
@@ -126,69 +49,24 @@
       },
     ],
   },
-  // Worker Loader bindings:
-  //   PROXY_LOADER — egress proxy executes user-defined proxy functions
-  //                  stored as strings on egress policies.
-  //   LOADER       — Isolate tools (code execution, browser tools) use this
-  //                  to load sandboxed isolates at runtime. Without it the
-  //                  `execute` / `run_file` / `browser_*` tools error out
-  //                  with a clear message instead of failing silently.
-  "worker_loaders": [
-    {
-      "binding": "PROXY_LOADER",
-    },
-    {
-      "binding": "LOADER",
-    },
-  ],
-  // Browser Rendering binding for Isolate Sandbox CDP tools and the
-  // Cloudflare Browser Rendering REST tools (screenshot, fetch_to_markdown,
-  // browse, web_fetch). Always declared — every Workers account is entitled
-  // to Browser Rendering, so we wire it up by default. The control plane gates each
-  // tool on the binding at registration time, and the UI hides browser
-  // tools when the binding isn't present.
-  "browser": {
-    "binding": "BROWSER",
-  },
-  // Workers AI — required for `image_generate`. Free tier covers
-  // basic usage; check https://developers.cloudflare.com/workers-ai/platform/pricing/.
-  "ai": {
-    "binding": "AI",
-  },
-  // R2 bucket for sandbox snapshots. The Sandbox SDK reads BACKUP_BUCKET as
-  // an R2 binding (used directly in dev via `localBucket: true`); in
-  // production it presigns URLs against R2 — that path needs the secrets
-  // R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, BACKUP_BUCKET_NAME, and
-  // CLOUDFLARE_ACCOUNT_ID. See README → Snapshots.
-  "r2_buckets": [
-    {
-      "binding": "BACKUP_BUCKET",
-      "bucket_name": "claude-managed-agents-snapshots",
-    },
-  ],
-  // Email Routing send_email binding for `email_send`. Configure
-  // your zone in the dashboard (Email → Email Routing → Destination
-  // addresses) and add the verified destinations to `destination_addresses`.
-  "send_email": [
-    {
-      "name": "SEND_EMAIL",
-    },
-  ],
   "migrations": [
     {
       "new_sqlite_classes": ["Sandbox", "IsolateRunner"],
       "tag": "v1",
     },
-    // v2 adds the MAKOTO_THREAD_LOCK exclusion DO (no SQLite — pure
-    // in-memory locks; we still list it in `new_sqlite_classes` so the
-    // platform provisions per-name DO instances).
     {
       "new_sqlite_classes": ["ThreadLock"],
       "tag": "v2",
     },
+    // v3 廃棄: v4 cloud-env-only に移行したため self-hosted sandbox DO を
+    // 全削除。Cloudflare に deploy された時、`deleted_classes` で指定した
+    // DO クラスの全 instance が platform 側で reaped される。
+    {
+      "deleted_classes": ["Sandbox", "IsolateRunner"],
+      "tag": "v3",
+    },
   ],
-  // Daily cleanup of webhook_events and sessions older than 24h.
-  // The same cron also prunes `dedupe` and `agentmail_webhook_seen`
+  // Daily prune of AgentMail bridge `dedupe` + `agentmail_webhook_seen`
   // rows past their 30-day TTL (see `src/index.ts` `scheduled`).
   "triggers": {
     "crons": ["0 4 * * *"],
@@ -217,16 +95,4 @@
       },
     ],
   },
-  // VPC + Mesh — declare bindings here when you want egress policies to be
-  // able to attach a VPC service or network to a sandbox.
-  // Add the binding(s) below — wrangler.jsonc is the only place you
-  // need to edit. The dashboard discovers bindings via
-  // `scripts/sync-vpc-bindings.mjs`, which runs on `prebuild`.
-  //
-  //    "vpc_networks": [
-  //      { "binding": "MESH", "network_id": "cf1:network", "remote": true }
-  //    ],
-  //    "vpc_services": [
-  //      { "binding": "INTERNAL_API", "service_id": "00000000-0000-0000-0000-000000000000" }
-  //    ],
 }
