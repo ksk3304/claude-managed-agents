@@ -13,7 +13,8 @@
   // IsolateRunner, worker_loaders PROXY_LOADER/LOADER, browser/BROWSER,
   // ai/AI, r2/BACKUP_BUCKET, send_email/SEND_EMAIL, KV SECRETS &
   // EGRESS_POLICIES) は v4 廃棄で全削除した。残る bindings は MAKOTO
-  // bridge 用 (MAKOTO_KV / DB / MAKOTO_THREAD_LOCK / queues) のみ。
+  // bridge 用 (MAKOTO_KV / DB / MAKOTO_THREAD_LOCK / MAKOTO_OAUTH_LEASE /
+  // queues) のみ。
   //
   // 設計ノート: worktrees/issue-186/diary/2026/05/24/issue-186-
   // cloudflare-phase2-rmail-bridge-ts/plan-draft-v4-cloud-env-only.md
@@ -47,6 +48,15 @@
         "class_name": "ThreadLock",
         "name": "MAKOTO_THREAD_LOCK",
       },
+      // MAKOTO bridge: per-user OAuth refresh lease + access_token
+      // cache DO. One instance per user (`idFromName(userSlug)`) so
+      // refresh attempts for the same user funnel through a single
+      // single-threaded actor (no in-flight refresh race, no duplicate
+      // audit rows, no thundering herd on Google's token endpoint).
+      {
+        "class_name": "OAuthLease",
+        "name": "MAKOTO_OAUTH_LEASE",
+      },
     ],
   },
   "migrations": [
@@ -64,6 +74,15 @@
     {
       "deleted_classes": ["Sandbox", "IsolateRunner"],
       "tag": "v3",
+    },
+    // v4: per-user OAuth refresh lease + token cache DO (Phase 2
+    // OAuth lease, plan v4 §5.4.3). State is in-memory only — the
+    // class registration here is what Cloudflare needs to route
+    // `MAKOTO_OAUTH_LEASE.get(id)` calls; no D1 row schema for the DO
+    // itself.
+    {
+      "new_sqlite_classes": ["OAuthLease"],
+      "tag": "v4",
     },
   ],
   // Daily prune of AgentMail bridge `dedupe` + `agentmail_webhook_seen`

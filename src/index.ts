@@ -22,6 +22,7 @@ import {
 import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { ThreadLock } from "./durable-objects/thread-lock";
+import { OAuthLease } from "./durable-objects/oauth-lease";
 import {
   pruneExpiredAgentMailWebhookSeen,
   pruneOlderThan,
@@ -32,7 +33,11 @@ import { pruneExpiredDedupe } from "./lib/dedupe";
 // AgentMail Queue consumer takes before any `sessions.create` /
 // AgentMail send work. Re-exported so wrangler can bind it; one DO
 // per thread key via `MAKOTO_THREAD_LOCK.idFromName(eventKey)`.
-export { ThreadLock };
+//
+// `OAuthLease` is the per-user Google OAuth refresh lease + token
+// cache DO. One instance per user (`idFromName(userSlug)`) — see
+// `src/durable-objects/oauth-lease.ts` for the contract.
+export { ThreadLock, OAuthLease };
 
 // Layer 7-3 wire-up: route AgentMail Queue deliveries through the real
 // session / tool-dispatch / EMAIL_SEND pipeline. `agentmailDispatch`
