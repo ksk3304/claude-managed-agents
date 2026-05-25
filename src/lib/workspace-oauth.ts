@@ -6,15 +6,21 @@
  *   - `https://oauth2.googleapis.com/revoke` (revoke)
  *
  * refresh_tokens live encrypted in `oauth-vault.ts`-keyed KV entries.
- * access_tokens are short-lived (~50 min) and cached in KV under
- * `oauth:access:<user_slug>` with `expirationTtl` so they auto-expire.
  *
- * Every operation writes one audit row to D1 `oauth_audit` (see
- * `recordOAuthAudit`) so we can answer "who used which user's
- * Workspace identity, when, with what outcome".
+ * access_token caching + in-flight refresh serialisation + per-user
+ * audit log are funneled through the `OAuthLease` Durable Object
+ * (`src/durable-objects/oauth-lease.ts`). Callers pass a `OAuthLeaseStub`
+ * in `deps.oauthLease` (one per user_slug) and `getAccessToken` calls
+ * `getOrLease` → either uses a cached token, waits briefly on busy, or
+ * holds a lease while it talks to Google's `/token` endpoint and then
+ * `commit`s the result.
  *
- * Issue: ksk3304/makoto-prime#186 (Phase 6 step 4 — 層 2)
- * Spec: plan-draft.md §7 OAuth + §S3 / §S4 / §S5 / §S6
+ * This is the Phase 2 OAuth lease path (plan v4 §5.4.3). The DO owns
+ * the in-memory cache + audit serialisation; the Worker owns the
+ * Google subrequest budget.
+ *
+ * Issue: ksk3304/makoto-prime#186 (Phase 6 step 4 — 層 2 / Phase 8 wire-up)
+ * Spec: plan-draft-v4-cloud-env-only.md §5.4.3 OAuth lease
  */
 
 import {
@@ -23,13 +29,18 @@ import {
   deleteRefreshToken,
 } from './oauth-vault';
 import { assertBridgeEgressAllowed } from './egress-guard';
+import type { OAuthLeaseStub } from '../durable-objects/oauth-lease';
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 
-const ACCESS_TOKEN_KV_PREFIX = 'oauth:access';
-/** Google access_tokens are ~3600s lived; we cache ~3300s to leave headroom. */
-const ACCESS_TOKEN_CACHE_TTL_SEC = 3300;
+/**
+ * How long to wait once when `getOrLease` returns `busy`. A second
+ * caller for the same user normally finds the cache populated on the
+ * retry, which lets us avoid a parallel refresh without blocking
+ * meaningfully. Capped to keep the consumer's wall-time budget honest.
+ */
+const BUSY_RETRY_WAIT_MS_MAX = 1000;
 
 export type OAuthAction =
   | 'bootstrap'
@@ -65,58 +76,112 @@ export interface WorkspaceOAuthDeps {
   clientSecret: string;
   /** Override fetch for tests. */
   fetchImpl?: typeof fetch;
+  /**
+   * Per-user lease + cache + audit serialiser. Required for `getAccessToken`
+   * (it owns the refresh-side audit rows); `revokeUser` / `bootstrapUser`
+   * use it when present to invalidate the cache, but tolerate `undefined`
+   * for callers that don't need lease coordination (e.g. the bootstrap CLI
+   * Worker path that only writes the vault).
+   */
+  oauthLease?: OAuthLeaseStub;
 }
 
 /**
- * Get a working Google access_token for `userSlug`. Pulls from KV
- * cache when fresh, otherwise refreshes via Google's token endpoint.
+ * Get a working Google access_token for `userSlug` via the `OAuthLease`
+ * Durable Object.
  *
- * Failure modes (all audited):
- *   - vault entry missing            → returns null, no audit row
- *   - vault decrypt fails (corrupt)  → throws, audit `fail_decrypt`
- *   - Google token endpoint 4xx      → returns null, audit `fail:<status>`
- *   - Google rotated refresh_token   → audit `rotate`, vault re-written
+ *   - DO cache hit (60s freshness margin) → return cached token
+ *   - DO `busy` (another caller is refreshing) → short wait, retry once;
+ *     if still busy, return null (caller can retry the higher-level op)
+ *   - DO `leased` → this caller holds the lease, talks to Google's
+ *     /token endpoint, then calls `commit` (success) / `release` (fail) /
+ *     `invalidate` (revoked) on the DO
+ *
+ * The DO writes the success / rotate / fail / revoke audit rows
+ * serially per user — the Worker no longer writes them directly. The
+ * one exception is `fail_decrypt` (vault corruption), which the Worker
+ * audits via `recordOAuthAudit` before re-throwing because the lease
+ * was never put in `commit-able` state.
  */
 export async function getAccessToken(
   deps: WorkspaceOAuthDeps,
   userSlug: string,
   options: { callerSessionId?: string } = {},
 ): Promise<AccessTokenResult | null> {
-  // KV cache first.
-  const cacheKey = `${ACCESS_TOKEN_KV_PREFIX}:${userSlug}`;
-  const cached = await deps.kv.get(cacheKey, 'json') as
-    | { access_token: string; expires_at_ms: number }
-    | null;
-  if (cached && cached.expires_at_ms > Date.now() + 60_000) {
-    return { ...cached, from_cache: true };
+  if (!deps.oauthLease) {
+    throw new Error('getAccessToken requires deps.oauthLease (OAuthLease DO stub)');
   }
+  const lease = deps.oauthLease;
+  const callerSessionId = options.callerSessionId ?? null;
 
-  // Vault read.
+  const first = await lease.getOrLease(userSlug);
+  if (first.kind === 'cached') return fromCached(first.accessToken, first.expiresInMs);
+  if (first.kind === 'busy') {
+    await sleep(Math.min(first.retryAfterMs, BUSY_RETRY_WAIT_MS_MAX));
+    const second = await lease.getOrLease(userSlug);
+    if (second.kind === 'cached') return fromCached(second.accessToken, second.expiresInMs);
+    if (second.kind === 'busy') return null;
+    return performRefresh(deps, userSlug, second.leaseId, callerSessionId);
+  }
+  return performRefresh(deps, userSlug, first.leaseId, callerSessionId);
+}
+
+function fromCached(accessToken: string, expiresInMs: number): AccessTokenResult {
+  return {
+    access_token: accessToken,
+    expires_at_ms: Date.now() + expiresInMs,
+    from_cache: true,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function performRefresh(
+  deps: WorkspaceOAuthDeps,
+  userSlug: string,
+  leaseId: string,
+  callerSessionId: string | null,
+): Promise<AccessTokenResult | null> {
+  const lease = deps.oauthLease!;
   let refreshToken: string | null;
   try {
     refreshToken = await getRefreshToken(deps.kv, deps.vaultKeyB64, userSlug);
   } catch (err) {
+    // Decrypt failure is the one audit path that bypasses the DO: the
+    // lease never reached a commit-able state, and the failure mode is
+    // global (vault corrupt for this user), so record it directly and
+    // free the lease.
     await recordOAuthAudit(deps.db, {
       timestamp_ms: Date.now(),
       user_slug: userSlug,
-      caller_session_id: options.callerSessionId,
+      caller_session_id: callerSessionId ?? undefined,
       action: 'fail_decrypt',
       outcome: `fail:${errorMessage(err)}`,
+    });
+    await lease.release({
+      userSlug,
+      leaseId,
+      outcome: 'fail',
+      callerSessionId,
+      notes: 'decrypt_fail',
     });
     throw err;
   }
   if (refreshToken === null) {
+    // Vault entry absent — caller never bootstrapped this user. Free
+    // the lease so a future bootstrap can proceed without waiting.
+    await lease.release({
+      userSlug,
+      leaseId,
+      outcome: 'fail',
+      callerSessionId,
+      notes: 'no_refresh_token_in_vault',
+    });
     return null;
   }
-  await recordOAuthAudit(deps.db, {
-    timestamp_ms: Date.now(),
-    user_slug: userSlug,
-    caller_session_id: options.callerSessionId,
-    action: 'get_refresh',
-    outcome: 'success',
-  });
 
-  // Exchange with Google.
   const fetchImpl = deps.fetchImpl ?? fetch;
   // Egress hard-allowlist (層 8). `GOOGLE_TOKEN_URL` is the constant
   // `oauth2.googleapis.com/token`; the check is here so a future
@@ -135,19 +200,24 @@ export async function getAccessToken(
   });
   const text = await resp.text();
   if (!resp.ok) {
-    await recordOAuthAudit(deps.db, {
-      timestamp_ms: Date.now(),
-      user_slug: userSlug,
-      caller_session_id: options.callerSessionId,
-      action: 'refresh',
-      outcome: `fail:${resp.status}`,
-      notes: text.slice(0, 512),
-    });
-    // 401 / 403 == refresh_token revoked or invalid → treat as revoked
-    // (S6 fail-close). Clear vault so we don't keep retrying.
     if (resp.status === 401 || resp.status === 403) {
+      // refresh_token itself is revoked / invalid → fail-close (S6).
+      // Purge the vault entry and tell the DO to drop its cache so no
+      // other caller serves stale data.
       await deleteRefreshToken(deps.kv, userSlug);
-      await deps.kv.delete(cacheKey);
+      await lease.invalidate({
+        userSlug,
+        callerSessionId,
+        reason: `refresh_token_revoked_${resp.status}`,
+      });
+    } else {
+      await lease.release({
+        userSlug,
+        leaseId,
+        outcome: 'fail',
+        callerSessionId,
+        notes: `google_${resp.status}:${text.slice(0, 256)}`,
+      });
     }
     return null;
   }
@@ -155,41 +225,29 @@ export async function getAccessToken(
     access_token: string;
     expires_in: number;
     refresh_token?: string;
-    token_type?: string;
   };
-  const expiresAtMs = Date.now() + body.expires_in * 1000;
+  const expiresInMs = body.expires_in * 1000;
 
   // Google rotates refresh_tokens only occasionally — handle it when
   // we see it (S3 rotate path).
+  let refreshTokenRotated = false;
   if (body.refresh_token && body.refresh_token !== refreshToken) {
     await putRefreshToken(deps.kv, deps.vaultKeyB64, userSlug, body.refresh_token);
-    await recordOAuthAudit(deps.db, {
-      timestamp_ms: Date.now(),
-      user_slug: userSlug,
-      caller_session_id: options.callerSessionId,
-      action: 'rotate',
-      outcome: 'success',
-    });
+    refreshTokenRotated = true;
   }
 
-  await recordOAuthAudit(deps.db, {
-    timestamp_ms: Date.now(),
-    user_slug: userSlug,
-    caller_session_id: options.callerSessionId,
-    action: 'refresh',
-    outcome: 'success',
+  await lease.commit({
+    userSlug,
+    leaseId,
+    accessToken: body.access_token,
+    expiresInMs,
+    refreshTokenRotated,
+    callerSessionId,
   });
-
-  // Cache. Use expirationTtl in seconds (Workers KV minimum is 60 s).
-  await deps.kv.put(
-    cacheKey,
-    JSON.stringify({ access_token: body.access_token, expires_at_ms: expiresAtMs }),
-    { expirationTtl: ACCESS_TOKEN_CACHE_TTL_SEC },
-  );
 
   return {
     access_token: body.access_token,
-    expires_at_ms: expiresAtMs,
+    expires_at_ms: Date.now() + expiresInMs,
     from_cache: false,
   };
 }
@@ -239,14 +297,25 @@ export async function revokeUser(
     }
   }
   await deleteRefreshToken(deps.kv, userSlug);
-  await deps.kv.delete(`${ACCESS_TOKEN_KV_PREFIX}:${userSlug}`);
-  await recordOAuthAudit(deps.db, {
-    timestamp_ms: Date.now(),
-    user_slug: userSlug,
-    caller_session_id: options.callerSessionId,
-    action: 'revoke',
-    outcome: 'success',
-  });
+  if (deps.oauthLease) {
+    // Drop the DO's cached access_token + any in-flight lease for this
+    // user. The DO writes the revoke audit row itself so we don't
+    // double-audit when the lease is wired up.
+    await deps.oauthLease.invalidate({
+      userSlug,
+      callerSessionId: options.callerSessionId ?? null,
+      reason: 'revoke',
+    });
+  } else {
+    // CLI / bootstrap path with no lease wired in — keep auditing.
+    await recordOAuthAudit(deps.db, {
+      timestamp_ms: Date.now(),
+      user_slug: userSlug,
+      caller_session_id: options.callerSessionId,
+      action: 'revoke',
+      outcome: 'success',
+    });
+  }
 }
 
 /**

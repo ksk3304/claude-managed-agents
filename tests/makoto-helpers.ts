@@ -414,6 +414,86 @@ export function makeFakeThreadLockNamespace(): DurableObjectNamespace {
   return ns;
 }
 
+/**
+ * Fake `OAuthLease` DO namespace for tests that wire the real
+ * `getOAuthLease(env, userSlug)` helper through to a dispatcher path.
+ * Mirrors enough of the contract that `getOrLease` → `commit` /
+ * `release` / `invalidate` round-trips work. Audit is no-op (the
+ * real DO writes to D1 `oauth_audit` via env.DB; this fake skips it
+ * because dispatcher tests don't assert on that table here).
+ */
+export function makeFakeOAuthLeaseNamespace(): DurableObjectNamespace {
+  interface PerUserState {
+    tokens: { accessToken: string; expiresAt: number } | null;
+    leaseId: string | null;
+    leaseExpiresAt: number;
+  }
+  const perUser = new Map<string, PerUserState>();
+  function get(name: string): PerUserState {
+    let state = perUser.get(name);
+    if (!state) {
+      state = { tokens: null, leaseId: null, leaseExpiresAt: 0 };
+      perUser.set(name, state);
+    }
+    return state;
+  }
+  const ns = {
+    idFromName(name: string) {
+      return { name } as unknown as DurableObjectId;
+    },
+    get(id: DurableObjectId) {
+      const name = (id as unknown as { name: string }).name;
+      const state = get(name);
+      return {
+        async fetch(url: string, init?: RequestInit): Promise<Response> {
+          const u = new URL(url);
+          const action = u.searchParams.get('action');
+          const body = init && typeof init.body === 'string' ? JSON.parse(init.body) : {};
+          const now = Date.now();
+          if (action === 'getOrLease') {
+            if (state.tokens && state.tokens.expiresAt - 60_000 > now) {
+              return Response.json({
+                kind: 'cached',
+                accessToken: state.tokens.accessToken,
+                expiresInMs: state.tokens.expiresAt - now,
+              });
+            }
+            if (state.leaseId && state.leaseExpiresAt > now) {
+              return Response.json({ kind: 'busy', retryAfterMs: state.leaseExpiresAt - now });
+            }
+            const id = `lease-${name}-${Math.random().toString(36).slice(2, 8)}`;
+            state.leaseId = id;
+            state.leaseExpiresAt = now + 30_000;
+            return Response.json({ kind: 'leased', leaseId: id, leaseTtlMs: 30_000 });
+          }
+          if (action === 'commit') {
+            if (state.leaseId !== body.leaseId) {
+              return Response.json({ ok: false, reason: 'lease not held' }, { status: 409 });
+            }
+            state.tokens = {
+              accessToken: body.accessToken,
+              expiresAt: now + body.expiresInMs,
+            };
+            state.leaseId = null;
+            return Response.json({ ok: true });
+          }
+          if (action === 'release') {
+            if (state.leaseId === body.leaseId) state.leaseId = null;
+            return Response.json({ ok: true });
+          }
+          if (action === 'invalidate') {
+            state.tokens = null;
+            state.leaseId = null;
+            return Response.json({ ok: true });
+          }
+          return new Response('unknown action', { status: 400 });
+        },
+      } as unknown as DurableObjectStub;
+    },
+  } as unknown as DurableObjectNamespace;
+  return ns;
+}
+
 // ---------------------------------------------------------------------------
 // svix signature helper (for webhook tests)
 // ---------------------------------------------------------------------------

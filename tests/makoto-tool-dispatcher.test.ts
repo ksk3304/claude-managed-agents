@@ -15,13 +15,15 @@ import {
   makeFetchMock,
   makeKv,
   makeMakotoDb,
+  makeFakeOAuthLeaseNamespace,
   TEST_VAULT_KEY_B64,
 } from './makoto-helpers';
 
-function envWith(fetchImpl: typeof fetch): Env {
+function envWith(_fetchImpl: typeof fetch): Env {
   return {
     DB: makeMakotoDb(),
     MAKOTO_KV: makeKv(),
+    MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
     OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
     OAUTH_CLIENT_ID: 'cid',
     OAUTH_CLIENT_SECRET: 'csec',
@@ -110,6 +112,7 @@ describe('dispatchMakotoTool happy paths', () => {
     const env = {
       DB: makeMakotoDb(),
       MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
       OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
       OAUTH_CLIENT_ID: 'cid',
       OAUTH_CLIENT_SECRET: 'csec',
@@ -136,6 +139,7 @@ describe('dispatchMakotoTool happy paths', () => {
     const env = {
       DB: makeMakotoDb(),
       MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
       OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
       OAUTH_CLIENT_ID: 'cid',
       OAUTH_CLIENT_SECRET: 'csec',
@@ -158,6 +162,7 @@ describe('dispatchMakotoTool happy paths', () => {
     const env = {
       DB: makeMakotoDb(),
       MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
       OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
       OAUTH_CLIENT_ID: 'cid',
       OAUTH_CLIENT_SECRET: 'csec',

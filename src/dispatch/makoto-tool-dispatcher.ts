@@ -54,6 +54,7 @@ import {
   createKvConfirmTokenStore,
 } from '../tools/tool-common';
 import { getAccessToken } from '../lib/workspace-oauth';
+import { getOAuthLease } from '../durable-objects/oauth-lease';
 
 /** Names of the 10 tools the MAKOTO bridge exposes to its agent. */
 export type MakotoToolName =
@@ -298,6 +299,10 @@ async function resolveAccessToken(
       vaultKeyB64: env.OAUTH_VAULT_KEY,
       clientId: env.OAUTH_CLIENT_ID,
       clientSecret: env.OAUTH_CLIENT_SECRET,
+      // OAuth lease DO: serialises in-flight refreshes + audit log
+      // writes per user_slug (plan v4 §5.4.3). Wired here so every
+      // custom-tool dispatch goes through the same lease.
+      oauthLease: getOAuthLease(env, ctx.userSlug),
       ...(ctx.fetchImpl ? { fetchImpl: ctx.fetchImpl } : {}),
     };
     const opts = ctx.callerSessionId ? { callerSessionId: ctx.callerSessionId } : {};

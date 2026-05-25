@@ -11,6 +11,12 @@
 -- not reference any of these tables — but coupling the apply to cutover
 -- keeps the rollback path simple (revert worker code AND skip apply).
 --
+-- Rollback: NOT POSSIBLE after apply — D1 DROP TABLE is destructive and
+-- the row data is gone. If a cutover regression forces a return to the
+-- v3 code path, the operator must restore from D1 backup (see
+-- `wrangler d1 backup` runbook) BEFORE redeploying the legacy worker.
+-- Treat the apply itself as the point of no return for the table data.
+--
 -- Tables retained by v4: sent_messages, email_threads (0001), dedupe,
 -- user_mapping_audit, oauth_audit (0002), agentmail_webhook_seen (0003).
 
