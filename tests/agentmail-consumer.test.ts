@@ -33,9 +33,9 @@ function makeBody(): AgentMailQueueMessage {
     received_at_ms: Date.now(),
     event: {
       id: 'evt_1',
-      type: 'message.received',
+      event_type: 'message.received',
       timestamp: 'x',
-      data: { message: INBOUND },
+      message: INBOUND,
     },
   };
 }
@@ -99,7 +99,7 @@ describe('handleAgentMailMessage', () => {
     const body: AgentMailQueueMessage = {
       svix_id: 'svix_1',
       received_at_ms: 0,
-      event: { id: 'e', type: 'message.received', timestamp: 'x', data: {} },
+      event: { id: 'e', event_type: 'message.received', timestamp: 'x' },
     };
     await handleAgentMailMessage(env, ctx, body, dispatcher);
     expect(db._tables.dedupe.size).toBe(0);
@@ -114,9 +114,9 @@ describe('handleAgentMailMessage', () => {
       received_at_ms: 0,
       event: {
         id: 'e',
-        type: 'message.received',
+        event_type: 'message.received',
         timestamp: 'x',
-        data: { message: { id: 'm', from: 'a@x' } },
+        message: { id: 'm', from: 'a@x' },
       },
     };
     await handleAgentMailMessage(env, ctx, body, dispatcher);

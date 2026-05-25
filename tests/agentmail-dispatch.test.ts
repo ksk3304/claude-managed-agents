@@ -112,9 +112,9 @@ function makeDispatchContext(overrides: {
     ctx: {} as ExecutionContext,
     event: overrides.event ?? {
       id: 'evt_1',
-      type: 'message.received',
+      event_type: 'message.received',
       timestamp: 'x',
-      data: { message: overrides.message ?? INBOUND_MSG, inbox_id: 'inbox_main' },
+      message: { ...(overrides.message ?? INBOUND_MSG), inbox_id: 'inbox_main' },
     },
     message: overrides.message ?? INBOUND_MSG,
     rfc822MsgId: 'inbound-1@example.com',
@@ -273,9 +273,9 @@ describe('agentmailDispatch', () => {
     const ctx = makeDispatchContext({
       event: {
         id: 'evt',
-        type: 'message.received',
+        event_type: 'message.received',
         timestamp: 'x',
-        data: { message: INBOUND_MSG }, // no inbox_id
+        message: INBOUND_MSG, // no inbox_id
       },
     });
     await ctx.env.MAKOTO_KV.put(
