@@ -18,5 +18,19 @@ declare namespace Cloudflare {
     ANTHROPIC_BASE_URL?: string;
     ENVIRONMENT_ID: string;
     OAUTH_VAULT_KEY: string;
+    /**
+     * Anthropic model name used by the daily-report cron summarizer.
+     * Defaults to `claude-haiku-4-5` when unset.
+     */
+    DAILY_REPORT_MODEL?: string;
+    /**
+     * Optional override for the daily-report target date (`YYYY-MM-DD`).
+     * When unset the runner computes "yesterday in JST" from the cron tick.
+     */
+    DAILY_REPORT_DATE?: string;
+    /**
+     * `"1"` = dry-run mode (do not write the `/<date>.md` memory back).
+     */
+    DAILY_REPORT_DRY_RUN?: string;
   }
 }

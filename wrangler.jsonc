@@ -85,10 +85,17 @@
       "tag": "v4",
     },
   ],
-  // Daily prune of AgentMail bridge `dedupe` + `agentmail_webhook_seen`
-  // rows past their 30-day TTL (see `src/index.ts` `scheduled`).
+  // Cron schedules (see `src/index.ts` `scheduled` for dispatch logic):
+  //   - `0 4 * * *`  (4 AM UTC) — daily prune of AgentMail bridge
+  //     `dedupe` + `agentmail_webhook_seen` rows past their 30-day TTL.
+  //   - `0 14 * * *` (14:00 UTC = 23:00 JST) — daily-report runner
+  //     (`src/scheduled/daily-report.ts`). Aggregates the previous JST
+  //     day's session logs from Memory Stores, summarises them with
+  //     `client.messages.create`, and writes `/<date>.md` to the
+  //     per-user / shared `daily_report_*_store`. TS port of the
+  //     Cloud Run `scripts/cma_daily_report.py` (Issue #186 Phase 2).
   "triggers": {
-    "crons": ["0 4 * * *"],
+    "crons": ["0 4 * * *", "0 14 * * *"],
   },
   // Cloudflare Queues for the AgentMail bridge (Issue #186). One
   // single-purpose queue carries verified webhook deliveries from the

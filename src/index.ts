@@ -28,6 +28,8 @@ import {
   pruneOlderThan,
 } from "./storage";
 import { pruneExpiredDedupe } from "./lib/dedupe";
+import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
+import { buildAnthropicClient } from "./lib/session";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -70,13 +72,21 @@ export default {
     return new Response("not found", { status: 404 });
   },
 
-  // Daily prune of dedupe / webhook_seen / legacy tables. Configured in
-  // wrangler.jsonc as `0 4 * * *` (4 AM UTC).
+  // Cron dispatcher — wrangler.jsonc `triggers.crons` 経由で複数 schedule を
+  // 受ける. `controller.cron` で経路を分岐する:
+  //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
+  //   - `0 14 * * *` (14:00 UTC = 23:00 JST) → daily-report (前日 JST の
+  //     セッションログを Memory Store に集約・要約・書き込み)
   async scheduled(
-    _controller: ScheduledController,
+    controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
+    if (controller.cron === "0 14 * * *") {
+      ctx.waitUntil(runDailyReportCron(env));
+      return;
+    }
+    // default = prune cron (`0 4 * * *`). 旧 path を保持.
     const cutoff = Date.now() - ONE_DAY_MS;
     ctx.waitUntil(
       (async () => {
@@ -119,3 +129,40 @@ export default {
     await handleAgentMailQueue(batch, env, ctx, agentmailDispatcher);
   },
 };
+
+// ----------------------------------------------------------------------------
+// daily-report cron runner
+// ----------------------------------------------------------------------------
+
+/**
+ * `0 14 * * *` (= 23:00 JST) tick で起動する daily-report バッチ.
+ * `src/scheduled/daily-report.ts:generateDailyReports` に処理を委譲する.
+ * Anthropic client の組み立て / env override 解決 / 起動ログだけここで行う.
+ */
+async function runDailyReportCron(env: Env): Promise<void> {
+  const client = buildAnthropicClient(env);
+  if (client === null) {
+    console.error("[cron] daily-report skipped: ANTHROPIC_API_KEY missing");
+    return;
+  }
+  const model = env.DAILY_REPORT_MODEL || "claude-haiku-4-5";
+  const dateLabel = env.DAILY_REPORT_DATE || defaultDateLabel(new Date());
+  const dryRun = env.DAILY_REPORT_DRY_RUN === "1";
+  console.log(
+    `[cron] daily-report start date=${dateLabel} model=${model} dry_run=${dryRun}`,
+  );
+  try {
+    const result = await generateDailyReports({
+      kv: env.MAKOTO_KV,
+      client,
+      dateLabel,
+      model,
+      dryRun,
+    });
+    console.log(
+      `[cron] daily-report done date=${dateLabel} routes=${JSON.stringify(result)}`,
+    );
+  } catch (error) {
+    console.error("[cron] daily-report failed", error);
+  }
+}

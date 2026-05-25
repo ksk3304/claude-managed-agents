@@ -1,0 +1,500 @@
+/**
+ * Daily report runner — MAKOTOくん の DM/共有スペース日報を Memory Store に
+ * 書き込む定期実行バッチ. Cloud Run の `scripts/cma_daily_report.py` の
+ * TS port (byte 等価).
+ *
+ * 2 経路を 1 cron tick で巡回する:
+ *   - **DM 経路**: user 単位で `session_log_dm_store` → `daily_report_dm_store`
+ *     (= per-user 複数 tuple)
+ *   - **共有スペース経路**: 全 user 共通の singleton (= 最初の user mapping から
+ *     shared store id を抜く)
+ *
+ * 入力ソース:
+ *   - KV: `user_mapping:<email>` を全件 list (= Python の
+ *     `cma_session_resolver.SessionCredentialResolver._mapping` を Cloudflare 版に置換)
+ *   - Memory Store: `client.beta.memoryStores.memories.list(store_id)` で
+ *     `/<date>/` prefix の memory を list + retrieve
+ *
+ * 出力:
+ *   - target Memory Store の `/<date>.md` を update / create
+ *
+ * LLM 呼出: Python `cma_lib.run_session` (Managed Agent 経由) を簡略化し、
+ * `client.messages.create` の 1 回呼出に置換. 理由: scheduled handler に
+ * agent lifecycle 管理は重い、tools 空、system+user prompt は byte 等価維持.
+ *
+ * Issue: ksk3304/makoto-prime#186 (Phase 2 — Cloudflare 移行 Day 3)
+ * Source of truth (Python):
+ *   - scripts/cma_daily_report.py (全 248 行)
+ *   - scripts/cma_session_resolver.py l.57-72 (_store_id_from_entry)
+ */
+
+import type Anthropic from '@anthropic-ai/sdk';
+import type { UserMappingValue } from '../lib/memory-attach';
+
+// ============================================================================
+// Constants / route definitions
+// ============================================================================
+
+/**
+ * Python `REPORT_ROUTES` (l.36-49) と byte 等価. shared / DM の 2 経路を
+ * 1 cron tick で巡回する.
+ */
+export interface ReportRoute {
+  kind: 'dm' | 'shared';
+  source_store_name: string;
+  target_store_name: string;
+  title: string;
+}
+
+export const REPORT_ROUTES: readonly ReportRoute[] = [
+  {
+    kind: 'dm',
+    source_store_name: 'session_log_dm_store',
+    target_store_name: 'daily_report_dm_store',
+    title: 'DM 日報',
+  },
+  {
+    kind: 'shared',
+    source_store_name: 'session_log_shared_store',
+    target_store_name: 'daily_report_shared_store',
+    title: '共有スペース日報',
+  },
+] as const;
+
+/**
+ * Python `_store_id_from_entry` (l.57-72) の `needles` table.
+ * store_name の attachment が無いとき instructions 文字列 substring 逆引き fallback.
+ */
+const NEEDLES: Readonly<Record<string, readonly [string, string]>> = {
+  session_log_dm_store: ['DM (個人 1:1)', 'セッションログ'],
+  session_log_shared_store: ['共有スペース', 'セッションログ'],
+  daily_report_dm_store: ['DM 軸', '日報'],
+  daily_report_shared_store: ['共有スペース軸', '日報'],
+} as const;
+
+/** KV key prefix (= `src/lib/memory-attach.ts` と同じ). */
+const KV_USER_MAPPING_PREFIX = 'user_mapping:';
+
+/** Anthropic API default model (= scheduled handler の env override 可). */
+const DEFAULT_MODEL = 'claude-haiku-4-5';
+
+/** Anthropic API max_tokens (= 日報 1 本に余裕). */
+const MAX_TOKENS = 8192;
+
+/** LLM system prompt — Python `_summarize_logs` l.160-163 と byte 等価. */
+const SYSTEM_PROMPT =
+  'あなたは MAKOTOくんの日報生成バッチです。' +
+  '渡されたセッションログだけを要約し、DM と共有スペースを絶対に混在させません。';
+
+// ============================================================================
+// Pure helpers (byte-equivalent ports)
+// ============================================================================
+
+/**
+ * Python `_store_id_from_entry` (l.57-72) の TS port.
+ * attachment 配列から `store_name` 一致を最優先、見つからなければ
+ * `instructions` substring 逆引き fallback (legacy mapping 互換) を 1 件返す.
+ */
+export function storeIdFromEntry(
+  entry: UserMappingValue,
+  storeName: string,
+): string | null {
+  const needles = NEEDLES[storeName];
+  if (!needles) {
+    // 未知 store_name は store_name 一致のみで返す (= Python の KeyError と
+    // 同等の挙動だが、本 port は呼出側でガードする前提で null fallback).
+    for (const att of entry.memory_attachments || []) {
+      if (att.store_name === storeName) return att.memory_store_id;
+    }
+    return null;
+  }
+  const [needleA, needleB] = needles;
+  let fallback: string | null = null;
+  for (const att of entry.memory_attachments || []) {
+    if (att.store_name === storeName) {
+      return att.memory_store_id;
+    }
+    const instructions = att.instructions ?? '';
+    if (
+      fallback === null &&
+      instructions.includes(needleA) &&
+      instructions.includes(needleB)
+    ) {
+      fallback = att.memory_store_id;
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Python `_daily_report_prompt` (l.135-150) の TS port — **byte 等価**.
+ * 改行 / 句読点 / 形式見出しを 1 字違わず再現する.
+ */
+export function dailyReportPrompt(
+  route: ReportRoute,
+  dateLabel: string,
+  logs: ReadonlyArray<[string, string]>,
+): string {
+  const source = logs
+    .filter(([, content]) => content.trim().length > 0)
+    .map(([path, content]) => `## Source: ${path}\n\n${content}`)
+    .join('\n\n');
+  return (
+    `${dateLabel} の ${route.title} を作成してください。\n` +
+    '入力ログだけを根拠にし、推測で補完しないでください。\n' +
+    '個人DMと共有スペースの内容を混在させないでください。\n' +
+    '形式:\n' +
+    '# YYYY-MM-DD 日報\n' +
+    '## 主な話題\n' +
+    '## 決定事項\n' +
+    '## 未完了・次アクション\n' +
+    '## 注意点\n\n' +
+    `${source}`
+  );
+}
+
+/**
+ * Python `_default_date_label` (l.223-224) の TS port.
+ * 現在時刻 (UTC) → JST 変換 → 前日 date を ISO 形式で返す.
+ */
+export function defaultDateLabel(now: Date): string {
+  // JST = UTC+9. 24h 前 (= 前日) の JST date を取る.
+  const jstYesterday = new Date(now.getTime() + 9 * 60 * 60 * 1000 - 24 * 60 * 60 * 1000);
+  const yyyy = jstYesterday.getUTCFullYear().toString().padStart(4, '0');
+  const mm = (jstYesterday.getUTCMonth() + 1).toString().padStart(2, '0');
+  const dd = jstYesterday.getUTCDate().toString().padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+// ============================================================================
+// KV mapping loader
+// ============================================================================
+
+/**
+ * KV `user_mapping:*` を全件 list して `{email → UserMappingValue}` の Map を返す.
+ * Python `cma_session_resolver.SessionCredentialResolver._mapping` を
+ * Cloudflare KV 版に置換する集約処理.
+ *
+ * paging まで実装 (1000 keys/page、現状 user 数 << 1000 だが将来用).
+ */
+export async function loadAllUserMappings(
+  kv: KVNamespace,
+): Promise<Map<string, UserMappingValue>> {
+  const out = new Map<string, UserMappingValue>();
+  let cursor: string | undefined;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const listResult = await kv.list({
+      prefix: KV_USER_MAPPING_PREFIX,
+      cursor,
+    });
+    for (const entry of listResult.keys) {
+      const email = entry.name.slice(KV_USER_MAPPING_PREFIX.length);
+      const value = (await kv.get(entry.name, 'json')) as UserMappingValue | null;
+      if (value !== null) {
+        out.set(email, value);
+      }
+    }
+    if (listResult.list_complete) break;
+    cursor = listResult.cursor;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+// ============================================================================
+// Memory Store ops (SDK-driven)
+// ============================================================================
+
+interface MemoryListItem {
+  type?: unknown;
+  id?: unknown;
+  path?: unknown;
+}
+
+interface MemoryRetrieveItem {
+  content?: unknown;
+}
+
+/**
+ * Python `_memory_content` + `_retrieve_memory_content` (l.106-119) の TS port.
+ * content は str / list[block] のどちらでもありうるので join する.
+ */
+function extractMemoryContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (typeof block === 'string') {
+        parts.push(block);
+      } else if (block && typeof block === 'object') {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === 'string') parts.push(text);
+      }
+    }
+    return parts.join('\n');
+  }
+  return '';
+}
+
+/**
+ * Python `_list_date_session_logs` (l.122-132) の TS port.
+ * 指定 store の memory 一覧から `/<date>/` prefix の memory を全件 retrieve し、
+ * `[path, content]` の sorted tuple list を返す.
+ */
+export async function listDateSessionLogs(
+  client: Anthropic,
+  storeId: string,
+  dateLabel: string,
+): Promise<Array<[string, string]>> {
+  const prefix = `/${dateLabel}/`;
+  const out: Array<[string, string]> = [];
+  const page = await client.beta.memoryStores.memories.list(storeId);
+  for await (const rawItem of page as unknown as AsyncIterable<MemoryListItem>) {
+    if (rawItem.type !== 'memory') continue;
+    const path = typeof rawItem.path === 'string' ? rawItem.path : '';
+    const id = typeof rawItem.id === 'string' ? rawItem.id : '';
+    if (!path.startsWith(prefix)) continue;
+    if (!id) continue;
+    const retrieved = (await client.beta.memoryStores.memories.retrieve(id, {
+      memory_store_id: storeId,
+    })) as MemoryRetrieveItem;
+    out.push([path, extractMemoryContent(retrieved.content)]);
+  }
+  // Python `sorted(out)` (= tuple compare = path 昇順).
+  out.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return out;
+}
+
+/**
+ * Python `_write_report` (l.178-193) の TS port.
+ * 既存 `/<date>.md` があれば update、なければ create.
+ */
+export async function writeReport(
+  client: Anthropic,
+  storeId: string,
+  dateLabel: string,
+  content: string,
+): Promise<string> {
+  const path = `/${dateLabel}.md`;
+  const page = await client.beta.memoryStores.memories.list(storeId);
+  let existingId: string | null = null;
+  for await (const rawItem of page as unknown as AsyncIterable<MemoryListItem>) {
+    if (rawItem.type !== 'memory') continue;
+    const itemPath = typeof rawItem.path === 'string' ? rawItem.path : '';
+    const itemId = typeof rawItem.id === 'string' ? rawItem.id : '';
+    if (itemPath === path && itemId) {
+      existingId = itemId;
+      break;
+    }
+  }
+  if (existingId !== null) {
+    await client.beta.memoryStores.memories.update(existingId, {
+      memory_store_id: storeId,
+      content,
+    });
+  } else {
+    await client.beta.memoryStores.memories.create(storeId, {
+      content,
+      path,
+    });
+  }
+  return path;
+}
+
+// ============================================================================
+// LLM summarize
+// ============================================================================
+
+interface MessagesCreateResponse {
+  content?: unknown;
+}
+
+/**
+ * Python `_summarize_logs` (l.153-175) の TS port.
+ * logs 0 件時は `# {date_label} {route.title}\n\n新着セッションなし。\n` を
+ * LLM 呼出なしで返す (byte 等価).
+ *
+ * logs ある時は `client.messages.create` (= Anthropic Messages API) を 1 回叩く.
+ * Python は Managed Agent + `run_session` 経由だが、TS は agent lifecycle を
+ * 持たず軽量化する (tools 空・system prompt 固定 = 挙動は等価).
+ */
+export async function summarizeLogs(
+  client: Anthropic,
+  route: ReportRoute,
+  dateLabel: string,
+  logs: ReadonlyArray<[string, string]>,
+  model: string,
+): Promise<string> {
+  if (logs.length === 0) {
+    return `# ${dateLabel} ${route.title}\n\n新着セッションなし。\n`;
+  }
+  const userPrompt = dailyReportPrompt(route, dateLabel, logs);
+  const response = (await client.messages.create({
+    model,
+    max_tokens: MAX_TOKENS,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: userPrompt }],
+  })) as MessagesCreateResponse;
+  const blocks = Array.isArray(response.content) ? response.content : [];
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (block && typeof block === 'object') {
+      const b = block as { type?: unknown; text?: unknown };
+      if (b.type === 'text' && typeof b.text === 'string') {
+        parts.push(b.text);
+      }
+    }
+  }
+  // Python: `"".join(chunks).strip() + "\n"` (l.175).
+  return parts.join('').trim() + '\n';
+}
+
+// ============================================================================
+// Route pair resolver
+// ============================================================================
+
+/**
+ * 1 route ぶんの `(label, source_store_id, target_store_id)` tuple 配列を作る.
+ * Python `_route_store_pairs` (l.86-103) の TS port.
+ *
+ * shared: singleton 1 件 (= 最初の email-sorted user mapping から抜く. 全 user
+ * で同一 shared_store 前提).
+ * DM: per-user 複数 tuple (= email 昇順で iterate, source/target 両方が
+ * 揃った user のみ pair に含める).
+ */
+export function routeStorePairs(
+  mapping: Map<string, UserMappingValue>,
+  route: ReportRoute,
+): Array<[string, string, string]> {
+  const sortedEmails = Array.from(mapping.keys()).sort();
+  if (route.kind === 'shared') {
+    // Python `_store_id_from_mapping`: entries を順に走査して最初に見つかった
+    // store_id を採用 (entries は dict の values + default の順). TS では
+    // email-sorted user mapping を順に走査する近似で同一結果 (全 user で
+    // 共有 store は同じ id のはずなので、どの user から抜いても等価).
+    for (const email of sortedEmails) {
+      const entry = mapping.get(email)!;
+      const source = storeIdFromEntry(entry, route.source_store_name);
+      const target = storeIdFromEntry(entry, route.target_store_name);
+      if (source && target) {
+        return [['shared', source, target]];
+      }
+    }
+    throw new Error(`store not found in mapping: ${route.source_store_name}`);
+  }
+
+  const pairs: Array<[string, string, string]> = [];
+  for (const email of sortedEmails) {
+    const entry = mapping.get(email)!;
+    const source = storeIdFromEntry(entry, route.source_store_name);
+    const target = storeIdFromEntry(entry, route.target_store_name);
+    if (source && target) {
+      const label = entry.user_slug || slugFromEmail(email);
+      pairs.push([label, source, target]);
+    }
+  }
+  if (pairs.length === 0) {
+    throw new Error('no user-scoped DM daily-report stores found');
+  }
+  return pairs;
+}
+
+/**
+ * Python `cma_session_resolver.slug_from_email` (l.509-512) の最小 TS port.
+ * `src/lib/session-log.ts:slugFromEmail` と同等だが循環 import を避けて
+ * 直接実装する.
+ */
+function slugFromEmail(email: string): string {
+  const at = email.indexOf('@');
+  const local = at === -1 ? email : email.slice(0, at);
+  return local.replace(/\./g, '-').toLowerCase();
+}
+
+// ============================================================================
+// Main entry (Cloudflare scheduled handler から呼ぶ)
+// ============================================================================
+
+export interface DailyReportRunInput {
+  kv: KVNamespace;
+  client: Anthropic;
+  dateLabel: string;
+  model: string;
+  dryRun: boolean;
+}
+
+export interface DailyReportRouteResult {
+  source_store_id: string;
+  target_store_id: string;
+  log_count: number;
+  output_path: string;
+  chars: number;
+  /** error 文字列 (route 単位 failure isolation で集約). 成功時は無し. */
+  error?: string;
+}
+
+/**
+ * Python `generate_daily_reports` (l.196-220) の TS port.
+ * 全 route 全 user で逐次実行し、result を集約する.
+ *
+ * **failure isolation**: 1 user / 1 route のエラーで全体を落とさず、
+ * その route だけ error 文字列を載せて次へ進む (= scheduled handler は
+ * "best effort" バッチであるため).
+ */
+export async function generateDailyReports(
+  input: DailyReportRunInput,
+): Promise<Record<string, DailyReportRouteResult>> {
+  const { kv, client, dateLabel, model, dryRun } = input;
+  const mapping = await loadAllUserMappings(kv);
+  const result: Record<string, DailyReportRouteResult> = {};
+
+  for (const route of REPORT_ROUTES) {
+    let pairs: Array<[string, string, string]>;
+    try {
+      pairs = routeStorePairs(mapping, route);
+    } catch (error) {
+      // mapping 不在 / store_name 不在は route 単位 fatal だが、他 route には
+      // 影響させない. error を集約 result に載せる.
+      const key = route.kind === 'shared' ? 'shared' : `dm:_route_init`;
+      result[key] = {
+        source_store_id: '',
+        target_store_id: '',
+        log_count: 0,
+        output_path: '',
+        chars: 0,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      continue;
+    }
+
+    for (const [label, sourceStoreId, targetStoreId] of pairs) {
+      const key = route.kind === 'shared' ? 'shared' : `dm:${label}`;
+      try {
+        const logs = await listDateSessionLogs(client, sourceStoreId, dateLabel);
+        const report = await summarizeLogs(client, route, dateLabel, logs, model);
+        let outputPath = `/${dateLabel}.md`;
+        if (!dryRun) {
+          outputPath = await writeReport(client, targetStoreId, dateLabel, report);
+        }
+        result[key] = {
+          source_store_id: sourceStoreId,
+          target_store_id: targetStoreId,
+          log_count: logs.length,
+          output_path: outputPath,
+          chars: report.length,
+        };
+      } catch (error) {
+        // 1 user の messages.create / list / write 失敗で他 user を巻き込まない.
+        result[key] = {
+          source_store_id: sourceStoreId,
+          target_store_id: targetStoreId,
+          log_count: 0,
+          output_path: '',
+          chars: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  }
+  return result;
+}
