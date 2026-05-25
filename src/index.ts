@@ -78,7 +78,7 @@ export default {
         try {
           const result = await pruneOlderThan(env.DB, cutoff);
           console.log(
-            `[cron] prune events=${result.events} sessions=${result.sessions} inbox=${result.inbox} sentMessages=${result.sentMessages} cutoff=${new Date(cutoff).toISOString()}`,
+            `[cron] prune sentMessages=${result.sentMessages} cutoff=${new Date(cutoff).toISOString()}`,
           );
         } catch (error) {
           console.error("[cron] prune failed", error);
