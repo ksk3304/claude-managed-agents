@@ -203,21 +203,33 @@ async function performRefresh(
     if (resp.status === 401 || resp.status === 403) {
       // refresh_token itself is revoked / invalid → fail-close (S6).
       // Purge the vault entry and tell the DO to drop its cache so no
-      // other caller serves stale data.
+      // other caller serves stale data. We check the invalidate result
+      // because a silent failure here would leave the DO serving a
+      // stale access_token for up to ~50 min after a confirmed revoke.
       await deleteRefreshToken(deps.kv, userSlug);
-      await lease.invalidate({
+      const inv = await lease.invalidate({
         userSlug,
         callerSessionId,
         reason: `refresh_token_revoked_${resp.status}`,
       });
+      if (!inv.ok) {
+        console.error(
+          `[workspace-oauth] DO invalidate failed after Google ${resp.status} for user=${userSlug} — cache may still serve stale token until eviction`,
+        );
+      }
     } else {
-      await lease.release({
+      const rel = await lease.release({
         userSlug,
         leaseId,
         outcome: 'fail',
         callerSessionId,
         notes: `google_${resp.status}:${text.slice(0, 256)}`,
       });
+      if (!rel.ok) {
+        console.error(
+          `[workspace-oauth] DO release failed after Google ${resp.status} for user=${userSlug} lease=${leaseId} — lease may block retries until TTL expires`,
+        );
+      }
     }
     return null;
   }
@@ -236,7 +248,7 @@ async function performRefresh(
     refreshTokenRotated = true;
   }
 
-  await lease.commit({
+  const committed = await lease.commit({
     userSlug,
     leaseId,
     accessToken: body.access_token,
@@ -244,6 +256,22 @@ async function performRefresh(
     refreshTokenRotated,
     callerSessionId,
   });
+  if (!committed.ok) {
+    // Lease was lost (TTL expired before we got back from Google, or a
+    // different worker took it). Refusing to commit means the access
+    // token was never audited under our lease and the DO will not
+    // serve it from cache — fail-close: the caller retries the whole
+    // getAccessToken flow on the next request. Release best-effort so
+    // any zombie lease record is cleared.
+    await lease.release({
+      userSlug,
+      leaseId,
+      outcome: 'fail',
+      callerSessionId,
+      notes: `commit_rejected:${committed.reason ?? 'unknown'}`,
+    });
+    return null;
+  }
 
   return {
     access_token: body.access_token,
@@ -300,12 +328,29 @@ export async function revokeUser(
   if (deps.oauthLease) {
     // Drop the DO's cached access_token + any in-flight lease for this
     // user. The DO writes the revoke audit row itself so we don't
-    // double-audit when the lease is wired up.
-    await deps.oauthLease.invalidate({
+    // double-audit when the lease is wired up. We check the result
+    // because a silent failure would leave the DO serving a cached
+    // access_token for up to ~50 min after the user/operator revoked.
+    const inv = await deps.oauthLease.invalidate({
       userSlug,
       callerSessionId: options.callerSessionId ?? null,
       reason: 'revoke',
     });
+    if (!inv.ok) {
+      // Record the DO failure as a D1 audit row so the revoke is at
+      // least visible, and re-throw so the caller can surface it to
+      // the user (a successful Google /revoke followed by a failed
+      // cache purge is not "success").
+      await recordOAuthAudit(deps.db, {
+        timestamp_ms: Date.now(),
+        user_slug: userSlug,
+        caller_session_id: options.callerSessionId,
+        action: 'revoke',
+        outcome: 'fail',
+        notes: 'oauth_lease_invalidate_failed',
+      });
+      throw new Error(`oauth lease invalidate failed for user=${userSlug}`);
+    }
   } else {
     // CLI / bootstrap path with no lease wired in — keep auditing.
     await recordOAuthAudit(deps.db, {
