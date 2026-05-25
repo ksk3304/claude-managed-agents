@@ -72,6 +72,28 @@ vi.mock('../src/lib/session', async (importOriginal) => {
   };
 });
 
+// Stub postChatMessage so dispatch tests can assert on Chat notification
+// content without going through the SA JWT exchange (= a real RSA key
+// fixture would only verify chat-api.ts's parser, which is already
+// covered by its own unit tests). Capture calls on `chatApiMock.posts`.
+const chatApiMock = {
+  posts: [] as Array<{ deps: unknown; spaceName: string; text: string }>,
+};
+vi.mock('../src/lib/chat-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/chat-api')>();
+  return {
+    ...actual,
+    postChatMessage: async (
+      deps: unknown,
+      spaceName: string,
+      text: string,
+    ) => {
+      chatApiMock.posts.push({ deps, spaceName, text });
+      return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}` };
+    },
+  };
+});
+
 function installFakeAnthropic(opts: FakeAnthOpts): void {
   (globalThis as unknown as { __makotoFakeAnth: Anthropic }).__makotoFakeAnth = makeFakeAnthropic(
     opts,
@@ -264,6 +286,113 @@ describe('agentmailDispatch', () => {
       expect(result.kind).toBe('skipped');
       if (result.kind === 'skipped') expect(result.reason).toBe('lost_claim_before_send');
       expect(amCalled).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // #186 #2 cold inbound notify-only path
+  // ---------------------------------------------------------------------------
+  it('cold inbound with MAKOTO_NOTIFY_SPACE + CHAT_SA_KEY_JSON → notify only + committed (no bot run)', async () => {
+    chatApiMock.posts.length = 0;
+    const ctx = makeDispatchContext({
+      env: {
+        MAKOTO_NOTIFY_SPACE: 'spaces/ABCNotify',
+        // Content doesn't matter — chat-api.ts is mocked at the module
+        // boundary above. Production needs a real SA JSON; tests don't.
+        CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await agentmailDispatch(ctx);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    const post = chatApiMock.posts[0]!;
+    expect(post.spaceName).toBe('spaces/ABCNotify');
+    expect(post.text).toContain('📨 新規問い合わせ (cold inbound)');
+    expect(post.text).toContain('From: alice@example.com');
+    expect(post.text).toContain('件名: こんにちは');
+    // No AgentMail send and no sent_messages row (= bot didn't run).
+    const sent = (
+      ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } }
+    )._tables.sent_messages;
+    expect(sent.size).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // #186 #4 continuation auto-reply notification path
+  // ---------------------------------------------------------------------------
+  it('continuation success with notify env → 📤 autoreply notification posted', async () => {
+    chatApiMock.posts.length = 0;
+    const ctx = makeDispatchContext({
+      env: {
+        MAKOTO_NOTIFY_SPACE: 'spaces/ABCNotify',
+        CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
+      },
+      message: {
+        ...INBOUND_MSG,
+        subject: 'Re: こんにちは', // → reChainDepth >= 1 → continuation path
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    const replyBody = 'ご連絡ありがとうございます。';
+    installFakeAnthropic({
+      sessionId: 'sesn_new_2',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            `了解しました。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re: こんにちは","body":"${replyBody}"}`,
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    // Mock AgentMail REST send (kept as fetch mock; AgentMail isn't
+    // module-mocked).
+    const amCalls: unknown[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: init.body });
+      return new Response(
+        JSON.stringify({ message_id: 'msg_out_2', rfc822_message_id: '<out-2@example.com>' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+
+      // 📤 autoreply notification posted exactly once with the sent
+      // body inlined.
+      expect(chatApiMock.posts).toHaveLength(1);
+      const post = chatApiMock.posts[0]!;
+      expect(post.spaceName).toBe('spaces/ABCNotify');
+      expect(post.text).toContain('📤 continuation 自動返信を送信しました');
+      expect(post.text).toContain('宛先: alice@example.com');
+      expect(post.text).toContain('件名: Re: こんにちは');
+      expect(post.text).toContain(replyBody);
+
+      // AgentMail send happened + sent_messages row created.
+      expect(amCalls.length).toBeGreaterThan(0);
+      const sent = (
+        ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } }
+      )._tables.sent_messages;
+      expect(sent.size).toBe(1);
     } finally {
       globalThis.fetch = origFetch;
     }

@@ -62,6 +62,11 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import { ChatApiError, postChatMessage } from '../lib/chat-api';
+import {
+  buildAutoreplyNotificationText,
+  buildInboundNotificationText,
+} from '../lib/agentmail-notification';
 import { confirmOwner } from '../lib/dedupe';
 import {
   buildContinuationPrompt,
@@ -135,6 +140,27 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
 
   // 4. Continuation vs first-contact branch.
   const isContinuation = sessionId !== null || reChainDepth(message.subject) >= 1;
+
+  // 4a. Cold inbound notify-only path (Issue #186 #2). When the
+  // operator has wired a notify space + Chat SA key, defer cold
+  // inbound (= no continuation match) to a human decision: post a
+  // `📨 新規問い合わせ` to the notify space and commit without
+  // running the bot. Mirrors Cloud Run
+  // `cma_agentmail_inbound.py:_notify_only(is_continuation=False)`
+  // at l.1755.
+  //
+  // Env unset = legacy "always run the bot" behaviour preserved so
+  // existing dispatch tests + deployments without a notify space
+  // configured don't change.
+  if (
+    !isContinuation &&
+    env.MAKOTO_NOTIFY_SPACE &&
+    env.CHAT_SA_KEY_JSON
+  ) {
+    await tryNotifyInbound(env, message, false, eventKey);
+    return { kind: 'committed' };
+  }
+
   let userMessage: string;
   if (sessionId === null) {
     try {
@@ -244,6 +270,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   const amClient = new AgentMailClient(env.AGENTMAIL_API_KEY, amClientOpts);
   const parentMessageId = typeof message.id === 'string' ? message.id : '';
 
+  const successfullySentBodies: string[] = [];
   for (const m of markers) {
     try {
       const sendResult = await deliverMarker(amClient, m, {
@@ -253,6 +280,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
         sessionId,
         jobId: `mail-send/${sessionId}`,
       });
+      successfullySentBodies.push(m.body);
       // Record outbound so future inbound replies can thread back.
       // `rfc822_message_id` may be empty if AgentMail didn't return one
       // — we still record the AgentMail-opaque id so the row exists.
@@ -283,6 +311,29 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       // recovers anything we couldn't deliver.
       return { kind: 'skipped', reason: 'agentmail_permanent_failure' };
     }
+  }
+
+  // 10. Continuation auto-reply notification (Issue #186 #4). When
+  // AgentMail accepted every marker, post a `📤 continuation 自動返信を
+  // 送信しました` to the notify space so the operator gets an FYI of
+  // exactly what got auto-replied. Mirrors Cloud Run
+  // `_auto_reply_continuation` post-send block at
+  // `cma_agentmail_inbound.py:l.2019-2024`. Failure is non-fatal — the
+  // outbound mail is already accepted so we keep `committed` (mirrors
+  // the `AUTO_REPLIED` terminal state from Python l.2025).
+  if (
+    isContinuation &&
+    env.MAKOTO_NOTIFY_SPACE &&
+    env.CHAT_SA_KEY_JSON &&
+    successfullySentBodies.length > 0
+  ) {
+    const replyTextForNotify = successfullySentBodies.join('\n---\n');
+    await tryNotifyAutoreplyForInbound(
+      env,
+      message,
+      replyTextForNotify,
+      eventKey,
+    );
   }
 
   return { kind: 'committed' };
@@ -382,6 +433,89 @@ function extractInboxId(event: AgentMailDispatchContext['event']): string {
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return '';
+}
+
+/**
+ * Post an inbound `📨` notification to `env.MAKOTO_NOTIFY_SPACE`. Used
+ * by the cold-inbound notify-only path (#186 #2). Failure is logged
+ * but never bubbled — the inbound is already committed at this point
+ * and we don't want a transient Chat outage to retry the bridge.
+ */
+async function tryNotifyInbound(
+  env: AgentMailDispatchContext['env'],
+  message: AgentMailMessage,
+  isContinuation: boolean,
+  eventKey: string,
+): Promise<void> {
+  const notifySpace = env.MAKOTO_NOTIFY_SPACE;
+  const saKeyJson = env.CHAT_SA_KEY_JSON;
+  if (!notifySpace || !saKeyJson) return; // gated by caller, but be safe.
+  const text = buildInboundNotificationText(
+    {
+      from: typeof message.from === 'string' ? message.from : '',
+      subject: typeof message.subject === 'string' ? message.subject : '',
+      body: extractBody(message),
+    },
+    isContinuation,
+  );
+  try {
+    await postChatMessage({ saKeyJson }, notifySpace, text);
+    console.log(
+      `[agentmail-dispatch] notify_posted eventKey=${eventKey} kind=${isContinuation ? 'continuation' : 'cold'}`,
+    );
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(
+      `[agentmail-dispatch] notify_failed eventKey=${eventKey} kind=${isContinuation ? 'continuation' : 'cold'} reason=${reason}`,
+    );
+  }
+}
+
+/**
+ * Post a continuation auto-reply `📤` confirmation to
+ * `env.MAKOTO_NOTIFY_SPACE` after the outbound mail was accepted by
+ * AgentMail. Failure is logged but never bubbled — the outbound mail
+ * already shipped, so we keep `committed` (= mirrors Cloud Run
+ * `AUTO_REPLIED` terminal state, l.2025).
+ */
+async function tryNotifyAutoreplyForInbound(
+  env: AgentMailDispatchContext['env'],
+  message: AgentMailMessage,
+  replyText: string,
+  eventKey: string,
+): Promise<void> {
+  const notifySpace = env.MAKOTO_NOTIFY_SPACE;
+  const saKeyJson = env.CHAT_SA_KEY_JSON;
+  if (!notifySpace || !saKeyJson) return; // gated by caller, but be safe.
+  const text = buildAutoreplyNotificationText(
+    {
+      from: typeof message.from === 'string' ? message.from : '',
+      subject: typeof message.subject === 'string' ? message.subject : '',
+      body: extractBody(message),
+    },
+    replyText,
+  );
+  try {
+    await postChatMessage({ saKeyJson }, notifySpace, text);
+    console.log(
+      `[agentmail-dispatch] autoreply_notify_posted eventKey=${eventKey}`,
+    );
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(
+      `[agentmail-dispatch] autoreply_notify_failed eventKey=${eventKey} reason=${reason}`,
+    );
+  }
 }
 
 // Re-export the outcome type so callers can stay narrow.
