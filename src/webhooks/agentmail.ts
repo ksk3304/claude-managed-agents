@@ -166,20 +166,6 @@ export async function handleAgentMailWebhook(
   const svixTimestamp = request.headers.get('svix-timestamp');
   const svixSignature = request.headers.get('svix-signature');
 
-  // 0. EMERGENCY KILL SWITCH (Issue #186 cutover、2026-05-25 早朝)
-  //    AgentMail webhook PATCH では url / enabled が immutable で API では
-  //    停止不可。Phase 0/1 の org 不整合 (Worker の ANTHROPIC_API_KEY が
-  //    個人 org、agent が会社 org) で sessions.create が 404 ループ。
-  //    `MAKOTO_EMERGENCY_KILL_SWITCH=1` の時 enqueue 前に skip + 200 返却 =
-  //    AgentMail には正常応答、Queue にも入らない = ループ絶対再発防止。
-  //    root cause 解決後は env 削除して通常運用に戻す。
-  if ((env as Env & { MAKOTO_EMERGENCY_KILL_SWITCH?: string }).MAKOTO_EMERGENCY_KILL_SWITCH === '1') {
-    console.log(
-      `[agentmail-webhook] EMERGENCY_KILL_SWITCH active cfRay=${cfRay} svixId=${svixId ?? 'none'} skipped`,
-    );
-    return Response.json({ status: 'skipped (emergency kill switch active)' });
-  }
-
   // 1. Missing headers
   if (!svixId || !svixTimestamp || !svixSignature) {
     const headerNames = Array.from(request.headers.keys()).join(',');
