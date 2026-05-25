@@ -6,7 +6,7 @@
  *   - text events accumulate into assistantText
  *   - `agent.custom_tool_use` events trigger the dispatcher and the
  *     result is posted back as `user.custom_tool_result`
- *   - terminal `session.completed` / `session.failed` end the loop
+ *   - terminal `session.status_idle` / `session.status_terminated` end the loop
  *   - tool-call soft cap breaks the loop with the cap label
  */
 
@@ -55,7 +55,7 @@ describe('sendAndStreamWithToolDispatch', () => {
         { type: 'agent.message.start' },
         { type: 'agent.message.text_delta', text: 'Hello, ' },
         { type: 'agent.message.text_delta', text: 'world.' },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
     const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
@@ -65,7 +65,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       toolDispatcher: dispatcher,
     });
     expect(r.assistantText).toBe('Hello, world.');
-    expect(r.terminalEventType).toBe('session.completed');
+    expect(r.terminalEventType).toBe('session.status_idle');
   });
 
   it('dispatches agent.custom_tool_use and posts a user.custom_tool_result', async () => {
@@ -78,7 +78,7 @@ describe('sendAndStreamWithToolDispatch', () => {
           name: 'drive_search',
           input: { query: 'x' },
         },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),
     });
@@ -106,7 +106,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     const client = makeFakeClient({
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),
     });
@@ -128,7 +128,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
         { type: 'agent.message.text_delta', text: 'done' },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
     const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
@@ -137,13 +137,13 @@ describe('sendAndStreamWithToolDispatch', () => {
       userMessage: 'x',
       toolDispatcher: dispatcher,
     });
-    expect(r.terminalEventType).toBe('session.completed');
+    expect(r.terminalEventType).toBe('session.status_idle');
     expect(r.assistantText).toContain('done');
   });
 
-  it('stops on session.failed', async () => {
+  it('stops on session.status_terminated', async () => {
     const client = makeFakeClient({
-      events: [{ type: 'agent.message.text_delta', text: 'partial' }, { type: 'session.failed' }],
+      events: [{ type: 'agent.message.text_delta', text: 'partial' }, { type: 'session.status_terminated' }],
     });
     const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
     const r = await sendAndStreamWithToolDispatch(client, {
@@ -151,7 +151,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       userMessage: 'x',
       toolDispatcher: dispatcher,
     });
-    expect(r.terminalEventType).toBe('session.failed');
+    expect(r.terminalEventType).toBe('session.status_terminated');
   });
 
   it('cap on max tool calls breaks the loop', async () => {
@@ -162,7 +162,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       input: {},
     }));
     const client = makeFakeClient({
-      events: [...tools, { type: 'session.completed' }],
+      events: [...tools, { type: 'session.status_idle' }],
     });
     let dispatched = 0;
     const dispatcher: ToolDispatcher = async () => {
@@ -184,7 +184,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     const client = makeFakeClient({
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),
     });
@@ -196,7 +196,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       userMessage: 'x',
       toolDispatcher: dispatcher,
     });
-    expect(r.terminalEventType).toBe('session.completed');
+    expect(r.terminalEventType).toBe('session.status_idle');
     const result = sent[1] as { events: Array<Record<string, unknown>> };
     expect(result.events[0]!.is_error).toBe(true);
   });
@@ -209,7 +209,7 @@ describe('sendAndStreamWithToolDispatch', () => {
           text:
             'preface\nEMAIL_SEND:{"to":"x@y","subject":"s","body":"b"}\nafter',
         },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
     const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });

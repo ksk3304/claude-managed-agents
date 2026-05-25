@@ -187,7 +187,7 @@ describe('agentmailDispatch', () => {
           text:
             '了解しました。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re: こんにちは","body":"ご連絡ありがとうございます。"}',
         },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
 
@@ -214,7 +214,7 @@ describe('agentmailDispatch', () => {
     installFakeAnthropic({
       events: [
         { type: 'agent.message.text', text: '内部メモのみ、返信しません。' },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
 
@@ -245,7 +245,7 @@ describe('agentmailDispatch', () => {
           type: 'agent.message.text',
           text: 'EMAIL_SEND:{"to":"a@x","subject":"s","body":"b"}',
         },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
 
@@ -287,7 +287,7 @@ describe('agentmailDispatch', () => {
     installFakeAnthropic({
       events: [
         { type: 'agent.message.text', text: 'EMAIL_SEND:{"to":"a@x","subject":"s","body":"b"}' },
-        { type: 'session.completed' },
+        { type: 'session.status_idle' },
       ],
     });
 

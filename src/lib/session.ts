@@ -12,7 +12,7 @@
  *
  * Event handling defers to the SDK's `events.stream` async iterator;
  * we don't reinvent the SSE plumbing. Terminal events
- * (`session.completed`, `session.failed`) end the loop.
+ * (`session.status_idle`, `session.status_terminated`) end the loop.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 step 5 — 層 3)
  * Spec: plan-draft.md §4 session + A24 (agent: vs agent_id: SDK shape)
@@ -97,7 +97,7 @@ export interface SendAndStreamResult {
    * becomes one outbound AgentMail call.
    */
   emailSendMarkers: EmailSendMarker[];
-  /** Last terminal event type observed (`session.completed`/`failed`). */
+  /** Last terminal event type observed (`session.status_idle`/`session.status_terminated`). */
   terminalEventType?: string;
 }
 
@@ -111,7 +111,7 @@ const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
  * Stream contract (SDK `events.stream`):
  *   - SDK exposes an async iterator over server-sent events
  *   - relevant event types: `*.text_delta`, `*.text`, `*.message`,
- *     `session.completed`, `session.failed`
+ *     `session.status_idle`, `session.status_terminated`
  *   - we accumulate any string content from text-bearing events
  *     into `assistantText` then run `parseEmailSendMarkers` once at
  *     the end (cheaper than per-delta parsing)
@@ -163,7 +163,7 @@ export async function sendAndStream(
       const text = pickString(ev, 'text') ?? pickString(ev, 'delta');
       if (text) assistantText += text;
 
-      if (evType === 'session.completed' || evType === 'session.failed') {
+      if (evType === 'session.status_idle' || evType === 'session.status_terminated') {
         terminalEventType = evType;
         break;
       }
@@ -249,7 +249,7 @@ const DEFAULT_MAX_TOOL_CALLS = 32;
  *   2. Drain events.stream:
  *      - `*.text_delta` / `*.text` → accumulate into `assistantText`
  *      - `agent.custom_tool_use` → dispatch + post `user.custom_tool_result`
- *      - `session.completed` / `session.failed` → break
+ *      - `session.status_idle` / `session.status_terminated` → break
  *   3. After break (or timeout), return assistant text + EMAIL_SEND markers.
  *
  * Note: `agent.tool_use` (built-in tools like bash) is observed but
@@ -356,7 +356,7 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       // 3. terminal events.
-      if (evType === 'session.completed' || evType === 'session.failed') {
+      if (evType === 'session.status_idle' || evType === 'session.status_terminated') {
         terminalEventType = evType;
         break;
       }
