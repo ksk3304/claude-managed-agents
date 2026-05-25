@@ -23,6 +23,7 @@ import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { handleGoogleChatWebhook } from "./webhooks/google-chat";
 import type { ChatQueueMessage } from "./webhooks/google-chat";
+import { handleChatQueue } from "./queue/chat-event-handler";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { OAuthLease } from "./durable-objects/oauth-lease";
 import {
@@ -143,18 +144,15 @@ export default {
     ctx: ExecutionContext,
   ): Promise<void> {
     if (batch.queue === "makoto-chat-queue") {
-      // Phase B (= sessions.create + tool dispatch + 各 marker 解析) は
-      // 別 subagent が実装する。本 stub は受信した event をログに残して
-      // ack するだけ。`commitDone` も Phase B の責務なのでここでは
-      // 触らない (= claim は alive のまま lease 期限切れ後に successor が
-      // takeover 可能、Phase A 単体運用でも redelivery は dedupe で抑止)。
-      for (const msg of batch.messages) {
-        const body = msg.body as ChatQueueMessage;
-        console.log(
-          `[chat-queue] message received, Phase B implementation pending eventKey=${body.eventKey}`,
-        );
-        msg.ack();
-      }
+      // Phase B (= sessions.create + tool dispatch + 各 marker 解析 +
+      // current space 投稿 + session-log + commitDone) を委譲する。
+      // `handleChatQueue` 内で msg.ack / msg.retry を判定するので
+      // ここでは return のみ。
+      await handleChatQueue(
+        batch as MessageBatch<ChatQueueMessage>,
+        env,
+        ctx,
+      );
       return;
     }
     await handleAgentMailQueue(

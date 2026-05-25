@@ -1,0 +1,285 @@
+/**
+ * Session orchestrator — Google Chat reactive event 1 件分の
+ * **session 構築 + LLM 呼出 + stream consume** をまとめる lib.
+ *
+ * Cloud Run の `cma_gchat_bot.py:_handle_event` (l.3784, ~1,668 行) のうち
+ * 「sessions.create or 既存 thread session 検索 → user message 組み立て →
+ *  sendAndStreamWithToolDispatch」核心部分のみ TS port。本 lib では
+ * marker parse / AgentMail send / current space 投稿 / session-log append
+ * は扱わない (= `chat-event-handler.ts` の責務)。
+ *
+ * 中間版 scope (= Day 3 残時間優先) のため、Cloud Run の精緻な
+ * `_build_user_message` (cap-recovery + intent + speaker prefix + 添付通知)
+ * は省略し、最小 envelope (`<context>...\n</context>\n<user_message>...`) で
+ * agent に渡す。完全 port は `// TODO(#186 follow-up):` で別 Issue 化。
+ *
+ * Issue: ksk3304/makoto-prime#186 (Phase 2 #5 — Google Chat reactive bot, Phase B)
+ * Spec: Day 3 subagent G task brief §設計確定事項 1
+ * Source of truth (Python):
+ *   - scripts/cma_gchat_bot.py l.494-512 (_session_key_for_thread)
+ *   - scripts/cma_gchat_bot.py l.3784-       (_handle_event)
+ */
+
+import type Anthropic from '@anthropic-ai/sdk';
+
+import type { UserMappingValue } from './memory-attach';
+import {
+  buildAnthropicClient,
+  createSessionWithResources,
+  sendAndStreamWithToolDispatch,
+  type SendAndStreamResult,
+  type ToolDispatcher,
+} from './session';
+import {
+  buildMakotoSystemPrompt,
+  logPromptSource,
+  type SystemPromptResult,
+} from './persona-builder';
+import { toResourceParam } from '../types/memory';
+import type { MemoryStoreResourceParam } from '../types/memory';
+
+/** KV key prefix for thread → session lookup. TTL 24h. */
+export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
+const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
+
+/** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
+const SESSION_STREAM_TIMEOUT_MS = 110_000;
+
+/**
+ * `_session_key_for_thread` (Python l.494-512) と byte 等価な KV key を
+ * 組み立てる純関数。sender_email + space + thread の三つ組で per-user per-thread
+ * に振り分ける (issue #1119 = per-user 化)。いずれかが空なら null を返し、
+ * 毎回新規 session として扱わせる (fail-closed)。
+ */
+export function chatThreadSessionKey(
+  senderEmail: string,
+  spaceName: string,
+  threadName: string | null | undefined,
+): string | null {
+  const email = (senderEmail || '').trim().toLowerCase();
+  const space = (spaceName || '').trim();
+  const thread = (threadName || '').trim();
+  if (!email || !space || !thread) return null;
+  return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}`;
+}
+
+/**
+ * orchestrator が必要とする per-event 入力一式。
+ * - `senderEmail` は正規化済 (lowercase) を渡すこと。
+ * - `userMapping` は `readUserMapping` の戻り値 (= user_slug / agent_id /
+ *   memory_attachments を保有)。
+ * - `personaSpec` / `toolsSpec` は静的 import 済の文字列 (caller が
+ *   `src/data/persona-spec.ts` 等から渡す。orchestrator は持たない)。
+ * - `toolDispatcher` は MAKOTOくん 10 tool dispatcher を bind 済の関数。
+ *   caller (chat-event-handler) が `dispatchMakotoTool` を bind して渡す。
+ */
+export interface OrchestrateChatTurnInput {
+  env: Env;
+  /** Pre-built Anthropic client. Falsy when ANTHROPIC_API_KEY missing. */
+  client: Anthropic | null;
+  senderEmail: string;
+  spaceName: string;
+  spaceType: string;
+  threadName: string | null;
+  bodyText: string;
+  userMapping: UserMappingValue;
+  personaSpec: string;
+  toolsSpec: string;
+  toolDispatcher: ToolDispatcher;
+  /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
+  kv?: KVNamespace;
+  /** Stream timeout override (test 用)。 */
+  timeoutMs?: number;
+}
+
+export interface OrchestrateChatTurnResult {
+  sessionId: string;
+  /** 新規 sessions.create したか (= true なら KV put 済)。 */
+  isNewSession: boolean;
+  /** stream の最終 assistantText (marker 含む raw 文字列). */
+  assistantText: string;
+  /** stream 終端 event type (`session.status_idle` / `session.status_terminated` / etc.). */
+  terminalEventType?: string;
+  /** 起動ログ用に取得した system prompt sha 等。caller が必要なら参照. */
+  systemPromptInfo: SystemPromptResult;
+}
+
+/**
+ * orchestrator の致命的エラー型。caller (chat-event-handler) が
+ * msg.retry() か commit か判定する。
+ *   - `no_anthropic_client`     — ANTHROPIC_API_KEY 未設定 / buildAnthropicClient null
+ *   - `sessions_create_failed`  — sessions.create 失敗 (transient = retry 推奨)
+ *   - `stream_failed`           — sendAndStreamWithToolDispatch throw (timeout / SDK error)
+ */
+export type OrchestratorFailureReason =
+  | 'no_anthropic_client'
+  | 'sessions_create_failed'
+  | 'stream_failed';
+
+export class OrchestratorFailure extends Error {
+  readonly reason: OrchestratorFailureReason;
+  readonly cause?: unknown;
+  constructor(reason: OrchestratorFailureReason, message: string, cause?: unknown) {
+    super(message);
+    this.name = 'OrchestratorFailure';
+    this.reason = reason;
+    this.cause = cause;
+  }
+}
+
+/**
+ * 1 reactive turn を駆動する。
+ *
+ * 流れ:
+ *   1. `client` が null なら `OrchestratorFailure('no_anthropic_client')` を throw
+ *   2. thread session key を組み立て KV を引く (key が null = 必ず新規)
+ *   3. KV hit なら既存 sessionId を再利用、miss なら sessions.create + KV put
+ *   4. system prompt 起動ログを 1 回出力 (drift 検出用)
+ *   5. user message envelope を組み立てて `sendAndStreamWithToolDispatch` で
+ *      stream consume
+ *   6. assistantText + sessionId を返す (marker parse は caller 責務)
+ *
+ * 注意: `systemPromptInfo` は **session.create には渡していない**
+ * (= persona は Anthropic Console 側で agent に紐付け済の前提)。
+ * 本 lib は drift 監視のための sha ログを吐く責務を担うのみ。
+ * caller が persona を per-session で差し込みたい (= 動的 system prompt
+ * addendum) なら `// TODO(#186 follow-up): system prompt addendum` 経路を
+ * 起こす。
+ */
+export async function orchestrateChatTurn(
+  input: OrchestrateChatTurnInput,
+): Promise<OrchestrateChatTurnResult> {
+  if (input.client === null) {
+    throw new OrchestratorFailure(
+      'no_anthropic_client',
+      'ANTHROPIC_API_KEY missing — cannot drive session',
+    );
+  }
+  const client = input.client;
+  const kv = input.kv ?? input.env.MAKOTO_KV;
+
+  // ---- system prompt sha ログ (drift 監視) ----
+  let systemPromptInfo: SystemPromptResult;
+  try {
+    systemPromptInfo = await buildMakotoSystemPrompt(input.personaSpec, input.toolsSpec);
+    logPromptSource(systemPromptInfo, { stage: 'reactive' });
+  } catch (err) {
+    // persona/tools spec の build 失敗は致命ではないが警告は出す。
+    // Cloud Run と同じく persona-only fallback で動かす (= 旧挙動)。
+    console.warn(
+      `[chat-event] system prompt build failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    systemPromptInfo = {
+      systemPrompt: input.personaSpec || '',
+      personaBytes: 0,
+      personaSha256: 'failed',
+      toolsBytes: 0,
+      toolsSha256: 'failed',
+      toolsSectionFound: false,
+    };
+  }
+
+  // ---- thread session 解決 ----
+  const sessionKey = chatThreadSessionKey(
+    input.senderEmail,
+    input.spaceName,
+    input.threadName,
+  );
+  let sessionId: string | null = null;
+  if (sessionKey !== null) {
+    try {
+      sessionId = await kv.get(sessionKey);
+    } catch (err) {
+      console.warn(
+        `[chat-event] KV get failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // KV 失敗は致命ではない — 新規 session で続行
+      sessionId = null;
+    }
+  }
+
+  let isNewSession = false;
+  if (sessionId === null) {
+    const resources: MemoryStoreResourceParam[] =
+      input.userMapping.memory_attachments.map(toResourceParam);
+    try {
+      sessionId = await createSessionWithResources(client, {
+        agentId: input.userMapping.agent_id,
+        environmentId: input.env.ENVIRONMENT_ID,
+        resources,
+      });
+    } catch (err) {
+      throw new OrchestratorFailure(
+        'sessions_create_failed',
+        `sessions.create failed for agent=${input.userMapping.agent_id}: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+    isNewSession = true;
+    console.log(
+      `[chat-event] created session=${sessionId} agent=${input.userMapping.agent_id} ` +
+        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
+    );
+    if (sessionKey !== null) {
+      try {
+        await kv.put(sessionKey, sessionId, {
+          expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
+        });
+      } catch (err) {
+        // KV put 失敗は次回が新規 session になるだけ — 致命ではない
+        console.warn(
+          `[chat-event] KV put failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  } else {
+    console.log(
+      `[chat-event] continuing session=${sessionId} agent=${input.userMapping.agent_id} ` +
+        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
+    );
+  }
+
+  // ---- user message envelope ----
+  // 中間版 = 最小 envelope。完全版 (cap-recovery + intent + speaker prefix
+  // + 添付通知) は別 Issue で対応 (= Cloud Run `_build_user_message` 経路の port)。
+  const senderLabel = input.senderEmail;
+  const userMessage =
+    `<context>space_type=${input.spaceType || 'UNKNOWN'} sender=${senderLabel}</context>\n` +
+    `<user_message>${input.bodyText}</user_message>`;
+
+  // ---- stream consume ----
+  let streamResult: SendAndStreamResult;
+  try {
+    streamResult = await sendAndStreamWithToolDispatch(client, {
+      sessionId,
+      userMessage,
+      toolDispatcher: input.toolDispatcher,
+      timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+    });
+  } catch (err) {
+    throw new OrchestratorFailure(
+      'stream_failed',
+      `sendAndStreamWithToolDispatch failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+
+  const result: OrchestrateChatTurnResult = {
+    sessionId,
+    isNewSession,
+    assistantText: streamResult.assistantText,
+    systemPromptInfo,
+  };
+  if (streamResult.terminalEventType !== undefined) {
+    result.terminalEventType = streamResult.terminalEventType;
+  }
+  return result;
+}
+
+/**
+ * Re-export `buildAnthropicClient` so chat-event-handler can build the
+ * client in one place. Kept here (= not re-exported from session.ts
+ * twice) so the orchestrator boundary is the single import surface for
+ * the consumer.
+ */
+export { buildAnthropicClient };

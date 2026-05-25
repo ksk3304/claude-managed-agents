@@ -79,5 +79,22 @@ declare namespace Cloudflare {
      * implemented by a follow-up subagent (#186 #5 Phase B).
      */
     MAKOTO_CHAT_QUEUE: Queue<import('../webhooks/google-chat').ChatQueueMessage>;
+    /**
+     * Google Chat reactive bot displayName (= bot account 表示名)。shared
+     * space で `@<displayName>` mention 検知に使う。未設定なら
+     * `MAKOTOくん` を default とする。
+     *
+     * Used by `src/queue/chat-event-handler.ts:textMentionsBot`.
+     */
+    MAKOTO_BOT_DISPLAY_NAME?: string;
+    /**
+     * AgentMail inbox id used by the reactive Chat bot for outbound
+     * EMAIL_SEND markers. Cloud Run の `cma-bot` inbox 等価 — 1 つの bot
+     * 全体で 1 inbox を共有。未設定だと EMAIL_SEND marker は warn skip
+     * される (= deploy 漏れで accidentally メール送信が止まる方を選ぶ)。
+     *
+     * Provisioned via `wrangler secret put AGENTMAIL_DEFAULT_INBOX_ID`.
+     */
+    AGENTMAIL_DEFAULT_INBOX_ID?: string;
   }
 }
