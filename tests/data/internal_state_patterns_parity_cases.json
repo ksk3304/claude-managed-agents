@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "_comment": "INTERNAL_STATE_PATTERNS parity fixture (Issue #177 Phase 1 中盤 B)。Python (tests/test_cma_log_redaction.py の test_parity_cases_match_python_redactor) と TS 側 (Phase 2 #186 で実装する src/redact/internal-state.test.ts 等価) の両言語が同 JSON を読み、各 case の input に対して scrub 関数を実行した結果が expect_hits / expect_output_type と完全一致することを検証する。HIT 順序契約: literals 配列順 → regexes 配列順 (本文出現順ではない)、両言語は二段 loop で守る (Python: cma_log_redaction.py:scrub_internal_state_for_chat / TS: 同等実装)。expect_output_type=passthrough は元 input をそのまま返す、neutral は中立文 (job_id 埋込) を返す。",
+  "neutral_template_id": "default_v1",
+  "neutral_template_format": "[{job_id}] 今回のタスクは完了できませんでした。担当者が確認します。",
+  "cases": [
+    {
+      "name": "clean_passthrough",
+      "input": "今日はいい天気ですね。お疲れさまでした。",
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
+    },
+    {
+      "name": "single_literal_hit_memory_store",
+      "input": "memory store の最新版を参照しています。",
+      "expect_hits": ["memory store"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "multiple_literals_canonical_order",
+      "input": "memory store にアクセスできません。未 attach です。",
+      "expect_hits": ["未 attach", "memory store"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "regex_only_hit_learning_md",
+      "input": "参照ファイル: learning_session_token_scopes.md を確認してください。",
+      "expect_hits": ["learning_md_filename"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "literal_and_regex_mixed",
+      "input": "OAuth トークンの問題で learning_drive_attach_fail.md が出ています。",
+      "expect_hits": ["OAuth トークン", "learning_md_filename"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "literal_appears_twice_reported_once",
+      "input": "memory store のキャッシュ、もう一度 memory store を確認。",
+      "expect_hits": ["memory store"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "empty_input_passthrough",
+      "input": "",
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
+    },
+    {
+      "name": "japanese_literal_kenkenfusoku",
+      "input": "操作には権限不足のため実行を中止しました。",
+      "expect_hits": ["権限不足"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "english_literal_not_attached",
+      "input": "The tool is not attached to this session.",
+      "expect_hits": ["not attached"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "ascii_path_literal_mnt_memory",
+      "input": "/mnt/memory 以下のファイルを読み込み中。",
+      "expect_hits": ["/mnt/memory"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "v9_literal_access_token_scope_insufficient",
+      "input": "ACCESS_TOKEN_SCOPE_INSUFFICIENT が返却されました。",
+      "expect_hits": ["ACCESS_TOKEN_SCOPE_INSUFFICIENT"],
+      "expect_output_type": "neutral"
+    },
+    {
+      "name": "regex_non_match_empty_basename",
+      "input": "参照ファイル: learning_.md (空英数字部分) は対象外です。",
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
+    },
+    {
+      "name": "bare_general_words_no_hit",
+      "input": "プロジェクトのスコープと閲覧権限について議論しました。",
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
+    },
+    {
+      "name": "all_three_one_literal_two_regex_distinct_files",
+      "input": "未 attach: learning_drive_oauth.md と learning_sheets_scope.md 両方で発生。",
+      "expect_hits": ["未 attach", "learning_md_filename"],
+      "expect_output_type": "neutral"
+    }
+  ]
+}
