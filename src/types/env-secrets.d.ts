@@ -59,5 +59,25 @@ declare namespace Cloudflare {
     GCHAT_OAUTH_CLIENT_ID?: string;
     /** Chat User OAuth client_secret. */
     GCHAT_OAUTH_CLIENT_SECRET?: string;
+    /**
+     * Google Cloud bot project number (numeric ID as string, e.g.
+     * `'192588613210'`). Audience claim that Google Chat embeds in the
+     * OIDC JWT it sends to the HTTPS push endpoint
+     * (`POST /webhooks/google-chat`). Used by
+     * `src/webhooks/google-chat.ts:verifyGoogleChatJwt` to reject tokens
+     * minted for a different project.
+     *
+     * Provisioned via `wrangler secret put GCP_BOT_PROJECT_NUMBER` once
+     * per environment.
+     */
+    GCP_BOT_PROJECT_NUMBER?: string;
+    /**
+     * Cloudflare Queues binding for inbound Google Chat events
+     * (`makoto-chat-queue`). Producer in
+     * `src/webhooks/google-chat.ts:handleGoogleChatWebhook`; consumer
+     * (Phase B = sessions.create + tool dispatch + marker parse) will be
+     * implemented by a follow-up subagent (#186 #5 Phase B).
+     */
+    MAKOTO_CHAT_QUEUE: Queue<import('../webhooks/google-chat').ChatQueueMessage>;
   }
 }

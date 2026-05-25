@@ -21,6 +21,8 @@ import {
 } from "./queue/agentmail-consumer";
 import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
+import { handleGoogleChatWebhook } from "./webhooks/google-chat";
+import type { ChatQueueMessage } from "./webhooks/google-chat";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { OAuthLease } from "./durable-objects/oauth-lease";
 import {
@@ -60,13 +62,24 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    // AgentMail inbound webhook (svix protocol). The only HTTP endpoint
-    // this Worker serves after v4 廃棄.
+    // AgentMail inbound webhook (svix protocol).
     if (
       url.pathname === "/webhooks/agentmail" &&
       request.method === "POST"
     ) {
       return handleAgentMailWebhook(request, env);
+    }
+
+    // Google Chat reactive bot HTTPS push endpoint (Issue #186 #5
+    // Phase A). Replaces the Cloud Run Pub/Sub pull path
+    // (`scripts/cma_gchat_bot.py:_handle_event`). JWT verify + dedupe +
+    // Queue enqueue here; heavy session orchestration runs in the
+    // Queue consumer (Phase B, stubbed today).
+    if (
+      url.pathname === "/webhooks/google-chat" &&
+      request.method === "POST"
+    ) {
+      return handleGoogleChatWebhook(request, env);
     }
 
     return new Response("not found", { status: 404 });
@@ -116,17 +129,40 @@ export default {
   },
 
   // Cloudflare Queues consumer entrypoint. Bound via
-  // `wrangler.jsonc` `queues.consumers[].queue = "<MAKOTO_QUEUE>"`.
+  // `wrangler.jsonc` `queues.consumers[].queue = "<name>"`.
   // Long-running session / EMAIL_SEND / AgentMail send work runs here
   // (Queues consumer wall budget = 15 min, CPU = 5 min), well past the
   // Workers HTTP `waitUntil` 30-second ceiling that constrained the
   // older Cloud Run path.
+  //
+  // Dispatch by `batch.queue` so a single `queue` export can serve
+  // multiple bindings (AgentMail + Google Chat).
   async queue(
-    batch: MessageBatch<AgentMailQueueMessage>,
+    batch: MessageBatch<AgentMailQueueMessage | ChatQueueMessage>,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    await handleAgentMailQueue(batch, env, ctx, agentmailDispatcher);
+    if (batch.queue === "makoto-chat-queue") {
+      // Phase B (= sessions.create + tool dispatch + 各 marker 解析) は
+      // 別 subagent が実装する。本 stub は受信した event をログに残して
+      // ack するだけ。`commitDone` も Phase B の責務なのでここでは
+      // 触らない (= claim は alive のまま lease 期限切れ後に successor が
+      // takeover 可能、Phase A 単体運用でも redelivery は dedupe で抑止)。
+      for (const msg of batch.messages) {
+        const body = msg.body as ChatQueueMessage;
+        console.log(
+          `[chat-queue] message received, Phase B implementation pending eventKey=${body.eventKey}`,
+        );
+        msg.ack();
+      }
+      return;
+    }
+    await handleAgentMailQueue(
+      batch as MessageBatch<AgentMailQueueMessage>,
+      env,
+      ctx,
+      agentmailDispatcher,
+    );
   },
 };
 

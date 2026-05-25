@@ -111,6 +111,14 @@
         "binding": "MAKOTO_QUEUE",
         "queue": "makoto-agentmail-events",
       },
+      // Google Chat reactive bot ingress (Issue #186 #5 Phase A). Producer
+      // = `src/webhooks/google-chat.ts:handleGoogleChatWebhook`. Consumer
+      // (Phase B = sessions.create + tool dispatch + marker parse) is a
+      // stub today; the follow-up subagent will fill it in.
+      {
+        "binding": "MAKOTO_CHAT_QUEUE",
+        "queue": "makoto-chat-queue",
+      },
     ],
     "consumers": [
       {
@@ -118,6 +126,13 @@
         "max_batch_size": 10,
         "max_batch_timeout": 5,
         "max_retries": 5,
+      },
+      {
+        "queue": "makoto-chat-queue",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "makoto-chat-queue-dlq",
       },
     ],
   },
