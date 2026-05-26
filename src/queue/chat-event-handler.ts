@@ -106,6 +106,7 @@ import { sendAndStreamWithToolDispatch } from '../lib/session';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
+import { executeWithCommit } from '../lib/three-stage-precheck';
 import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import { PERSONA_SPEC } from '../data/persona-spec';
@@ -512,7 +513,7 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey);
+  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey, claim);
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -693,6 +694,7 @@ export async function handleChatEvent(
     emailParsed.markers,
     sessionId,
     userMapping.agent_id,
+    claim,
   );
 
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
@@ -723,6 +725,7 @@ export async function handleChatEvent(
     chatPostGateApplication.text,
     spaceName,
     threadName,
+    claim,
   );
 
   // 7c. SCHEDULE_ACTION markers (Issue #186 #5 follow-up = 実 dispatch)。
@@ -756,10 +759,38 @@ export async function handleChatEvent(
     // WARN log + safePost に fallback (= bot 全体は落とさない、Python
     // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
     // は従来通り新規 POST。
-    if (placeholderName) {
-      await safeUpdateOrPost(env, placeholderName, spaceName, finalText, threadName, eventKey);
-    } else {
-      await safePost(env, spaceName, finalText, threadName, eventKey);
+    //
+    // 3-stage precheck wrap (Python `cma_lib.py:send_chat_reply` 等価)。
+    // 同一 (eventKey, kind='chat_reply', target=`${spaceName}:${threadName}`)
+    // 既送信なら ALREADY → 二重 reply を構造的に防ぐ (life #1266 系再発防止)。
+    const chatReplyOutcome = await executeWithCommit({
+      env,
+      parentEventKey: eventKey,
+      parentOwner: claim.owner,
+      kind: 'chat_reply',
+      target: `${spaceName}:${threadName ?? ''}`,
+      sendFn: async () => {
+        if (placeholderName) {
+          await safeUpdateOrPost(env, placeholderName, spaceName, finalText, threadName, eventKey);
+        } else {
+          await safePost(env, spaceName, finalText, threadName, eventKey);
+        }
+        // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
+        return undefined as unknown as void;
+      },
+    });
+    if (chatReplyOutcome.outcome === 'already') {
+      console.log(
+        `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
+      );
+    } else if (chatReplyOutcome.outcome === 'lease_alive') {
+      console.warn(
+        `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
+      );
+    } else if (chatReplyOutcome.outcome === 'lease_lost') {
+      console.warn(
+        `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
+      );
     }
   } else {
     console.log(
@@ -811,6 +842,7 @@ async function dispatchEmailMarkers(
   markers: EmailSendMarker[],
   sessionId: string,
   agentId: string,
+  claim: { owner: string; version: number },
 ): Promise<void> {
   if (markers.length === 0) return;
   const apiKey = env.AGENTMAIL_API_KEY;
@@ -849,15 +881,55 @@ async function dispatchEmailMarkers(
           ? { attachments: m.attachments }
           : {}),
       };
-      let sendResult;
-      if (m.in_reply_to_message_id) {
-        sendResult = await client.replyMessage({
-          ...baseInput,
-          parentMessageId: m.in_reply_to_message_id,
-        });
-      } else {
-        sendResult = await client.sendMessage(baseInput);
+      // 3-stage precheck wrap (Python `cma_lib.py:send_mail` 等価)。
+      // 同一 (eventKey, kind='email_send', target=`${inboxId}:${to}:${in_reply_to_id}`)
+      // 既送信なら ALREADY → AgentMail への二重送信を構造的に防ぐ。
+      // target に in_reply_to_message_id を入れることで「同 inbox/同 to でも
+      // 別 thread への返信は別 send」として扱う。
+      const emailTarget = `${inboxId}:${m.to}:${m.in_reply_to_message_id ?? ''}`;
+      const emOutcome = await executeWithCommit({
+        env,
+        parentEventKey: eventKey,
+        parentOwner: claim.owner,
+        kind: 'email_send',
+        target: emailTarget,
+        sendFn: async () => {
+          if (m.in_reply_to_message_id) {
+            return await client.replyMessage({
+              ...baseInput,
+              parentMessageId: m.in_reply_to_message_id,
+            });
+          }
+          return await client.sendMessage(baseInput);
+        },
+      });
+      if (emOutcome.outcome === 'already') {
+        console.log(
+          `[chat-event] EMAIL_SEND already sent eventKey=${eventKey} to=${redactPiiInText(m.to)} — skipping duplicate`,
+        );
+        continue;
       }
+      if (emOutcome.outcome === 'lease_alive') {
+        console.warn(
+          `[chat-event] EMAIL_SEND in-flight by another worker eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
+        );
+        continue;
+      }
+      if (emOutcome.outcome === 'lease_lost') {
+        // sent_messages 記録は committed されない (= heartbeat dead or fence drift)
+        console.warn(
+          `[chat-event] EMAIL_SEND lease lost eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
+        );
+        continue;
+      }
+      if (emOutcome.outcome === 'precheck_failed') {
+        console.warn(
+          `[chat-event] EMAIL_SEND precheck failed eventKey=${eventKey} to=${redactPiiInText(m.to)} reason=${emOutcome.reason}`,
+        );
+        continue;
+      }
+      // outcome === 'sent'
+      const sendResult = emOutcome.result;
       if (sendResult.message_id) {
         await recordSentMessage(
           env.DB,
@@ -910,6 +982,7 @@ async function dispatchChatPostMarkers(
   inputText: string,
   receivedSpaceName: string,
   receivedThreadName: string | null,
+  claim: { owner: string; version: number },
 ): Promise<ChatPostDispatchResult> {
   let working = inputText;
   // first-match を繰り返し処理。parseChatPostMarkerDetailed は g flag 無しなので
@@ -977,15 +1050,40 @@ async function dispatchChatPostMarkers(
         );
       } else {
         try {
-          await postChatMessage(
-            { saKeyJson: saKey },
-            targetSpace,
-            m.text,
-            threadOpt ?? {},
-          );
-          console.log(
-            `[chat-event] CHAT_POST posted eventKey=${eventKey} space=${targetSpace} text_chars=${m.text.length}`,
-          );
+          // 3-stage precheck wrap (Python `cma_lib.py:send_chat_post` 等価)。
+          // 同一 (eventKey, kind='chat_post', target=`${targetSpace}:${thread}`)
+          // 既送信なら ALREADY → 別 space への二重投稿を構造的に防ぐ。
+          const cpOutcome = await executeWithCommit({
+            env,
+            parentEventKey: eventKey,
+            parentOwner: claim.owner,
+            kind: 'chat_post',
+            target: `${targetSpace}:${threadOpt?.threadName ?? ''}`,
+            sendFn: async () =>
+              await postChatMessage(
+                { saKeyJson: saKey },
+                targetSpace,
+                m.text,
+                threadOpt ?? {},
+              ),
+          });
+          if (cpOutcome.outcome === 'sent') {
+            console.log(
+              `[chat-event] CHAT_POST posted eventKey=${eventKey} space=${targetSpace} text_chars=${m.text.length}`,
+            );
+          } else if (cpOutcome.outcome === 'already') {
+            console.log(
+              `[chat-event] CHAT_POST already sent eventKey=${eventKey} space=${targetSpace} — skipping duplicate`,
+            );
+          } else if (cpOutcome.outcome === 'lease_alive') {
+            console.warn(
+              `[chat-event] CHAT_POST in-flight by another worker eventKey=${eventKey} space=${targetSpace}`,
+            );
+          } else if (cpOutcome.outcome === 'lease_lost') {
+            console.warn(
+              `[chat-event] CHAT_POST lease lost eventKey=${eventKey} space=${targetSpace}`,
+            );
+          }
         } catch (err) {
           const reason =
             err instanceof ChatApiError
@@ -1192,6 +1290,7 @@ async function safePostPlaceholder(
   spaceName: string,
   threadName: string | null,
   eventKey: string,
+  claim: { owner: string; version: number },
 ): Promise<string> {
   const saKey = env.CHAT_SA_KEY_JSON;
   if (!saKey) {
@@ -1205,20 +1304,55 @@ async function safePostPlaceholder(
     return '';
   }
   try {
-    // thread reply 時は `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
-    // を必須付与 (= safePost と同様、Python `_reply_to_chat:l.1247-1249` 等価)。
-    const res = await postChatMessage(
-      { saKeyJson: saKey },
-      spaceName,
-      PLACEHOLDER_TEXT,
-      threadName
-        ? {
-            threadName,
-            threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
-          }
-        : {},
+    // 3-stage precheck wrap (Python `cma_lib.py:send_placeholder` 等価)。
+    // 同一 (eventKey, kind='placeholder', target=`${spaceName}:${threadName}`)
+    // 既送信なら ALREADY → 二重 placeholder POST を構造的に防ぐ。
+    const outcome = await executeWithCommit({
+      env,
+      parentEventKey: eventKey,
+      parentOwner: claim.owner,
+      kind: 'placeholder',
+      target: `${spaceName}:${threadName ?? ''}`,
+      sendFn: async () => {
+        // thread reply 時は `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
+        // を必須付与 (= safePost と同様、Python `_reply_to_chat:l.1247-1249` 等価)。
+        return await postChatMessage(
+          { saKeyJson: saKey },
+          spaceName,
+          PLACEHOLDER_TEXT,
+          threadName
+            ? {
+                threadName,
+                threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
+              }
+            : {},
+        );
+      },
+    });
+    if (outcome.outcome === 'sent') {
+      return outcome.result.name;
+    }
+    if (outcome.outcome === 'already') {
+      // 別 worker (or 同 worker のリトライ) が既に placeholder を POST 済。
+      // 既送信 message name は本 wrapper では返せない (= side-effect log には
+      // result を保持していない) ため、PATCH 経路には進めず空文字を返して
+      // 「placeholder なし」扱いで進める (= 旧経路 = 新規 POST fallback)。
+      console.log(
+        `[chat-event] placeholder POST already sent eventKey=${eventKey} space=${spaceName} — skipping`,
+      );
+      return '';
+    }
+    if (outcome.outcome === 'lease_alive') {
+      console.warn(
+        `[chat-event] placeholder POST in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
+      );
+      return '';
+    }
+    // lease_lost: heartbeat dead before send, or commit fence drifted
+    console.warn(
+      `[chat-event] placeholder POST lease lost eventKey=${eventKey} space=${spaceName}`,
     );
-    return res.name;
+    return '';
   } catch (err) {
     const reason =
       err instanceof ChatApiError

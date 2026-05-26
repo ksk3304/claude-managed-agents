@@ -84,6 +84,7 @@ import {
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
+import { executeWithCommit } from '../lib/three-stage-precheck';
 import type { AgentMailMessage, EmailSendMarker } from '../types/agentmail';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import type {
@@ -312,13 +313,57 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   const successfullySentBodies: string[] = [];
   for (const m of markers) {
     try {
-      const sendResult = await deliverMarker(amClient, m, {
-        inboxId,
-        parentMessageIdFallback: parentMessageId,
-        agentId,
-        sessionId,
-        jobId: `mail-send/${sessionId}`,
+      // 3-stage precheck wrap (Python `cma_lib.py:send_mail` 等価)。
+      // 同一 (eventKey, kind='email_send', target=`${inboxId}:${to}:${reply_id}`)
+      // 既送信なら ALREADY → AgentMail への二重送信を構造的に防ぐ。
+      // target は webhook 発火源 (= rfc822 in_reply_to) を含めることで
+      // 「同 inbox/同 to でも別 thread への返信は別 send」として扱う。
+      const replyIdForTarget = m.in_reply_to_message_id ?? parentMessageId ?? '';
+      const emTarget = `${inboxId}:${m.to}:${replyIdForTarget}`;
+      const emOutcome = await executeWithCommit({
+        env,
+        parentEventKey: eventKey,
+        parentOwner: claim.owner,
+        kind: 'email_send',
+        target: emTarget,
+        sendFn: async () =>
+          await deliverMarker(amClient, m, {
+            inboxId,
+            parentMessageIdFallback: parentMessageId,
+            agentId,
+            sessionId,
+            jobId: `mail-send/${sessionId}`,
+          }),
       });
+      if (emOutcome.outcome === 'already') {
+        console.log(
+          `[agentmail-dispatch] EMAIL_SEND already sent eventKey=${eventKey} to=${redactPiiInText(m.to)} — skipping duplicate`,
+        );
+        // 既送信 = "成功扱い" として後続の continuation 通知に body を含める。
+        // (= 既に届いている = ユーザー視点は通知に出すべき = Python 等価挙動)
+        successfullySentBodies.push(m.body);
+        continue;
+      }
+      if (emOutcome.outcome === 'lease_alive') {
+        console.warn(
+          `[agentmail-dispatch] EMAIL_SEND in-flight by another worker eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
+        );
+        continue;
+      }
+      if (emOutcome.outcome === 'lease_lost') {
+        console.warn(
+          `[agentmail-dispatch] EMAIL_SEND lease lost eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
+        );
+        continue;
+      }
+      if (emOutcome.outcome === 'precheck_failed') {
+        console.warn(
+          `[agentmail-dispatch] EMAIL_SEND precheck failed eventKey=${eventKey} to=${redactPiiInText(m.to)} reason=${emOutcome.reason}`,
+        );
+        continue;
+      }
+      // outcome === 'sent'
+      const sendResult = emOutcome.result;
       successfullySentBodies.push(m.body);
       // Record outbound so future inbound replies can thread back.
       // `rfc822_message_id` may be empty if AgentMail didn't return one
