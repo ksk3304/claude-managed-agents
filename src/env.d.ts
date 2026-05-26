@@ -83,6 +83,19 @@ declare namespace Cloudflare {
     WORKER_INSTANCE_ID?: string;
 
     /**
+     * Optional default user_slug for the Chat reactive path. When set,
+     * `chat-event-handler.ts` step 5 falls back to
+     * `user_mapping:<DEFAULT_USER_SLUG>` if the sender email has no
+     * dedicated mapping (TS port of `cma_session_resolver.py`'s
+     * `default` entry, Issue #186 follow-up #8). Unset → original
+     * `unknown_sender` skip is preserved.
+     *
+     * NB: chat-path only. Mail-path keeps fail-close semantics
+     * (`memory-attach.ts:resolveSenderToResources` comment).
+     */
+    DEFAULT_USER_SLUG?: string;
+
+    /**
      * KV namespace for the MAKOTO bridge: sender→user_slug→agent_id
      * mapping (`user_mapping:<email>`), per-user OAuth vault entries
      * (`vault:oauth:<user_slug>:*`), and other bridge-side caches.

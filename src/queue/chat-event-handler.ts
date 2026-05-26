@@ -51,7 +51,7 @@ import {
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
-import { readUserMapping } from '../lib/memory-attach';
+import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
@@ -166,8 +166,18 @@ export async function handleChatEvent(
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_sender_email' };
   }
-  const userMapping = await readUserMapping(env.MAKOTO_KV, senderEmail);
-  if (!userMapping) {
+  // Mapping resolve with optional default fallback (Issue #186
+  // follow-up #8). When `env.DEFAULT_USER_SLUG` is set and the direct
+  // lookup misses, fall back to `user_mapping:<DEFAULT_USER_SLUG>` (TS
+  // port of `cma_session_resolver.py:resolve` l.435-446 `default`
+  // entry). Unset / blank / absent default → original
+  // `unknown_sender` skip is preserved (回帰防止).
+  const mappingResolution = await readUserMappingWithDefault(
+    env.MAKOTO_KV,
+    senderEmail,
+    env.DEFAULT_USER_SLUG,
+  );
+  if (!mappingResolution) {
     // Scrub sender email through PII redactor before logging — Cloudflare
     // Logs retains warn lines long-term (Issue #186 D コンプラ対応).
     console.warn(
@@ -175,6 +185,13 @@ export async function handleChatEvent(
     );
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'unknown_sender' };
+  }
+  const userMapping = mappingResolution.mapping;
+  if (mappingResolution.isDefault) {
+    console.info(
+      `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
+        `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
+    );
   }
 
   // ---- 6. orchestrate session ----
