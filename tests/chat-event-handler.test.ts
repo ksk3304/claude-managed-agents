@@ -46,9 +46,23 @@ vi.mock('../src/lib/session-orchestrator', async (importOriginal) => {
   };
 });
 
-// Capture postChatMessage calls.
-const chatApiMock = {
-  posts: [] as Array<{ spaceName: string; text: string; opts: unknown }>,
+// Capture postChatMessage / updateChatMessage / deleteChatMessage calls.
+// `updateThrow` / `deleteThrow` で個別 test ケースから fail 経路を発火可能。
+interface ChatApiMockState {
+  posts: Array<{ spaceName: string; text: string; opts: unknown }>;
+  patches: Array<{ messageName: string; text: string }>;
+  deletes: string[];
+  postThrow: Error | null;
+  updateThrow: Error | null;
+  deleteThrow: Error | null;
+}
+const chatApiMock: ChatApiMockState = {
+  posts: [],
+  patches: [],
+  deletes: [],
+  postThrow: null,
+  updateThrow: null,
+  deleteThrow: null,
 };
 vi.mock('../src/lib/chat-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/lib/chat-api')>();
@@ -60,8 +74,21 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
       text: string,
       opts: unknown = {},
     ) => {
+      if (chatApiMock.postThrow) throw chatApiMock.postThrow;
       chatApiMock.posts.push({ spaceName, text, opts });
       return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}` };
+    },
+    updateChatMessage: async (
+      _deps: unknown,
+      messageName: string,
+      text: string,
+    ) => {
+      if (chatApiMock.updateThrow) throw chatApiMock.updateThrow;
+      chatApiMock.patches.push({ messageName, text });
+    },
+    deleteChatMessage: async (_deps: unknown, messageName: string) => {
+      if (chatApiMock.deleteThrow) throw chatApiMock.deleteThrow;
+      chatApiMock.deletes.push(messageName);
     },
   };
 });
@@ -132,6 +159,10 @@ interface FakeAnthOpts {
   sessionId?: string;
   createCapture?: Array<unknown>;
   streamThrow?: Error;
+  /** sessions.create を呼んだときに throw する error。orchestrator 内で
+   *  `sessions_create_failed` reason に分類される (#186 placeholder DELETE
+   *  経路の発火条件)。 */
+  createThrow?: Error;
   // Track which sessionId was used for events.send (continuation vs new)
   sendCaptureSessionIds?: string[];
   // Capture memory store list/retrieve/create/update calls for session-log
@@ -153,6 +184,7 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
       sessions: {
         async create(args: unknown) {
           opts.createCapture?.push(args);
+          if (opts.createThrow) throw opts.createThrow;
           return { id: opts.sessionId ?? 'sesn_new' };
         },
         events: {
@@ -296,6 +328,11 @@ async function putMapping(env: Env, email: string, opts: { withSessionLog?: bool
 
 beforeEach(() => {
   chatApiMock.posts.length = 0;
+  chatApiMock.patches.length = 0;
+  chatApiMock.deletes.length = 0;
+  chatApiMock.postThrow = null;
+  chatApiMock.updateThrow = null;
+  chatApiMock.deleteThrow = null;
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
   installFakeAnthropic(null);
@@ -338,10 +375,14 @@ describe('handleChatEvent', () => {
       const result = await handleChatEvent(env, {} as ExecutionContext, msg);
       expect(result.kind).toBe('committed');
       expect(amCalls).toHaveLength(1);
-      // current space 投稿 (本文 = marker strip 後)。
+      // placeholder POST + PATCH update (= #186 UX 致命傷 fix)。
       const postsToSpace = chatApiMock.posts.filter((p) => p.spaceName === 'spaces/AAA');
       expect(postsToSpace).toHaveLength(1);
-      expect(postsToSpace[0]!.text).toContain('了解しました');
+      expect(postsToSpace[0]!.text).toBe('... MAKOTOくんが入力中');
+      // 最終 reply は PATCH 経由で placeholder を書き換える。
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('了解しました');
+      expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
       // sent_messages 行
       const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
         ._tables.sent_messages;
@@ -372,12 +413,15 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
+    // placeholder POST 1 件 + 最終 reply は PATCH。
     const postsToSpace = chatApiMock.posts.filter((p) => p.spaceName === 'spaces/ROOM1');
     expect(postsToSpace).toHaveLength(1);
-    expect(postsToSpace[0]!.text).toBe('ご質問への回答です。');
+    expect(postsToSpace[0]!.text).toBe('... MAKOTOくんが入力中');
     expect((postsToSpace[0]!.opts as { threadName?: string }).threadName).toBe(
       'spaces/ROOM1/threads/T1',
     );
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
   });
 
   it('Case 3: shared space + bot mention なし → skip + commit', async () => {
@@ -435,7 +479,10 @@ describe('handleChatEvent', () => {
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
     expect(sends).toHaveLength(1); // events.send called
+    // placeholder POST 1 件 + 最終 reply は PATCH (= #186 UX 致命傷 fix)。
     expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
   });
 
   it('Case 6: body 空 + thread なし → 「（空メッセージ）」投稿 + commit', async () => {
@@ -472,14 +519,17 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    // 2 投稿: spaces/OTHER + spaces/AAA (current)
+    // CHAT_POST 投稿 1 件 + placeholder POST 1 件 (current space)
+    // 最終 reply (= "了解しました...") は PATCH 経由で placeholder を書き換え。
     const otherPosts = chatApiMock.posts.filter((p) => p.spaceName === 'spaces/OTHER');
     const currentPosts = chatApiMock.posts.filter((p) => p.spaceName === 'spaces/AAA');
     expect(otherPosts).toHaveLength(1);
     expect(otherPosts[0]!.text).toBe('別スペースへの本文');
     expect(currentPosts).toHaveLength(1);
-    expect(currentPosts[0]!.text).toContain('了解しました');
-    expect(currentPosts[0]!.text).not.toContain('CHAT_POST:');
+    expect(currentPosts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('了解しました');
+    expect(chatApiMock.patches[0]!.text).not.toContain('CHAT_POST:');
   });
 
   it('Case 8: EMAIL_SEND + CHAT_POST 両方 → 両方 dispatch', async () => {
@@ -515,7 +565,9 @@ describe('handleChatEvent', () => {
       expect(result.kind).toBe('committed');
       expect(amCalls).toHaveLength(1);
       expect(chatApiMock.posts.filter((p) => p.spaceName === 'spaces/OTHER')).toHaveLength(1);
+      // placeholder POST 1 件 (= "...MAKOTOくんが入力中") + 最終 reply は PATCH。
       expect(chatApiMock.posts.filter((p) => p.spaceName === 'spaces/AAA')).toHaveLength(1);
+      expect(chatApiMock.patches).toHaveLength(1);
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -541,10 +593,13 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
+    // placeholder POST 1 件 → 最終 redaction 結果は PATCH で書き換え。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
-    expect(post!.text).toContain('今回のタスクは完了できませんでした');
-    expect(post!.text).not.toContain('memory store');
+    expect(post!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
+    expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
@@ -622,7 +677,12 @@ describe('handleChatEvent', () => {
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
     expect(Number(row?.lease_expires_at_ms)).toBe(0);
-    expect(chatApiMock.posts).toHaveLength(0);
+    // placeholder POST は走った (= ack 表示) が、stream throw 後に DELETE で
+    // 残骸 cleanup される (Python `_delete_chat_message` 等価)。
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.deletes).toHaveLength(1);
+    expect(chatApiMock.patches).toHaveLength(0); // 最終 reply は無い
   });
 
   it('Case 13: session-log attachment 不在 → skip + event committed', async () => {
@@ -645,7 +705,10 @@ describe('handleChatEvent', () => {
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
     expect(memCreate).toHaveLength(0); // session-log skipped
-    expect(chatApiMock.posts).toHaveLength(1); // current space 投稿は行われた
+    // placeholder POST 1 件 + 最終 reply は PATCH (= #186 UX 致命傷 fix)。
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
   });
 
   it('Case 14: user_mapping 不在 → unknown_sender skip + commit', async () => {
@@ -746,12 +809,14 @@ describe('handleChatEvent', () => {
     // manager.create_job が 1 回呼ばれた (get_job が先行する Python l.1119 等価)
     expect(schedulerMock.capturedCalls.some((c) => c.method === 'create_job')).toBe(true);
     expect(schedulerMock.capturedCalls.some((c) => c.method === 'get_job')).toBe(true);
-    // current space 投稿に「✅ `daily-x` 登録」が含まれる (Python l.1122 byte 等価)
+    // placeholder POST 1 件 → 最終応答は PATCH に「✅ `daily-x` 登録」が含まれる。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
-    expect(post!.text).toContain('登録');
-    expect(post!.text).toContain('daily-x');
-    expect(post!.text).not.toContain('SCHEDULE_ACTION:');
+    expect(post!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('登録');
+    expect(chatApiMock.patches[0]!.text).toContain('daily-x');
+    expect(chatApiMock.patches[0]!.text).not.toContain('SCHEDULE_ACTION:');
   });
 
   it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 未設定 → dispatch skip + 既存 chat 投稿のみ', async () => {
@@ -777,8 +842,9 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     // manager は呼ばれない
     expect(schedulerMock.capturedCalls).toHaveLength(0);
-    // current space 投稿はある (= 旧挙動完全互換)。SCHEDULE_ACTION 文字列は本文に残る可能性。
+    // current space 投稿はある = placeholder POST 1 件 + 最終 reply は PATCH。
     expect(chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA')).toBeDefined();
+    expect(chatApiMock.patches).toHaveLength(1);
   });
 
   it('SCHEDULE_ACTION marker: manager throw → WARN log + 元 cleanedText で投稿継続', async () => {
@@ -814,11 +880,14 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
+    // placeholder POST 1 件 → 最終応答 (❌ メッセージ) は PATCH に乗る。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
-    // failure isolation: 投稿は行われ、❌ メッセージが本文に含まれる。
-    expect(post!.text).toContain('will-fail');
-    expect(post!.text).toContain('❌');
+    expect(post!.text).toBe('... MAKOTOくんが入力中');
+    // failure isolation: PATCH に ❌ メッセージが含まれる。
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('will-fail');
+    expect(chatApiMock.patches[0]!.text).toContain('❌');
   });
 
   it('session-log: DM mapping ありなら memory create が呼ばれる', async () => {
@@ -841,5 +910,95 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(memCreate).toHaveLength(1);
     expect(memCreate[0]!.memoryStoreId).toBe('memstore_dm');
+  });
+
+  // -------------------------------------------------------------------------
+  // #186 placeholder POST + PATCH update + DELETE cleanup flow (UX 致命傷 fix)
+  // -------------------------------------------------------------------------
+
+  it('placeholder happy path: POST → stream OK → PATCH update (= Python _placeholder_reply 等価)', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_ph_ok',
+      events: [
+        { type: 'agent.message.text', text: '応答完了テキスト' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // POST が 1 件で text が placeholder literal。
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.spaceName).toBe('spaces/AAA');
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    // PATCH 1 件で text が最終応答。messageName が placeholder POST の戻り
+    // resource name と一致 (= Python `_update_chat_message` 経路と等価)。
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe('応答完了テキスト');
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    // DELETE は呼ばれない (失敗経路ではない)
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_ph_create_fail',
+      events: [],
+      // orchestrator は sessions.create 失敗を OrchestratorFailure
+      // (reason='sessions_create_failed') に詰めて throw する。
+      createThrow: new Error('sessions.create upstream 503'),
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('sessions_create_failed');
+    }
+    // placeholder POST 1 件 + DELETE 1 件 (= 残骸 cleanup)
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.deletes).toHaveLength(1);
+    expect(chatApiMock.deletes[0]).toBe('spaces/AAA/messages/m_1');
+    // PATCH は呼ばれない (= 最終応答は無い)
+    expect(chatApiMock.patches).toHaveLength(0);
+  });
+
+  it('placeholder PATCH 失敗: WARN log + safePost (新規 POST) に fallback、bot 全体は落とさない', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_ph_patch_fail',
+      events: [
+        { type: 'agent.message.text', text: '応答テキスト patch fallback' },
+        { type: 'session.status_idle' },
+      ],
+    });
+    // PATCH を 1 回 throw させる。fallback で safePost が走り新規 POST 1 件追加。
+    chatApiMock.updateThrow = new Error('PATCH 500 simulated');
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed'); // PATCH 失敗で event 全体は落とさない
+    // POST 2 件: placeholder + fallback 新規 POST (= 最終応答)。
+    expect(chatApiMock.posts).toHaveLength(2);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.posts[1]!.text).toBe('応答テキスト patch fallback');
+    // PATCH は 1 回試行された (= updateThrow が発火)。
+    // mock は throw する経路で patches に push しないため patches.length === 0。
+    expect(chatApiMock.patches).toHaveLength(0);
+    // DELETE は呼ばれない (= 失敗経路ではなく fallback POST で完結)
+    expect(chatApiMock.deletes).toHaveLength(0);
   });
 });

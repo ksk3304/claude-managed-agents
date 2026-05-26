@@ -25,7 +25,6 @@
  * 中間版 = **含まない** もの (Cloud Run 完全実装比、follow-up Issue で対応):
  *   - 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
  *   - `/costguard` command の決定論短絡ハンドラ
- *   - placeholder POST (= 「入力中」表示後 reply で書き換え)
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
  *   - intent-detector 統合 (intent ベース dispatch 分岐)
  *   - Cold continuation の SignalB 経由 thread-self-scan
@@ -43,7 +42,12 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { ChatApiError, postChatMessage } from '../lib/chat-api';
+import {
+  ChatApiError,
+  deleteChatMessage,
+  postChatMessage,
+  updateChatMessage,
+} from '../lib/chat-api';
 import {
   parseChatPostMarkerDetailed,
   CHAT_POST_MARKER_REGEX,
@@ -73,6 +77,18 @@ import type { EmailSendMarker } from '../types/agentmail';
 
 /** Default bot displayName for shared-space mention matching. */
 const DEFAULT_BOT_DISPLAY_NAME = 'MAKOTOくん';
+
+/**
+ * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
+ * `cma_gchat_bot.py:l.3921` で hard-coded された `"... MAKOTOくんが入力中"`
+ * を byte 等価で port (env / config 由来ではない hard-coded literal)。
+ *
+ * 役割: session.create + LLM stream (= 24-45 秒) の前に短い ack を Chat
+ * に POST し、Google Chat client の「MAKOTOくん から応答ありません」
+ * timeout 表示を抑止する。完了後に `updateChatMessage` で書き換え、
+ * 失敗時に `deleteChatMessage` で残骸 cleanup する (#186 UX 致命傷)。
+ */
+const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 
 /**
  * 1 reactive event を処理する。返り値は consumer (= `queue` handler) が
@@ -201,6 +217,14 @@ export async function handleChatEvent(
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
+  // ---- 6a. placeholder POST (#186 UX 致命傷) ----
+  // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
+  // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
+  // 抑止する。POST に成功すれば `placeholderName` を保持し、後で PATCH
+  // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
+  // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
+  // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
+  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey);
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -232,6 +256,12 @@ export async function handleChatEvent(
     sessionIdRef.current = sessionId;
     assistantText = orchestrated.assistantText;
   } catch (err) {
+    // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
+    // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
+    // 全体は落とさない (= 上流 retry/skip 経路を優先)。
+    if (placeholderName) {
+      await safeDeletePlaceholder(env, placeholderName, eventKey);
+    }
     if (err instanceof OrchestratorFailure) {
       if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
         // transient → release & retry
@@ -302,11 +332,26 @@ export async function handleChatEvent(
   }
   const finalText = scrubbed.text;
   if (finalText.trim().length > 0) {
-    await safePost(env, spaceName, finalText, threadName, eventKey);
+    // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
+    // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
+    // WARN log + safePost に fallback (= bot 全体は落とさない、Python
+    // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
+    // は従来通り新規 POST。
+    if (placeholderName) {
+      await safeUpdateOrPost(env, placeholderName, spaceName, finalText, threadName, eventKey);
+    } else {
+      await safePost(env, spaceName, finalText, threadName, eventKey);
+    }
   } else {
     console.log(
       `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}`,
     );
+    // 本文空 = 投稿すべきテキスト無し。placeholder 残骸を消す
+    // (Python では placeholder のまま残るが、TS では `_delete_chat_message`
+    // 経路で残骸を出さない方が UX 上素直 = #186 の主旨に沿う)。
+    if (placeholderName) {
+      await safeDeletePlaceholder(env, placeholderName, eventKey);
+    }
   }
 
   // ---- 8. session-log memory append ----
@@ -682,6 +727,131 @@ async function safePost(
   }
 }
 
+/**
+ * placeholder POST helper (#186 UX 致命傷 fix)。Cloud Run
+ * `cma_lib.py:send_placeholder:l.3674-3720` の Worker port (Firestore 連動
+ * の dedupe state commit は省略 — Workers 側 dedupe は `confirmOwner` /
+ * `commitDone` が別軸で担保するため、placeholder POST 結果の `name` だけ
+ * 取れれば PATCH update / DELETE cleanup には十分)。
+ *
+ * 戻り値: 成功時 message resource name (`spaces/.../messages/...`)、失敗時
+ * 空文字。caller 側は空文字なら従来の新規 POST 経路に fallback する。
+ */
+async function safePostPlaceholder(
+  env: Env,
+  spaceName: string,
+  threadName: string | null,
+  eventKey: string,
+): Promise<string> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  if (!saKey) {
+    console.warn(
+      `[chat-event] placeholder POST skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
+    );
+    return '';
+  }
+  if (!spaceName) {
+    console.warn(`[chat-event] placeholder POST skipped eventKey=${eventKey} empty space`);
+    return '';
+  }
+  try {
+    // thread reply 時は `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
+    // を必須付与 (= safePost と同様、Python `_reply_to_chat:l.1247-1249` 等価)。
+    const res = await postChatMessage(
+      { saKeyJson: saKey },
+      spaceName,
+      PLACEHOLDER_TEXT,
+      threadName
+        ? {
+            threadName,
+            threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
+          }
+        : {},
+    );
+    return res.name;
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(
+      `[chat-event] placeholder POST fail eventKey=${eventKey} space=${spaceName}: ${reason}`,
+    );
+    return '';
+  }
+}
+
+/**
+ * placeholder PATCH update helper。失敗時は WARN log + safePost に
+ * fallback (Python `_placeholder_reply:l.3936-3942` legacy 経路と等価)。
+ */
+async function safeUpdateOrPost(
+  env: Env,
+  messageName: string,
+  spaceName: string,
+  text: string,
+  threadName: string | null,
+  eventKey: string,
+): Promise<void> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  if (!saKey) {
+    console.warn(
+      `[chat-event] safeUpdateOrPost skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
+    );
+    return;
+  }
+  try {
+    await updateChatMessage({ saKeyJson: saKey }, messageName, text);
+    return;
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(
+      `[chat-event] PATCH fail eventKey=${eventKey} message=${messageName}: ${reason} — falling back to POST`,
+    );
+  }
+  // PATCH 失敗時 fallback: 新規 POST (Python l.3942 等価)
+  await safePost(env, spaceName, text, threadName, eventKey);
+}
+
+/**
+ * placeholder DELETE helper (Python `_delete_chat_message:l.1879-1912`
+ * 等価)。404 は内部で正常扱い、その他失敗は WARN log のみで吸収する
+ * (bot 全体は落とさない、Python l.1888-1891 同思想)。
+ */
+async function safeDeletePlaceholder(
+  env: Env,
+  messageName: string,
+  eventKey: string,
+): Promise<void> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  if (!saKey) {
+    console.warn(
+      `[chat-event] placeholder DELETE skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
+    );
+    return;
+  }
+  try {
+    await deleteChatMessage({ saKeyJson: saKey }, messageName);
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(
+      `[chat-event] placeholder DELETE fail eventKey=${eventKey} message=${messageName}: ${reason}`,
+    );
+  }
+}
+
 async function safeCommit(
   env: Env,
   eventKey: string,
@@ -816,7 +986,6 @@ export async function handleChatQueue(
 //
 // TODO(#186 follow-up): 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
 // TODO(#186 follow-up): /costguard command の決定論短絡ハンドラ
-// TODO(#186 follow-up): placeholder POST + reply 書き換え (「入力中」表示)
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan

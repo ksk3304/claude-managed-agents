@@ -433,6 +433,57 @@ export async function updateChatMessage(
   }
 }
 
+/**
+ * Delete an existing Chat message. Used by the placeholder cleanup
+ * path (= Cloud Run `cma_gchat_bot.py:_delete_chat_message:l.1879-1912`
+ * 等価):
+ *   - placeholder を POST した後で session.create / LLM stream が失敗
+ *     したとき、Google Chat に残った placeholder 残骸 (= "...
+ *     MAKOTOくんが入力中") を削除する。
+ *
+ * HTTP 404 は「既に削除済」競合状態として **正常扱い** で resolve する
+ * (Python l.1905-1906 等価)。それ以外の non-2xx は `ChatApiError` を
+ * throw する。caller (= chat-event-handler.ts) 側は try/catch で囲み
+ * cleanup 失敗で bot 全体を落とさない方針 (Python l.1888-1891 と同思想)。
+ */
+export async function deleteChatMessage(
+  deps: ChatApiDeps,
+  messageName: string,
+): Promise<void> {
+  if (!messageName || !messageName.startsWith('spaces/')) {
+    throw new Error(
+      `deleteChatMessage: messageName must start with 'spaces/' (got ${messageName})`,
+    );
+  }
+
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const scopes = deps.scopes ?? [CHAT_BOT_SCOPE];
+  const token = await getChatAccessToken(deps, scopes);
+
+  // DELETE /v1/{messageName} (= Python l.1895-1897 等価)
+  const url = `${CHAT_API_BASE}/${messageName}`;
+  assertBridgeEgressAllowed(url, 'chat-api:deleteChatMessage');
+
+  const response = await fetchImpl(url, {
+    method: 'DELETE',
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  // 404 = 既に削除済 (race / 競合) として正常扱い (Python l.1905-1906)
+  if (response.status === 404) return;
+
+  if (!response.ok) {
+    const errorText = await safeReadText(response);
+    throw new ChatApiError(
+      `Chat REST DELETE failed status=${response.status} message=${messageName} body=${errorText.slice(0, 300)}`,
+      response.status,
+      errorText,
+    );
+  }
+}
+
 /** Reset the module-level cache. Tests only. */
 export function _resetChatTokenCacheForTests(): void {
   cachedToken = null;
