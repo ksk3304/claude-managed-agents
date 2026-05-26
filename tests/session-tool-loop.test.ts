@@ -81,6 +81,7 @@ describe('sendAndStreamWithToolDispatch', () => {
           name: 'drive_search',
           input: { query: 'x' },
         },
+        { type: 'session.status_idle', stop_reason: { type: 'requires_action', event_ids: ['tu_1'] } },
         { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),
@@ -109,6 +110,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     const client = makeFakeClient({
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
+        { type: 'session.status_idle', stop_reason: { type: 'requires_action', event_ids: ['tu_1'] } },
         { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),
@@ -130,6 +132,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     const client = makeFakeClient({
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
+        { type: 'session.status_idle', stop_reason: { type: 'requires_action', event_ids: ['tu_1'] } },
         { type: 'agent.message.text_delta', text: 'done' },
         { type: 'session.status_idle' },
       ],
@@ -178,7 +181,7 @@ describe('sendAndStreamWithToolDispatch', () => {
       toolDispatcher: dispatcher,
       maxToolCalls: 3,
     });
-    expect(dispatched).toBe(3);
+    expect(dispatched).toBe(0);
     expect(r.terminalEventType).toBe('limit.custom_tool_calls');
   });
 
@@ -187,6 +190,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     const client = makeFakeClient({
       events: [
         { type: 'agent.custom_tool_use', id: 'tu_1', name: 'drive_search', input: {} },
+        { type: 'session.status_idle', stop_reason: { type: 'requires_action', event_ids: ['tu_1'] } },
         { type: 'session.status_idle' },
       ],
       onSend: (p) => sent.push(p),

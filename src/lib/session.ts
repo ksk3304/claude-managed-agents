@@ -365,6 +365,11 @@ export async function sendAndStreamWithToolDispatch(
   let terminalEventType: string | undefined;
   let stopReason: string | undefined;
   let toolCalls = 0;
+  let requiresActionIters = 0;
+  const pendingCustomToolUses = new Map<
+    string,
+    { name: string; input: unknown }
+  >();
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
 
@@ -459,7 +464,11 @@ export async function sendAndStreamWithToolDispatch(
         continue;
       }
 
-      // 2b. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時
+      // 2b. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時。
+      // Managed Agents contract: collect `agent.custom_tool_use` here, then
+      // execute/send `user.custom_tool_result` only after the session pauses
+      // with `session.status_idle(stop_reason=requires_action)`. Sending the
+      // result while the session is still running can break the stream.
       if (evType === 'agent.custom_tool_use') {
         toolCalls += 1;
         if (toolCalls > maxToolCalls) {
@@ -476,52 +485,8 @@ export async function sendAndStreamWithToolDispatch(
         const toolUseId = pickString(ev, 'id') ?? '';
         const toolName = pickString(ev, 'name') ?? 'unknown';
         const toolInput = (ev as { input?: unknown }).input;
-        let result: ToolDispatchResult;
-        try {
-          result = await input.toolDispatcher(toolName, toolInput);
-        } catch (err) {
-          // Defensive — dispatcher contract says "never throw" but
-          // surface unexpected throws as is_error rather than killing
-          // the loop. The agent then sees the failure and can choose
-          // to recover or terminate.
-          result = {
-            ok: false,
-            payload: {
-              error: 'dispatcher_threw',
-              tool: toolName,
-              message: err instanceof Error ? err.message : String(err),
-            },
-          };
-        }
-        const resultEvent: Record<string, unknown> = {
-          type: 'user.custom_tool_result',
-          custom_tool_use_id: toolUseId,
-          content: [{ type: 'text', text: safeJsonStringify(result.payload) }],
-        };
-        if (!result.ok) resultEvent.is_error = true;
-        try {
-          // SDK's `BetaManagedAgentsEventParams` union doesn't model
-          // `user.custom_tool_result` (Python cma_lib.py:2424-2440 sends
-          // this shape: `{type, custom_tool_use_id, content, is_error?}`
-          // — Anthropic accepts it but the typed union covers only a
-          // subset). Cast through `unknown` to mirror email-handler.ts
-          // line 625's escape hatch for `user.message`.
-          await client.beta.sessions.events.send(input.sessionId, {
-            events: [resultEvent],
-            betas: [ANTHROPIC_BETA],
-          } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
-        } catch (err) {
-          // events.send shouldn't fail on a healthy session — log and
-          // break the loop so we don't loop on a broken pipe. The
-          // dedupe fence will keep the message from being double-replied.
-          console.error(
-            `[session] events.send for tool_result failed sessionId=${input.sessionId} tool=${toolName}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-          stopReason = 'events_send_failed';
-          terminalEventType = 'error.events_send';
-          break;
+        if (toolUseId) {
+          pendingCustomToolUses.set(toolUseId, { name: toolName, input: toolInput });
         }
         continue;
       }
@@ -533,11 +498,89 @@ export async function sendAndStreamWithToolDispatch(
         // The SDK exposes it on the event as either a nested object
         // ({type:'end_turn'}) or a bare string depending on shape.
         const sr = (ev as { stop_reason?: unknown }).stop_reason;
+        let requiredEventIds: string[] = [];
         if (typeof sr === 'string' && sr.length > 0) {
           stopReason = sr;
         } else if (sr && typeof sr === 'object') {
-          const t = pickString(sr as Record<string, unknown>, 'type');
+          const srObj = sr as Record<string, unknown>;
+          const t = pickString(srObj, 'type');
           if (t) stopReason = t;
+          requiredEventIds = extractRequiresActionEventIds(srObj);
+        }
+        if (
+          stopReason === 'requires_action' &&
+          pendingCustomToolUses.size > 0
+        ) {
+          requiresActionIters += 1;
+          if (requiresActionIters > maxToolCalls) {
+            console.warn(
+              `[session] custom_tool_use requires_action cap reached (${maxToolCalls}); sending errors`,
+            );
+          }
+          const eventIds =
+            requiredEventIds.length > 0
+              ? requiredEventIds
+              : [...pendingCustomToolUses.keys()];
+          const resultEvents: Record<string, unknown>[] = [];
+          for (const eventId of eventIds) {
+            const pending = pendingCustomToolUses.get(eventId);
+            if (!pending) {
+              resultEvents.push(makeCustomToolErrorResult(eventId, 'pending_lost'));
+              continue;
+            }
+            pendingCustomToolUses.delete(eventId);
+            let result: ToolDispatchResult;
+            if (requiresActionIters > maxToolCalls) {
+              result = {
+                ok: false,
+                payload: {
+                  error: 'custom_tool_call_cap',
+                  message: `custom tool iteration cap reached (max=${maxToolCalls})`,
+                },
+              };
+            } else {
+              try {
+                result = await input.toolDispatcher(pending.name, pending.input);
+              } catch (err) {
+                // Defensive — dispatcher contract says "never throw" but
+                // surface unexpected throws as is_error rather than killing
+                // the loop. The agent then sees the failure and can recover.
+                result = {
+                  ok: false,
+                  payload: {
+                    error: 'dispatcher_threw',
+                    tool: pending.name,
+                    message: err instanceof Error ? err.message : String(err),
+                  },
+                };
+              }
+            }
+            const resultEvent: Record<string, unknown> = {
+              type: 'user.custom_tool_result',
+              custom_tool_use_id: eventId,
+              content: [{ type: 'text', text: safeJsonStringify(result.payload) }],
+            };
+            if (!result.ok) resultEvent.is_error = true;
+            resultEvents.push(resultEvent);
+          }
+          try {
+            await client.beta.sessions.events.send(input.sessionId, {
+              events: resultEvents,
+              betas: [ANTHROPIC_BETA],
+            } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+          } catch (err) {
+            console.error(
+              `[session] events.send for tool_result failed sessionId=${input.sessionId}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            stopReason = 'events_send_failed';
+            terminalEventType = 'error.events_send';
+            break;
+          }
+          terminalEventType = undefined;
+          stopReason = undefined;
+          continue;
         }
         break;
       }
@@ -580,4 +623,28 @@ function safeJsonStringify(value: unknown): string {
       message: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+function extractRequiresActionEventIds(stopReason: Record<string, unknown>): string[] {
+  const direct = stopReason.event_ids;
+  if (Array.isArray(direct)) {
+    return direct.filter((v): v is string => typeof v === 'string' && v.length > 0);
+  }
+  const requiresAction = stopReason.requires_action;
+  if (requiresAction && typeof requiresAction === 'object') {
+    const nested = (requiresAction as Record<string, unknown>).event_ids;
+    if (Array.isArray(nested)) {
+      return nested.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    }
+  }
+  return [];
+}
+
+function makeCustomToolErrorResult(eventId: string, message: string): Record<string, unknown> {
+  return {
+    type: 'user.custom_tool_result',
+    custom_tool_use_id: eventId,
+    content: [{ type: 'text', text: message }],
+    is_error: true,
+  };
 }
