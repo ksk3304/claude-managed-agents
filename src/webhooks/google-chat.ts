@@ -71,6 +71,25 @@ export interface ChatEventPayload {
     sender: { name: string; displayName?: string; email?: string };
     text?: string;
     thread?: { name?: string };
+    /**
+     * Google Chat `Message.annotations`. shared space で mention の
+     * 厳密判定 (= substring 一致では拾えない USER_MENTION の
+     * startIndex/length) を行うため必須 (Issue #186 既知 #9 + #10)。
+     *
+     * type / userMention / startIndex / length の詳細は
+     * `src/lib/mention-detection.ts:ChatAnnotation` を参照。
+     */
+    annotations?: Array<{
+      type?: string;
+      startIndex?: number;
+      length?: number;
+      userMention?: {
+        user?: {
+          name?: string;
+          type?: string;
+        };
+      };
+    }>;
   };
   space?: { name: string; type?: string; displayName?: string };
   user?: { name: string; displayName?: string; email?: string };

@@ -99,10 +99,8 @@ import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
+import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
-
-/** Default bot displayName for shared-space mention matching. */
-const DEFAULT_BOT_DISPLAY_NAME = 'MAKOTOくん';
 
 /**
  * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
@@ -173,11 +171,15 @@ export async function handleChatEvent(
   const spaceType = space.type || 'UNKNOWN';
   const threadName = message.thread?.name ?? null;
   const rawText = message.text ?? '';
+  const annotations = message.annotations ?? [];
 
-  // ---- 3. bot 宛判定 (簡略) ----
-  const botDisplayName = (env.MAKOTO_BOT_DISPLAY_NAME || DEFAULT_BOT_DISPLAY_NAME).trim();
+  // ---- 3. bot 宛判定 (annotations-based, Python `_is_for_bot` 等価) ----
+  // 実判定は annotations の USER_MENTION (= `userMention.user.type === 'BOT'`
+  // 優先 + `GCHAT_BOT_USER_NAME` fallback) で行う (Issue #186 既知 #9
+  // substring false hit 解消)。
+  const botUserName = (env.GCHAT_BOT_USER_NAME ?? '').trim();
   const isDm = isDmSpace(spaceType);
-  const isForBot = isDm || textMentionsBot(rawText, botDisplayName);
+  const isForBot = isDm || isMentioningBot(annotations, botUserName);
   if (!isForBot) {
     console.log(
       `[chat-event] skip non-mention eventKey=${eventKey} space=${spaceName} type=${spaceType}`,
@@ -186,8 +188,10 @@ export async function handleChatEvent(
     return { kind: 'skipped', reason: 'not_for_bot' };
   }
 
-  // ---- 4. mention strip ----
-  let bodyText = stripLeadingMention(rawText, botDisplayName);
+  // ---- 4. mention strip (annotations-based, Python `_strip_mention` 等価) ----
+  // startIndex + length 範囲を正確に切り出す (= 先頭以外の mention や
+  // 複数 mention も漏れなく除去、Issue #186 既知 #10 解消)。
+  let bodyText = stripMentions(rawText, annotations);
   if (bodyText.length === 0) {
     if (threadName) {
       // Cloud Run l.3903-3906 と同等: mention のみのとき、文脈追従指示で agent に渡す
@@ -922,8 +926,13 @@ async function dispatchScheduleActionMarkers(
 }
 
 // ---------------------------------------------------------------------------
-// helper: bot detection + mention strip
+// helper: DM space detection
 // ---------------------------------------------------------------------------
+//
+// mention 判定 + strip は `src/lib/mention-detection.ts` に切り出し済
+// (= annotations-based、Python `_is_for_bot` / `_strip_mention` と byte 等価
+// port、Issue #186 既知 #9 + #10)。
+//
 
 function isDmSpace(spaceType: string): boolean {
   const up = (spaceType || '').toUpperCase();
@@ -935,21 +944,9 @@ function isDmSpace(spaceType: string): boolean {
  * Python 一次ソース (`scripts/cma_lib.py:l.59`):
  *   `_CAP_STOP_REASONS = ("tool_call_cap", "max_iter", "session_watchdog")`
  *
- * session.ts の `stopReason` は SDK event 終端ベースで TS 独自命名を含む。
- * cap-recovery wire up (= #186 既知 #3) では Python `_CAP_STOP_REASONS` 用語に
- * 正規化してから `shouldAttemptCapRecovery` に渡し、`isCapStopReason` 判定の
- * parity を保つ。mapping は session.ts 内 cap path 3 経路と1対1:
- *   - `'custom_tool_call_cap'`  (= custom_tool_use 上限超過、TS 独自命名)
- *       → `'tool_call_cap'`     (Python では custom/built-in を同じ tool_call_cap で扱う)
- *   - `'tool_call_cap'`         (= built-in tool 上限超過、TS = Python 同名)
- *       → `'tool_call_cap'`     (passthrough)
- *   - `'session_watchdog'`      (= 壁時計超過、TS = Python 同名)
- *       → `'session_watchdog'`  (passthrough)
- *   - その他 (`end_turn` / `stream_terminated` / `events_send_failed` / undefined)
- *       → `null` (= recovery 対象外)
- *
- * Python `max_iter` (custom_tool_use 往復上限) は scheduled 経路の概念で、
- * reactive (session.ts) では `custom_tool_call_cap` に集約済 = mapping 不要。
+ * cap-recovery wire up (= #186 既知 #3) で session.ts の TS 独自命名
+ * (`custom_tool_call_cap`) を Python `tool_call_cap` に正規化して
+ * `shouldAttemptCapRecovery` に渡す。
  */
 function mapToPythonCapStopReason(
   tsStopReason: string | undefined,
@@ -966,24 +963,6 @@ function mapToPythonCapStopReason(
   }
 }
 
-function textMentionsBot(text: string, botDisplayName: string): boolean {
-  if (!text || !botDisplayName) return false;
-  // 簡略: `@<displayName>` substring 含むかだけ判定 (annotations 不要)。
-  return text.includes(`@${botDisplayName}`);
-}
-
-function stripLeadingMention(text: string, botDisplayName: string): string {
-  if (!text) return '';
-  const prefix = `@${botDisplayName}`;
-  let t = text;
-  // 先頭の `@<displayName>` + 空白 (1 個以上、半角/全角) を除去
-  if (t.startsWith(prefix)) {
-    t = t.slice(prefix.length);
-    // 残り先頭の空白を 1 つだけ落とす (= Cloud Run 簡略版)
-    t = t.replace(/^[\s　]+/, '');
-  }
-  return t.trim();
-}
 
 // ---------------------------------------------------------------------------
 // helper: safe wrappers (never throw)

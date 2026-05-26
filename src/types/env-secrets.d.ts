@@ -81,12 +81,24 @@ declare namespace Cloudflare {
     MAKOTO_CHAT_QUEUE: Queue<import('../webhooks/google-chat').ChatQueueMessage>;
     /**
      * Google Chat reactive bot displayName (= bot account 表示名)。shared
-     * space で `@<displayName>` mention 検知に使う。未設定なら
-     * `MAKOTOくん` を default とする。
-     *
-     * Used by `src/queue/chat-event-handler.ts:textMentionsBot`.
+     * space で `@<displayName>` mention 検知の **displayName-based 簡易**
+     * 経路で使う (legacy)。annotations-based 厳密判定では使わない。
+     * 未設定なら `MAKOTOくん` を default とする。
      */
     MAKOTO_BOT_DISPLAY_NAME?: string;
+    /**
+     * Google Chat reactive bot の安定 user 識別子 (= `users/<numeric_id>`)。
+     * `Message.annotations` の `userMention.user.name` と一致比較し、
+     * `userMention.user.type === 'BOT'` が取れない環境 (= 旧形式 payload や
+     * Workspace Add-on 非対応の経路) のフォールバック判定に使う。
+     *
+     * 一次ソース: `scripts/cma_gchat_bot.py:BOT_USER_NAME` (env
+     * `GCHAT_BOT_USER_NAME`)。
+     *
+     * Used by `src/queue/chat-event-handler.ts` 経由で
+     * `src/lib/mention-detection.ts:isMentioningBot`。
+     */
+    GCHAT_BOT_USER_NAME?: string;
     /**
      * AgentMail inbox id used by the reactive Chat bot for outbound
      * EMAIL_SEND markers. Cloud Run の `cma-bot` inbox 等価 — 1 つの bot

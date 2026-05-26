@@ -279,6 +279,12 @@ function buildQueueMsg(overrides: {
   text?: string;
   senderEmail?: string;
   senderType?: string;
+  annotations?: Array<{
+    type?: string;
+    startIndex?: number;
+    length?: number;
+    userMention?: { user?: { name?: string; type?: string } };
+  }>;
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
@@ -301,6 +307,7 @@ function buildQueueMsg(overrides: {
         ...(overrides.threadName !== undefined && overrides.threadName !== null
           ? { thread: { name: overrides.threadName } }
           : {}),
+        ...(overrides.annotations ? { annotations: overrides.annotations } : {}),
       },
       space: {
         name: spaceName,
@@ -417,11 +424,22 @@ describe('handleChatEvent', () => {
 
   it('Case 2: shared space + bot mention あり → 同経路で committed', async () => {
     const env = buildEnv();
+    // annotations-based 厳密 mention (= Python `_is_for_bot` 等価)。
+    // `@MAKOTOくん` (= 9 UTF-16 code units) を範囲とする USER_MENTION。
+    // strip 後は ' 簡単な質問です' → trim → '簡単な質問です'。
     const msg = buildQueueMsg({
       spaceType: 'ROOM',
       spaceName: 'spaces/ROOM1',
       text: '@MAKOTOくん 簡単な質問です',
       threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
@@ -480,11 +498,21 @@ describe('handleChatEvent', () => {
 
   it('Case 5: body 空 + thread あり → mention-only 指示文で agent に渡し継続', async () => {
     const env = buildEnv();
+    // annotations-based 厳密 mention のみ (本文無し)。strip 後 bodyText が
+    // 空になり、thread 有 → mention-only 指示文へ。
     const msg = buildQueueMsg({
       spaceType: 'ROOM',
       spaceName: 'spaces/ROOM1',
       text: '@MAKOTOくん',
       threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
@@ -632,6 +660,14 @@ describe('handleChatEvent', () => {
       spaceName: 'spaces/ROOM10',
       text: '@MAKOTOくん 続きの質問',
       threadName: 'spaces/ROOM10/threads/T10',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
