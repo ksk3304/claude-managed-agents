@@ -318,9 +318,11 @@ export async function handleChatEvent(
 
   // ---- 5b. shared space thread history prepend (Issue #186 A 業務影響大) ----
   // shared space + thread reply 時のみ thread の過去 message を fetch して
-  // agent prompt の先頭に挿入する。DM では skip (= 1 対 1 session memory で
-  // カバー)。fetch failure は WARN + 空 fallback で従来挙動を破壊しない。
-  // permanent failure (= 連続 3 回失敗) 後は KV mark で skip。
+  // envelope の history 層に渡す (= mutating bodyText せず、orchestrator 側
+  // `buildUserMessageEnvelope({history})` で Python l.4195 と byte 等価に連結)。
+  // DM では skip (= 1 対 1 session memory でカバー)。fetch failure は WARN +
+  // 空 fallback で従来挙動を破壊しない。permanent failure (連続 3 回失敗)
+  // 後は KV mark で skip。
   //
   // Issue #186 既知 #6 (speaker-gate 完全実装): 履歴に未登録 chat_user_id が
   // 存在した場合は `hasUnresolvedSpeakers=true` を立て、後段 7b の
@@ -329,6 +331,7 @@ export async function handleChatEvent(
   // 旧挙動 (= 履歴なし → gate しない) を破壊しない。DM では shared space
   // 履歴自体存在しないため、初期値 false のまま CHAT_POST も自然に通る。
   let hasUnresolvedSpeakers = false;
+  let historyBlock = '';
   if (!isDm && threadName && env.CHAT_SA_KEY_JSON) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
@@ -341,9 +344,7 @@ export async function handleChatEvent(
         const historyResult = formatThreadHistoryWithMeta(history, {
           currentMessageName: message.name ?? '',
         });
-        if (historyResult.text) {
-          bodyText = `${historyResult.text}\n\n${bodyText}`;
-        }
+        historyBlock = historyResult.text;
         if (historyResult.unresolvedCount > 0) {
           hasUnresolvedSpeakers = true;
           console.warn(
@@ -371,7 +372,7 @@ export async function handleChatEvent(
 
   // ---- 5c. Space context + roster prepend (Issue #186 C 業務影響大) ----
   // shared space + chat-api key 有り時、「ここは何の space で、誰がいる、
-  // どの thread か」を内部メモブロックとして bodyText 先頭に追加する。
+  // どの thread か」を内部メモブロックとして envelope の speaker 層に渡す。
   // DM は skip (= 1 対 1 文脈)。Python `cma_gchat_bot.py:_build_space_context_block`
   // (l.3667) + `_build_space_roster_block` (l.3321) を 1 ブロックに連結
   // (Python wire-up l.4241-4253 / l.4269-4272 と同形)。
@@ -386,6 +387,7 @@ export async function handleChatEvent(
   // が space member を一切識別できない状態で別 space に CHAT_POST するのは
   // 履歴 latch と同じ権限事故源 (= unknown member 混在 thread からの横展開)
   // のため、保守的に gate 側へ倒す (= 「分からない時は止める」)。
+  let speakerContextBlock = '';
   if (!isDm && env.CHAT_SA_KEY_JSON) {
     try {
       const rosterResult: RosterFetchResult = await fetchSpaceMemberRoster(
@@ -398,7 +400,7 @@ export async function handleChatEvent(
         { threadName, roster: rosterResult },
       );
       if (contextBlock) {
-        bodyText = `${contextBlock}\n\n${bodyText}`;
+        speakerContextBlock = contextBlock;
         if (rosterResult.kind === 'roster') {
           console.log(
             `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
@@ -459,15 +461,6 @@ export async function handleChatEvent(
           `command=${intent.command} source=${intent.source}`,
       );
     }
-  }
-  // intent 種別を bodyText の先頭に注釈として注入 (= 既存 envelope への最小
-  // hint。本注釈は agent が intent を考慮した応答を返しやすくするため。
-  // history block より前に挿入し、agent が「今ターンの intent は ...」と
-  // 認識した上で履歴を読めるようにする)。null 時は注入しない (= 旧経路と
-  // bytes 等価)。
-  const intentPrefix = buildIntentPrefix(intent);
-  if (intentPrefix) {
-    bodyText = `${intentPrefix}\n${bodyText}`;
   }
 
   // ---- 6. orchestrate session ----
@@ -541,6 +534,17 @@ export async function handleChatEvent(
         personaSpec: PERSONA_SPEC,
         toolsSpec: TOOLS_SPEC,
         extraContentBlocks,
+        ...(historyBlock ? { historyBlock } : {}),
+        ...(speakerContextBlock ? { speakerContextBlock } : {}),
+        ...(intent
+          ? {
+              intent: {
+                command: intent.command,
+                ...(intent.source ? { source: intent.source } : {}),
+                isActionSkill: intent.isActionSkill,
+              },
+            }
+          : {}),
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,
@@ -1473,4 +1477,7 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // TODO(#186 follow-up): user_mapping default fallback (= 既知ユーザ以外の処理)
 // TODO(#186 follow-up): annotation-based mention detection (= _is_for_bot 完全 port)
 // TODO(#186 follow-up): _strip_mention の annotations ベース完全実装
-// TODO(#186 follow-up): user_message envelope の cap-recovery / intent / speaker prefix
+// NOTE(#186): user_message envelope の cap-recovery / intent / speaker prefix
+//             は既知 #11 で `src/lib/user-message-envelope.ts` に実装済 (= 配線
+//             は本 file の `intentResult` / `historyBlock` 経由)。残る完全化
+//             (speaker context block 本体 / roster block fetch) は別 follow-up。

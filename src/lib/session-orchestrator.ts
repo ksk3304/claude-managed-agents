@@ -8,10 +8,11 @@
  * marker parse / AgentMail send / current space 投稿 / session-log append
  * は扱わない (= `chat-event-handler.ts` の責務)。
  *
- * 中間版 scope (= Day 3 残時間優先) のため、Cloud Run の精緻な
- * `_build_user_message` (cap-recovery + intent + speaker prefix + 添付通知)
- * は省略し、最小 envelope (`<context>...\n</context>\n<user_message>...`) で
- * agent に渡す。完全 port は `// TODO(#186 follow-up):` で別 Issue 化。
+ * envelope 完全版 (cap-recovery + intent + speaker prefix + history + roster)
+ * は `src/lib/user-message-envelope.ts` の `buildUserMessageEnvelope` に集約済。
+ * 本 orchestrator は input から opts を構築して helper に委譲するだけ。
+ * 全層 opt-in 設計のため、未指定層は 0 bytes として落ちる = 中間版互換
+ * (最小 envelope) は維持されたまま、caller が段階的に層を有効化できる。
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 2 #5 — Google Chat reactive bot, Phase B)
  * Spec: Day 3 subagent G task brief §設計確定事項 1
@@ -38,6 +39,12 @@ import {
 } from './persona-builder';
 import { toResourceParam } from '../types/memory';
 import type { MemoryStoreResourceParam } from '../types/memory';
+import {
+  buildUserMessageEnvelope,
+  type IntentEnvelopeOption,
+  type SpeakerEnvelopeOption,
+  type CapEnvelopeOption,
+} from './user-message-envelope';
 
 /** KV key prefix for thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
@@ -112,6 +119,35 @@ export interface OrchestrateChatTurnInput {
    * 前提で暴走する」(incident 2026-05-08 同根) を防ぐ。
    */
   forceFreshSession?: boolean;
+  /**
+   * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
+   * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
+   * を挟んで連結される。caller (chat-event-handler) が `formatThreadHistory`
+   * の結果をそのまま渡す責務。未指定 = history なし (旧挙動互換).
+   */
+  historyBlock?: string;
+  /**
+   * 検出済 intent label (= `detectActionSkillIntent` の結果)。未指定なら
+   * envelope に何も挿入しない (= 旧挙動互換)。指定時は `<intent>` tag で
+   * agent context に hint として注入される (TS port 拡張点).
+   */
+  intent?: IntentEnvelopeOption;
+  /**
+   * speaker context block の Python 完成形 (= `_build_space_context_block`
+   * の出力)。未指定 / 空文字なら最小 `<context>space_type=... sender=...</context>`
+   * のみ (= 旧挙動互換).
+   */
+  speakerContextBlock?: string;
+  /**
+   * roster block (Python `_build_space_roster_block` 出力)。未指定 / 空文字
+   * なら envelope に 0 bytes (= 旧挙動互換).
+   */
+  rosterBlock?: string;
+  /**
+   * cap-recovery turn opt-in。`{recovery: true}` 時 body は RECOVERY_PROMPT
+   * で完全差し替え (Python recovery semantics)。未指定 = 通常 turn (旧挙動互換).
+   */
+  cap?: CapEnvelopeOption;
 }
 
 export interface OrchestrateChatTurnResult {
@@ -278,12 +314,26 @@ export async function orchestrateChatTurn(
   }
 
   // ---- user message envelope ----
-  // 中間版 = 最小 envelope。完全版 (cap-recovery + intent + speaker prefix
-  // + 添付通知) は別 Issue で対応 (= Cloud Run `_build_user_message` 経路の port)。
-  const senderLabel = input.senderEmail;
-  const userMessageText =
-    `<context>space_type=${input.spaceType || 'UNKNOWN'} sender=${senderLabel}</context>\n` +
-    `<user_message>${input.bodyText}</user_message>`;
+  // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
+  // を `buildUserMessageEnvelope` 純関数で組み立てる (Python と byte 等価層は
+  // history / mention header / speaker context block / RECOVERY_PROMPT)。
+  // 全層 opt-in 設計で、caller が未指定の層は 0 bytes として落ちるため、
+  // 中間版互換 (最小 envelope) は opts なしで同形に保たれる (= 回帰なし).
+  const speakerOpt: SpeakerEnvelopeOption = {
+    spaceType: input.spaceType || 'UNKNOWN',
+    senderEmail: input.senderEmail,
+  };
+  if (input.speakerContextBlock) {
+    speakerOpt.contextBlock = input.speakerContextBlock;
+  }
+  const envelopeOpts: Parameters<typeof buildUserMessageEnvelope>[1] = {
+    speaker: speakerOpt,
+  };
+  if (input.historyBlock) envelopeOpts.history = input.historyBlock;
+  if (input.intent) envelopeOpts.intent = input.intent;
+  if (input.rosterBlock) envelopeOpts.roster = input.rosterBlock;
+  if (input.cap) envelopeOpts.cap = input.cap;
+  const userMessageText = buildUserMessageEnvelope(input.bodyText, envelopeOpts);
 
   // 添付処理 (Issue #186 既知 #1 + O) で組み立てた image / document / text blocks
   // があれば text の後ろに連結する。Cloud Run `cma_gchat_bot.py` では
