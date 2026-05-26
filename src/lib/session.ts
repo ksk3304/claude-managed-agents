@@ -582,7 +582,18 @@ export async function sendAndStreamWithToolDispatch(
           stopReason = undefined;
           continue;
         }
-        break;
+        // Managed Agents can emit an idle boundary before later tool/final
+        // events arrive. Treat explicit final reasons as terminal; otherwise
+        // keep draining the stream. If the stream actually ends here, the
+        // async iterator exits and we return the text collected so far.
+        if (
+          stopReason === 'end_turn' ||
+          stopReason === 'stop_sequence' ||
+          stopReason === 'max_tokens'
+        ) {
+          break;
+        }
+        continue;
       }
       if (evType === 'session.status_terminated') {
         terminalEventType = evType;

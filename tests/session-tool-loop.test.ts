@@ -147,6 +147,33 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.assistantText).toContain('done');
   });
 
+  it('keeps draining after an interim idle boundary before built-in tool output', async () => {
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '了解です。シート作成を進めます。' }],
+        },
+        { type: 'session.status_idle' },
+        { type: 'agent.tool_use', name: 'sheets_create' },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '作成しました！ URL: https://docs.example/sheet' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 's',
+      userMessage: 'sheet',
+      toolDispatcher: dispatcher,
+    });
+    expect(r.assistantText).toContain('了解です。');
+    expect(r.assistantText).toContain('作成しました！');
+    expect(r.stopReason).toBe('end_turn');
+  });
+
   it('stops on session.status_terminated', async () => {
     const client = makeFakeClient({
       events: [{ type: 'agent.message.text_delta', text: 'partial' }, { type: 'session.status_terminated' }],
