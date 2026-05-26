@@ -73,6 +73,7 @@ import {
   type RosterFetchResult,
 } from '../lib/space-roster';
 import { applyChatPostGateToText } from '../lib/speaker-gate';
+import { isMailSendApprovalText, isMailSendApprovalTurn } from '../lib/mail-confirmation';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import {
   parseCostGuardCommand,
@@ -319,11 +320,14 @@ export async function handleChatEvent(
     }
   }
 
-  // ---- 5b. shared space thread history prepend (Issue #186 A 業務影響大) ----
-  // shared space + thread reply 時のみ thread の過去 message を fetch して
+  // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
+  // shared space + thread reply、または DM の mail confirmation reply 時のみ
+  // thread の過去 message を fetch して
   // envelope の history 層に渡す (= mutating bodyText せず、orchestrator 側
   // `buildUserMessageEnvelope({history})` で Python l.4195 と byte 等価に連結)。
-  // DM では skip (= 1 対 1 session memory でカバー)。fetch failure は WARN +
+  // DM は通常 skip (= 1 対 1 session memory でカバー) だが、
+  // 「はい、お願いします」だけでは mail intent が出ないため、mail draft
+  // confirmation らしい短文の時だけ history を渡す。fetch failure は WARN +
   // 空 fallback で従来挙動を破壊しない。permanent failure (連続 3 回失敗)
   // 後は KV mark で skip。
   //
@@ -335,12 +339,16 @@ export async function handleChatEvent(
   // 履歴自体存在しないため、初期値 false のまま CHAT_POST も自然に通る。
   let hasUnresolvedSpeakers = false;
   let historyBlock = '';
-  if (!isDm && threadName && env.CHAT_SA_KEY_JSON) {
+  const shouldFetchHistory =
+    threadName !== null &&
+    Boolean(env.CHAT_SA_KEY_JSON) &&
+    (!isDm || isMailSendApprovalText(bodyText));
+  if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
       try {
         const history = await fetchThreadMessages(
-          { saKeyJson: env.CHAT_SA_KEY_JSON },
+          { saKeyJson: env.CHAT_SA_KEY_JSON! },
           spaceName,
           threadName,
         );
@@ -446,7 +454,13 @@ export async function handleChatEvent(
   //     ここで /mail や /schedule の skill 自体を invoke することはしない
   //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
   //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
-  const intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
+    intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
+    console.log(
+      `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
+    );
+  }
   const forceFreshSession = intent?.isActionSkill === true;
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
