@@ -1,0 +1,63 @@
+# CI gate: internal_state_patterns.json drift detection between this
+# Worker bundle and the upstream makoto-prime canonical JSON.
+#
+# Background: MAKOTOくん's internal-state leakage filter runs in two
+# languages (Python on Cloud Run + TypeScript on Cloudflare Workers)
+# and both must agree on the same pattern set. The single source of
+# truth lives in the makoto-prime repo at
+# `scripts/data/internal_state_patterns.json` (and a parity fixture
+# under `tests/data/`). This Worker bundles snapshot copies under
+# `src/redact/` and `tests/data/`. This workflow fails the build if
+# the bundled snapshots drift from upstream.
+#
+# Issue: ksk3304/makoto-prime#186 (Phase 2 — N).
+# Spec  : .claude/rules/makoto-kun-verification.md §1.1 実行時フィルタ
+#         との同期 in the makoto-prime repo.
+
+name: check-patterns-drift
+
+on:
+  pull_request:
+    paths:
+      - 'src/redact/internal_state_patterns.json'
+      - 'tests/data/internal_state_patterns_parity_cases.json'
+      - 'scripts/check-patterns-drift.mjs'
+      - '.github/workflows/check-patterns-drift.yml'
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'src/redact/internal_state_patterns.json'
+      - 'tests/data/internal_state_patterns_parity_cases.json'
+      - 'scripts/check-patterns-drift.mjs'
+      - '.github/workflows/check-patterns-drift.yml'
+  # Manual trigger so anyone can verify the bundle vs upstream on demand.
+  workflow_dispatch: {}
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (cma-on-cf)
+        uses: actions/checkout@v4
+        with:
+          path: cma-on-cf
+
+      - name: Checkout upstream makoto-prime as a sibling
+        uses: actions/checkout@v4
+        with:
+          # Public repo lookup — adjust `repository` if the canonical
+          # makoto-prime moves. The drift script only needs read access
+          # to two JSON files; no token-scoped permissions required.
+          repository: ksk3304/makoto-prime
+          path: makoto-prime
+          fetch-depth: 1
+
+      - name: Run drift check
+        # MAKOTO_PRIME_DIR points at the sibling checkout from the cma-on-cf
+        # working directory. Script exits non-zero on drift.
+        working-directory: cma-on-cf
+        env:
+          MAKOTO_PRIME_DIR: ${{ github.workspace }}/makoto-prime
+        run: node scripts/check-patterns-drift.mjs

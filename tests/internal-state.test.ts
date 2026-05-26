@@ -4,8 +4,9 @@
  * Parity with Python `scripts/cma_log_redaction.py:scrub_internal_state_for_chat`,
  * verified by the shared parity fixture
  * `tests/data/internal_state_patterns_parity_cases.json` (= snapshot
- * copied from makoto-prime/tests/data; a follow-up issue tracks
- * SHA-diff CI gate between the two copies).
+ * copied from makoto-prime/tests/data; sha-diff CI gate against
+ * upstream is enforced by `scripts/check-patterns-drift.mjs` via
+ * `.github/workflows/check-patterns-drift.yml`, Issue #186 N).
  */
 
 import { describe, it, expect } from 'vitest';

@@ -4,8 +4,9 @@
  *
  * Single source of truth = `scripts/data/internal_state_patterns.json`
  * in the makoto-prime repo (Issue #177 Phase 1 中盤 B). The JSON in
- * this directory is a snapshot copy; a follow-up Issue tracks CI
- * sha-diff between the two copies.
+ * this directory is a snapshot copy; drift between the two is caught
+ * pre-merge by `scripts/check-patterns-drift.mjs` (CI workflow
+ * `.github/workflows/check-patterns-drift.yml`, Issue #186 N).
  *
  * Contract (parity with Python — verified by
  * `tests/data/internal_state_patterns_parity_cases.json` consumed
