@@ -70,6 +70,12 @@ import {
 import { applyChatPostGateToText } from '../lib/speaker-gate';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
+import {
+  resolveCapRecoveryConfig,
+  runCapRecovery,
+  shouldAttemptCapRecovery,
+  type CapRecoveryStreamExecutor,
+} from '../lib/cap-recovery';
 import { parseAssistantText } from '../lib/email-send-marker';
 import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
@@ -85,6 +91,7 @@ import {
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
 import type { SkillsData } from '../lib/intent-detector';
+import { sendAndStreamWithToolDispatch } from '../lib/session';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
@@ -424,6 +431,82 @@ export async function handleChatEvent(
     sessionId = orchestrated.sessionId;
     sessionIdRef.current = sessionId;
     assistantText = orchestrated.assistantText;
+
+    // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
+    // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
+    // session.ts の `sendAndStreamWithToolDispatch` が cap (custom_tool_use /
+    // built-in tool / session_watchdog) を踏むと `stopReason` を返す。
+    // それが Python `_CAP_STOP_REASONS` 等価かを判定し、env flag が enable
+    // なら recovery turn を 1 度だけ追撃し、得られた本文で assistantText を
+    // 置換する。失敗/空/timeout/disabled は 既存挙動 (= 部分テキストの
+    // まま) を温存する (= silent skip しない = 必ず構造化ログを残す)。
+    //
+    // session.ts の stopReason → Python `_CAP_STOP_REASONS` 用語 mapping:
+    //   - `'custom_tool_call_cap'`  (TS, custom_tool_use 上限超過)
+    //       → `'tool_call_cap'`     (Python `_CAP_STOP_REASONS[0]`)
+    //   - `'tool_call_cap'`         (TS, built-in tool 上限超過)
+    //       → `'tool_call_cap'`     (Python 同名)
+    //   - `'session_watchdog'`      (TS, 壁時計超過)
+    //       → `'session_watchdog'`  (Python 同名)
+    //   - その他                    → mapping なし = recovery 対象外
+    const capRecoveryConfig = resolveCapRecoveryConfig({
+      ...(env.CMA_REACTIVE_MAX_TOOL_CALLS !== undefined
+        ? { CMA_REACTIVE_MAX_TOOL_CALLS: env.CMA_REACTIVE_MAX_TOOL_CALLS }
+        : {}),
+      ...(env.CMA_REACTIVE_CAP_RECOVERY_ENABLED !== undefined
+        ? {
+            CMA_REACTIVE_CAP_RECOVERY_ENABLED:
+              env.CMA_REACTIVE_CAP_RECOVERY_ENABLED,
+          }
+        : {}),
+    });
+    const pythonStopReason = mapToPythonCapStopReason(orchestrated.stopReason);
+    if (
+      pythonStopReason !== null &&
+      shouldAttemptCapRecovery(pythonStopReason, capRecoveryConfig)
+    ) {
+      const executor: CapRecoveryStreamExecutor = async ({
+        sessionId: sid,
+        recoveryPrompt,
+        maxToolCalls,
+        toolDispatcher,
+      }) => {
+        const res = await sendAndStreamWithToolDispatch(client, {
+          sessionId: sid,
+          userMessage: recoveryPrompt,
+          toolDispatcher,
+          maxToolCalls,
+        });
+        return {
+          text: res.assistantText,
+          stopReason: res.stopReason ?? res.terminalEventType ?? '',
+        };
+      };
+      const recoveryResult = await runCapRecovery({
+        sessionId,
+        executor,
+      });
+      const degraded =
+        recoveryResult.toolNames.length > 0 ||
+        (recoveryResult.stopReason !== '' &&
+          mapToPythonCapStopReason(recoveryResult.stopReason) !== null);
+      console.log(
+        `[chat-event] cap_recovery outcome=${recoveryResult.outcome} ` +
+          `eventKey=${eventKey} session=${sessionId} ` +
+          `orig_stop=${pythonStopReason} rec_stop=${recoveryResult.stopReason || 'n/a'} ` +
+          `rec_chars=${recoveryResult.text.length} ` +
+          `rec_tools=${recoveryResult.toolNames.join(',') || 'n/a'} ` +
+          `rec_degraded=${degraded} ` +
+          `rec_error=${recoveryResult.error || 'n/a'}`,
+      );
+      if (recoveryResult.outcome === 'recovered' && recoveryResult.text) {
+        // 収集済み部分テキストを recovered 本文で置換。
+        // Python `collected[:] = [_rec["text"]]` + `_recovery_suppressed_cap_notice`
+        // と同等の効果 (TS 中間版では cap notice 自体が未実装なので「置換」だけ
+        // 行えば cap notice 抑止 = no-op で済む)。
+        assistantText = recoveryResult.text;
+      }
+    }
   } catch (err) {
     // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
     // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
@@ -845,6 +928,42 @@ async function dispatchScheduleActionMarkers(
 function isDmSpace(spaceType: string): boolean {
   const up = (spaceType || '').toUpperCase();
   return up === 'DM' || up === 'DIRECT_MESSAGE';
+}
+
+/**
+ * session.ts の `stopReason` を Python `_CAP_STOP_REASONS` 用語に正規化する。
+ * Python 一次ソース (`scripts/cma_lib.py:l.59`):
+ *   `_CAP_STOP_REASONS = ("tool_call_cap", "max_iter", "session_watchdog")`
+ *
+ * session.ts の `stopReason` は SDK event 終端ベースで TS 独自命名を含む。
+ * cap-recovery wire up (= #186 既知 #3) では Python `_CAP_STOP_REASONS` 用語に
+ * 正規化してから `shouldAttemptCapRecovery` に渡し、`isCapStopReason` 判定の
+ * parity を保つ。mapping は session.ts 内 cap path 3 経路と1対1:
+ *   - `'custom_tool_call_cap'`  (= custom_tool_use 上限超過、TS 独自命名)
+ *       → `'tool_call_cap'`     (Python では custom/built-in を同じ tool_call_cap で扱う)
+ *   - `'tool_call_cap'`         (= built-in tool 上限超過、TS = Python 同名)
+ *       → `'tool_call_cap'`     (passthrough)
+ *   - `'session_watchdog'`      (= 壁時計超過、TS = Python 同名)
+ *       → `'session_watchdog'`  (passthrough)
+ *   - その他 (`end_turn` / `stream_terminated` / `events_send_failed` / undefined)
+ *       → `null` (= recovery 対象外)
+ *
+ * Python `max_iter` (custom_tool_use 往復上限) は scheduled 経路の概念で、
+ * reactive (session.ts) では `custom_tool_call_cap` に集約済 = mapping 不要。
+ */
+function mapToPythonCapStopReason(
+  tsStopReason: string | undefined,
+): 'tool_call_cap' | 'session_watchdog' | null {
+  if (!tsStopReason) return null;
+  switch (tsStopReason) {
+    case 'custom_tool_call_cap':
+    case 'tool_call_cap':
+      return 'tool_call_cap';
+    case 'session_watchdog':
+      return 'session_watchdog';
+    default:
+      return null;
+  }
 }
 
 function textMentionsBot(text: string, botDisplayName: string): boolean {

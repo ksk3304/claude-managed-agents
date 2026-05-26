@@ -170,10 +170,31 @@ interface FakeAnthOpts {
   memoryRetrieveContent?: string;
   memoryCreateCapture?: Array<{ memoryStoreId: string; input: unknown }>;
   memoryUpdateCapture?: Array<unknown>;
+  /**
+   * cap-recovery wire up テスト用。`stream()` の N 回目以降の呼出で再生
+   * する追加 event 列。指定なしなら従来通り `events` を毎回再生する。
+   * 配列の index N-1 が N 回目 (= 1-based) の stream に対応する。
+   */
+  followupEventBatches?: Array<Array<Record<string, unknown>>>;
 }
 
 function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
-  async function* stream(): AsyncIterable<Record<string, unknown>> {
+  let streamCallCount = 0;
+  async function* streamForCall(
+    callIndex: number,
+  ): AsyncIterable<Record<string, unknown>> {
+    // callIndex は 0-based。0 = 初回 = opts.events、1 以降は
+    // followupEventBatches[callIndex - 1] を優先、無ければ events fallback。
+    if (callIndex === 0) {
+      for (const ev of opts.events) yield ev;
+      return;
+    }
+    const batchIdx = callIndex - 1;
+    const followup = opts.followupEventBatches?.[batchIdx];
+    if (followup) {
+      for (const ev of followup) yield ev;
+      return;
+    }
     for (const ev of opts.events) yield ev;
   }
   async function* emptyMemList(): AsyncIterable<Record<string, unknown>> {
@@ -196,7 +217,9 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
             _o: unknown,
           ): Promise<AsyncIterable<Record<string, unknown>>> {
             if (opts.streamThrow) throw opts.streamThrow;
-            return stream();
+            const callIndex = streamCallCount;
+            streamCallCount += 1;
+            return streamForCall(callIndex);
           },
         },
       },
@@ -1000,5 +1023,158 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(0);
     // DELETE は呼ばれない (= 失敗経路ではなく fallback POST で完結)
     expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // #186 既知 #3 配線: cap-recovery wire up (= chat-event-handler.ts の
+  // orchestrator return 後の cap 超過判定 + runCapRecovery 起動)。
+  // -------------------------------------------------------------------------
+  //
+  // session.ts の `sendAndStreamWithToolDispatch` は built-in tool 上限
+  // (`DEFAULT_MAX_BUILTIN_TOOL_CALLS=15`) を超えた `agent.tool_use` event を
+  // 受信すると `user.interrupt` を送信し、`stopReason='tool_call_cap'` /
+  // `terminalEventType='limit.builtin_tool_calls'` を返して loop を break する。
+  // test では 16 件の `agent.tool_use` event を流して cap を踏ませる。
+
+  /** 16 件の `agent.tool_use` event を生成 (= built-in cap 発火条件)。 */
+  function makeBuiltinCapEvents(): Array<Record<string, unknown>> {
+    const events: Array<Record<string, unknown>> = [
+      // 初回 partial text を 1 件流し、後で recovery 後の text と差別化する。
+      {
+        type: 'agent.message',
+        content: [{ type: 'text', text: '途中まで作りました…' }],
+      },
+    ];
+    // 16 件の built-in tool_use event (= bash 等) を生成。
+    // DEFAULT_MAX_BUILTIN_TOOL_CALLS=15 なので 16 件目で `> max` で break。
+    for (let i = 0; i < 16; i += 1) {
+      events.push({ type: 'agent.tool_use', id: `bt_${i}`, name: 'bash' });
+    }
+    // 終端 event は不要 (cap 検知が break するため到達しない)。
+    return events;
+  }
+
+  it('cap-recovery: built-in tool cap 超過 → recovery turn 起動 → recovered 本文で置換 + commit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_cap_1',
+      events: makeBuiltinCapEvents(),
+      // 2 回目 stream = recovery turn の応答。完成本文を text として返す。
+      followupEventBatches: [
+        [
+          {
+            type: 'agent.message',
+            content: [
+              { type: 'text', text: '収集済み情報で完成版を作成しました。' },
+            ],
+          },
+          { type: 'session.status_idle', stop_reason: 'end_turn' },
+        ],
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // 最終応答 (= recovery 後の本文) が placeholder の PATCH 経由で出る。
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain(
+      '収集済み情報で完成版を作成しました。',
+    );
+    // 元の部分テキスト「途中まで作りました…」は置換されているため含まれない。
+    expect(chatApiMock.patches[0]!.text).not.toContain('途中まで作りました');
+  });
+
+  it('cap-recovery: env CMA_REACTIVE_CAP_RECOVERY_ENABLED=0 で cap 超過 → recovery 起動せず部分テキストのまま', async () => {
+    const env = buildEnv({
+      envOverrides: { CMA_REACTIVE_CAP_RECOVERY_ENABLED: '0' } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_cap_2',
+      events: makeBuiltinCapEvents(),
+      // 2 回目 stream を仕込んでおく (= もし誤って recovery が起動した
+      // 場合に確実に検知できるよう、recovery 本文を flag 文字列に)
+      followupEventBatches: [
+        [
+          {
+            type: 'agent.message',
+            content: [
+              { type: 'text', text: 'RECOVERY_RAN_ERRONEOUSLY' },
+            ],
+          },
+          { type: 'session.status_idle' },
+        ],
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // 部分テキストがそのまま PATCH に出る (= recovery 起動しなかった証拠)。
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('途中まで作りました');
+    expect(chatApiMock.patches[0]!.text).not.toContain('RECOVERY_RAN_ERRONEOUSLY');
+  });
+
+  it('cap-recovery: outcome=empty (recovery 本文が空) → 部分テキストのまま温存 (= 既存挙動 fallback)', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_cap_3',
+      events: makeBuiltinCapEvents(),
+      // 2 回目 stream が空応答 (= recovery が text を生成できなかった)
+      followupEventBatches: [
+        [{ type: 'session.status_idle', stop_reason: 'end_turn' }],
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // 部分テキストがそのまま PATCH に出る (= recovery empty で置換しない)。
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('途中まで作りました');
+  });
+
+  it('cap-recovery: 非 cap 終端 (end_turn) → recovery 起動しない (= 通常完了経路、未起動証跡)', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_cap_4',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '通常完了テキスト' }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+      // 2 回目用 events を仕込んでおき、もし起動されたら検知できるように。
+      followupEventBatches: [
+        [
+          {
+            type: 'agent.message',
+            content: [{ type: 'text', text: 'RECOVERY_ERRONEOUSLY_RAN' }],
+          },
+          { type: 'session.status_idle' },
+        ],
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('通常完了テキスト');
+    expect(chatApiMock.patches[0]!.text).not.toContain('RECOVERY_ERRONEOUSLY_RAN');
   });
 });

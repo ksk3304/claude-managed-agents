@@ -100,6 +100,14 @@ export interface OrchestrateChatTurnResult {
   assistantText: string;
   /** stream 終端 event type (`session.status_idle` / `session.status_terminated` / etc.). */
   terminalEventType?: string;
+  /**
+   * `sendAndStreamWithToolDispatch` が返した stop reason (= Python
+   * `_stop_reason_type` 等価)。cap 超過判定 (cap-recovery wire up #186 既知 #3)
+   * で caller が参照する。値は session.ts 側の決定 = `'end_turn'` /
+   * `'tool_call_cap'` / `'custom_tool_call_cap'` / `'session_watchdog'` /
+   * `'stream_terminated'` / `'events_send_failed'` 等。
+   */
+  stopReason?: string;
   /** 起動ログ用に取得した system prompt sha 等。caller が必要なら参照. */
   systemPromptInfo: SystemPromptResult;
 }
@@ -272,6 +280,9 @@ export async function orchestrateChatTurn(
   };
   if (streamResult.terminalEventType !== undefined) {
     result.terminalEventType = streamResult.terminalEventType;
+  }
+  if (streamResult.stopReason !== undefined) {
+    result.stopReason = streamResult.stopReason;
   }
   return result;
 }

@@ -118,5 +118,20 @@ declare namespace Cloudflare {
      * handler 別 topic モデルで分けて運用する)。
      */
     SCHEDULER_HANDLER_TOPIC_PREFIX?: string;
+    /**
+     * Reactive 経路 (chat / mail) の `agent.tool_use` 既定上限 override
+     * (整数文字列、1..60 範囲外は WARN + default fallback)。未設定 = 40。
+     * Python `_REACTIVE_DEFAULT_MAX_TOOL_CALLS` (`scripts/cma_gchat_bot.py:l.1388`)
+     * と等価。`src/lib/cap-recovery.ts:resolveReactiveMaxToolCalls` が読む。
+     */
+    CMA_REACTIVE_MAX_TOOL_CALLS?: string;
+    /**
+     * Reactive cap recovery turn の feature flag。"0" / "false" / "no"
+     * (大小無視) で無効化。未設定 = 既定有効。Python
+     * `_reactive_cap_recovery_enabled` (`scripts/cma_gchat_bot.py:l.1420`)
+     * と等価。`src/lib/cap-recovery.ts:isReactiveCapRecoveryEnabled` が読む。
+     * scheduled 経路の recovery には影響しない (reactive 専用)。
+     */
+    CMA_REACTIVE_CAP_RECOVERY_ENABLED?: string;
   }
 }
