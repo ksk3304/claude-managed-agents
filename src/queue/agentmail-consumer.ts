@@ -53,6 +53,10 @@ import {
 } from '../lib/dedupe';
 import { redactPiiInText } from '../redact/pii';
 import { extractInboundRfc822MessageId } from '../lib/email-thread';
+import {
+  classifyInboundMail,
+  type InboundClassification,
+} from '../lib/agentmail-classification';
 import { getThreadLock, type ThreadLockStub } from '../durable-objects/thread-lock';
 import type { AgentMailMessage, AgentMailWebhookEvent } from '../types/agentmail';
 import type { AgentMailQueueMessage } from '../webhooks/agentmail';
@@ -80,6 +84,18 @@ export interface AgentMailDispatchContext {
   threadLock: ThreadLockStub;
   /** Event key the framing layer uses for commit / release. */
   eventKey: string;
+  /**
+   * Header-only continuation / cold-inbound classification computed by
+   * the framing layer (Issue #186 G). Dispatchers may **refine** this
+   * verdict after a `findSessionByRfc822MessageId` D1 lookup — the
+   * framing pass cannot reach D1, so a strong `continuation` result
+   * from this field still requires a DB-confirmed match to advance to
+   * the auto-reply path. A `cold` verdict from a `re_chain_exceeded`
+   * demotion (`classification.demotedReason === 're_chain_exceeded'`)
+   * should be treated as a hard veto on auto-reply even if D1
+   * confirms the thread.
+   */
+  classification: InboundClassification;
 }
 
 export type AgentMailDispatchOutcome =
@@ -150,6 +166,21 @@ export async function handleAgentMailMessage(
   const eventKey = eventKeyForRfc822(rfc822);
   const owner = newClaimOwner(env.WORKER_INSTANCE_ID ?? '');
 
+  // Step 1b. Header-only continuation / cold classification (Issue
+  // #186 G). The framing layer cannot reach D1, so we pass an empty
+  // `knownOutboundMessageIds` set — the dispatcher can still upgrade a
+  // `cold` verdict to `continuation` after its
+  // `findSessionByRfc822MessageId` lookup. What this pass *does* catch
+  // up front: `re_chain_exceeded` runaway threads (`Re:` chain >= 5
+  // demotes to cold even if D1 would confirm the thread) and pure-
+  // header signals that survive serialization to the dispatch context.
+  const classification = classifyInboundMail(inboundMessage);
+  console.log(
+    `[agentmail-consumer] classify svixId=${body.svix_id} rfc822=${rfc822} kind=${classification.kind} confidence=${classification.confidence.toFixed(2)} signals=${classification.signals.join('|')}${
+      classification.demotedReason ? ` demoted=${classification.demotedReason}` : ''
+    }`,
+  );
+
   // Step 2. Claim.
   const claim = await tryClaim(env.DB, eventKey, owner, {
     leaseTtlMs: LEASE_TTL_MS,
@@ -196,6 +227,7 @@ export async function handleAgentMailMessage(
       claim: { owner, version: claimVersion },
       threadLock,
       eventKey,
+      classification,
     });
 
     if (outcome.kind === 'committed') {
