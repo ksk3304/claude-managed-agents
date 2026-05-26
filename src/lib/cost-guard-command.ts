@@ -52,7 +52,7 @@ export function parseCostGuardCommand(
   const [cmd, rest] = parseCommand(text);
   if (cmd !== '/costguard') return null;
   const toks = (rest || '').trim().split(/\s+/).filter((t) => t.length > 0);
-  const subcommand = (toks[0] || '').toLowerCase();
+  const subcommand = (toks[0] || 'status').toLowerCase();
   const restTokens = toks.slice(1);
   return { subcommand, restTokens };
 }
@@ -152,12 +152,6 @@ async function handleInner(
 ): Promise<string> {
   const { subcommand } = command;
   const { senderEmail, guardDeps } = opts;
-
-  if (!subcommand) {
-    return denied(
-      'サブコマンド未指定 (status / enable / disable / resume / pause / set / confirm / cancel)',
-    );
-  }
 
   if (subcommand === 'status') {
     // status は閲覧 = 非 admin でも可 (Python `_handle:l.231-232` と同じ)

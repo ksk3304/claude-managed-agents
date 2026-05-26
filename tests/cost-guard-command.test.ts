@@ -59,9 +59,9 @@ describe('parseCostGuardCommand', () => {
       subcommand: 'set',
       restTokens: ['hard-cap', 'session', '5.0'],
     });
-    // sub なし → subcommand 空文字 (handleCostGuardCommand 側で denied 返却)
+    // sub なし → status 扱い (実機テスト計画の `/costguard` 課金確認応答)
     expect(parseCostGuardCommand('/costguard')).toEqual({
-      subcommand: '',
+      subcommand: 'status',
       restTokens: [],
     });
     // 大小混在 → lowercase 化 (Python `_handle:l.229` 等価)
@@ -184,18 +184,18 @@ describe('handleCostGuardCommand mutation gate', () => {
 // ---------------------------------------------------------------------------
 
 describe('handleCostGuardCommand edge cases', () => {
-  it('returns denied for empty subcommand (= /costguard alone)', async () => {
+  it('returns status for empty subcommand (= /costguard alone)', async () => {
     const env = envWith();
     const text = await handleCostGuardCommand(
       env,
-      { subcommand: '', restTokens: [] },
+      { subcommand: 'status', restTokens: [] },
       {
         senderEmail: 'someone@example.com',
         guardDeps: makeGuardDeps(),
       },
     );
-    expect(text).toContain('Cost Guard コマンド拒否');
-    expect(text).toContain('サブコマンド未指定');
+    expect(text).toContain('Cost Guard 状態');
+    expect(text).toContain('Anthropic 月累計 USD');
   });
 
   it('returns denied for unknown subcommand', async () => {

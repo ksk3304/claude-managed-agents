@@ -46,6 +46,7 @@
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
+import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
   ChatApiError,
   deleteChatMessage,
@@ -1569,22 +1570,17 @@ export async function handleChatQueue(
 // ---------------------------------------------------------------------------
 
 /**
- * cma_skills.json の TS port は本中間版では未配線 (= `cma_skills.json` を
- * Worker bundle に焼く配線は別 follow-up)。`/help` 短絡経路用に空 skillsData
- * を返す stub。env に skill 定義注入経路ができたら、ここで JSON parse して
- * SkillsData 型を返す形に差替する (= 関数境界は維持されるので caller 影響なし)。
+ * cma_skills.json の TS port 縮約版。`/help` の決定論応答で空一覧を返さない
+ * ため、Worker bundle に slash command metadata を焼く。
  *
  * 現状の動作:
- *   - `/help` → 「スキルが登録されていません。」を返す (= 最小だが安全)
- *   - `/costguard` → handler 経路で短絡 (本関数の skillsData は無関係)
+ *   - `/help` → 登録済み slash command 一覧を返す
+ *   - `/costguard` → handler 経路で短絡 (本関数の metadata は help 表示用)
  *   - その他 `/cmd` → resolveSkillRun が 「未登録」 reply を返す
- *
- * Issue #186 follow-up で cma_skills.json TS port + env 配線が完了したら、
- * 本関数を `JSON.parse(env.CMA_SKILLS_JSON || '{}')` 等に差替する。
  */
 function loadSlashSkillsData(env: Env): SkillsData {
-  void env; // 中間版では env 未参照 (= 配線完了後に CMA_SKILLS_JSON / KV 経由読み)
-  return { skills: {} };
+  void env;
+  return SLASH_SKILLS_DATA;
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,7 +1588,7 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // ---------------------------------------------------------------------------
 //
 // (done #186 既知 #1 + O): 画像 / PDF / Office 添付処理 = `attachment-processing.ts`
-// TODO(#186 follow-up): cma_skills.json TS port + loadSlashSkillsData env 配線
+// Done (#186): slash command metadata bundled for `/help` + minimal dispatch.
 // TODO(#186 follow-up): /costguard mutation 系 (enable / disable / pause / set
 //                       / confirm / cancel) port (Worker 側 Firestore overlay
 //                       永続層が必要、Issue #186 follow-up)。Phase 2 では

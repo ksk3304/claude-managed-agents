@@ -18,6 +18,7 @@ import {
   dispatchSlashCommand,
   type SlashSkillHandlers,
 } from '../src/lib/slash-skill';
+import { SLASH_SKILLS_DATA } from '../src/data/skills-data';
 import type { SkillsData } from '../src/lib/intent-detector';
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,14 @@ describe('formatHelp', () => {
     expect(out).toContain('• `/mail` — メールを送信');
     expect(out).toContain('• `/help` — 一覧を表示');
     expect(out.endsWith('\n※ コマンドなしのメンションは汎用 CMA に投げます。')).toBe(true);
+  });
+
+  it('bundled slash skills provide a non-empty /help list', () => {
+    const out = formatHelp(SLASH_SKILLS_DATA);
+    expect(out).toContain('*利用可能なスキル一覧*');
+    expect(out).toContain('• `/help`');
+    expect(out).toContain('• `/costguard`');
+    expect(out).not.toBe('スキルが登録されていません。');
   });
 
   it('treats missing description as empty string', () => {
