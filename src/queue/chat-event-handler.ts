@@ -61,6 +61,11 @@ import {
   handleHistoryFetchPermanentFailure,
   isHistoryPermanentlyFailed,
 } from '../lib/chat-history';
+import {
+  fetchSpaceMemberRoster,
+  buildSpaceContextBlock,
+  type RosterFetchResult,
+} from '../lib/space-roster';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
@@ -293,6 +298,51 @@ export async function handleChatEvent(
           );
         }
       }
+    }
+  }
+
+  // ---- 5c. Space context + roster prepend (Issue #186 C 業務影響大) ----
+  // shared space + chat-api key 有り時、「ここは何の space で、誰がいる、
+  // どの thread か」を内部メモブロックとして bodyText 先頭に追加する。
+  // DM は skip (= 1 対 1 文脈)。Python `cma_gchat_bot.py:_build_space_context_block`
+  // (l.3667) + `_build_space_roster_block` (l.3321) を 1 ブロックに連結
+  // (Python wire-up l.4241-4253 / l.4269-4272 と同形)。
+  // History block と並ぶときの順序: [context+roster] → [history] → [user text]
+  // (= Python `prompt = f"{space_context_block}\n\n{prompt}"` で context が
+  // history より前に来る、l.4271-4272)。
+  // fetch / build failure は WARN + skip で従来挙動を破壊しない (failure
+  // isolation、placeholder POST と同思想)。
+  if (!isDm && env.CHAT_SA_KEY_JSON) {
+    try {
+      const rosterResult: RosterFetchResult = await fetchSpaceMemberRoster(
+        { saKeyJson: env.CHAT_SA_KEY_JSON },
+        spaceName,
+      );
+      const contextBlock = buildSpaceContextBlock(
+        space as { name?: string; displayName?: string; type?: string },
+        { name: sender.name, displayName: (sender as { displayName?: string }).displayName },
+        { threadName, roster: rosterResult },
+      );
+      if (contextBlock) {
+        bodyText = `${contextBlock}\n\n${bodyText}`;
+        if (rosterResult.kind === 'roster') {
+          console.log(
+            `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
+              `space=${spaceName} member_count=${rosterResult.members.size}`,
+          );
+        } else {
+          console.warn(
+            `[chat-event] space_context injected without roster eventKey=${eventKey} ` +
+              `space=${spaceName} roster_failure=${rosterResult.reason}`,
+          );
+        }
+      }
+    } catch (err) {
+      // 想定外 throw (= egress-guard reject 等)。bot 全体は落とさず警告だけ
+      // (= 従来 bodyText で orchestrate 継続、failure isolation)。
+      console.warn(
+        `[chat-event] space_context build fail eventKey=${eventKey} space=${spaceName}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
