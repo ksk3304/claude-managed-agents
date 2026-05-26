@@ -51,6 +51,7 @@ import {
   releaseClaim,
   tryClaim,
 } from '../lib/dedupe';
+import { redactPiiInText } from '../redact/pii';
 import { extractInboundRfc822MessageId } from '../lib/email-thread';
 import { getThreadLock, type ThreadLockStub } from '../durable-objects/thread-lock';
 import type { AgentMailMessage, AgentMailWebhookEvent } from '../types/agentmail';
@@ -254,8 +255,11 @@ export async function handleAgentMailQueue(
       await handleAgentMailMessage(env, ctx, msg.body, dispatcher);
       msg.ack();
     } catch (error) {
+      // Scrub PII from the error message before logging — downstream throws
+      // can quote sender/recipient emails from upstream SDK errors
+      // (Issue #186 D コンプラ対応).
       console.error(
-        `[agentmail-consumer] retry svixId=${msg.body?.svix_id}: ${error instanceof Error ? error.message : String(error)}`,
+        `[agentmail-consumer] retry svixId=${msg.body?.svix_id}: ${redactPiiInText(error instanceof Error ? error.message : String(error))}`,
       );
       msg.retry();
     }

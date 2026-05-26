@@ -81,6 +81,7 @@ import {
   sendAndStreamWithToolDispatch,
 } from '../lib/session';
 import { scrubInternalStateForChat } from '../redact/internal-state';
+import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
 import type { AgentMailMessage, EmailSendMarker } from '../types/agentmail';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
@@ -296,15 +297,17 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       }
     } catch (err) {
       if (err instanceof AgentMailError && err.transient) {
+        // Scrub PII (= marker.to email + any email/phone in error message) before
+        // logging — Cloudflare Logs retains error lines long-term (Issue #186 D コンプラ対応).
         console.error(
-          `[agentmail-dispatch] AgentMail transient eventKey=${eventKey} marker_to=${m.to}: ${err.message}`,
+          `[agentmail-dispatch] AgentMail transient eventKey=${eventKey} marker_to=${redactPiiInText(m.to)}: ${redactPiiInText(err.message)}`,
         );
         return { kind: 'release_and_retry', reason: 'agentmail_transient' };
       }
       console.error(
-        `[agentmail-dispatch] AgentMail send failed eventKey=${eventKey} marker_to=${m.to}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[agentmail-dispatch] AgentMail send failed eventKey=${eventKey} marker_to=${redactPiiInText(m.to)}: ${redactPiiInText(
+          err instanceof Error ? err.message : String(err),
+        )}`,
       );
       // Non-transient send failure: skip rather than loop. The dedupe
       // row commits so the queue stops redelivering. Manual audit

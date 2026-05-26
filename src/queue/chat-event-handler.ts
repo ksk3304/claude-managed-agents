@@ -63,6 +63,7 @@ import {
   isSharedSpace,
 } from '../lib/session-log';
 import { scrubInternalStateForChat } from '../redact/internal-state';
+import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
 import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
@@ -167,8 +168,10 @@ export async function handleChatEvent(
   }
   const userMapping = await readUserMapping(env.MAKOTO_KV, senderEmail);
   if (!userMapping) {
+    // Scrub sender email through PII redactor before logging — Cloudflare
+    // Logs retains warn lines long-term (Issue #186 D コンプラ対応).
     console.warn(
-      `[chat-event] unknown_sender eventKey=${eventKey} email=${senderEmail}`,
+      `[chat-event] unknown_sender eventKey=${eventKey} email=${redactPiiInText(senderEmail)}`,
     );
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'unknown_sender' };
@@ -385,16 +388,16 @@ async function dispatchEmailMarkers(
         );
       }
       console.log(
-        `[chat-event] EMAIL_SEND ok eventKey=${eventKey} to=${m.to} subject_chars=${m.subject.length}`,
+        `[chat-event] EMAIL_SEND ok eventKey=${eventKey} to=${redactPiiInText(m.to)} subject_chars=${m.subject.length}`,
       );
     } catch (err) {
       if (err instanceof AgentMailError) {
         console.warn(
-          `[chat-event] EMAIL_SEND fail eventKey=${eventKey} to=${m.to} status=${err.status} transient=${err.transient}: ${err.message}`,
+          `[chat-event] EMAIL_SEND fail eventKey=${eventKey} to=${redactPiiInText(m.to)} status=${err.status} transient=${err.transient}: ${redactPiiInText(err.message)}`,
         );
       } else {
         console.warn(
-          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${m.to}: ${err instanceof Error ? err.message : String(err)}`,
+          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${redactPiiInText(m.to)}: ${redactPiiInText(err instanceof Error ? err.message : String(err))}`,
         );
       }
       // 1 marker 失敗で全体落とさない (failure isolation)。
