@@ -75,6 +75,9 @@ import {
   appendSessionLogMemory,
   isSharedSpace,
 } from '../lib/session-log';
+import { dispatchSlashCommand } from '../lib/slash-skill';
+import type { SlashSkillHandlers } from '../lib/slash-skill';
+import type { SkillsData } from '../lib/intent-detector';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
@@ -217,6 +220,43 @@ export async function handleChatEvent(
       `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
         `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
     );
+  }
+
+  // ---- 5a. slash-skill 決定論短絡 (#186 既知 #2 hook + /help) ----
+  // Cloud Run `_handle_event` の以下と等価:
+  //   - l.3949-3956 `/costguard` pre-branch (継続セッション・添付処理・LLM より前)
+  //   - l.4033-4035 `/help` 即返信 (skills 一覧をユーザーに返す)
+  //
+  // bodyText 先頭が `/<cmd>` のとき、agent を呼ばずに決定論で返答する。
+  // skillsData は本中間版では空 (= cma_skills.json TS port が別 follow-up
+  // 待ち)。空でも `/help` は「スキルが登録されていません。」を返せる ので
+  // bot 全体は落ちない (= follow-up で skillsData 配線時に自然に拡張)。
+  // `/costguard` handler 未配線時は fallthrough = 旧経路 (agent) へ。
+  if (bodyText.startsWith('/')) {
+    const slashSkillsData: SkillsData = loadSlashSkillsData(env);
+    const slashHandlers: SlashSkillHandlers = {};
+    const slashOutcome = await dispatchSlashCommand(bodyText, slashSkillsData, {
+      senderEmail,
+      handlers: slashHandlers,
+    });
+    if (slashOutcome.kind === 'decided') {
+      console.log(
+        `[chat-event] slash decided eventKey=${eventKey} source=${slashOutcome.source} chars=${slashOutcome.text.length}`,
+      );
+      await safePost(env, spaceName, slashOutcome.text, threadName, eventKey);
+      await safeCommit(env, eventKey, claim);
+      return { kind: 'committed' };
+    }
+    // 'run' / 'fallthrough' はどちらも agent 経路に流す (orchestrator に委譲)。
+    // 'run' のとき `slashOutcome.prompt` / title は本中間版では未利用
+    // (= 既存 orchestrator が user_mapping / persona / tools spec から組立、
+    // skill 個別 system_prompt 上書き経路は follow-up で配線)。ログだけ残す。
+    if (slashOutcome.kind === 'run') {
+      console.log(
+        `[chat-event] slash run eventKey=${eventKey} command=${slashOutcome.command} ` +
+          `attach_memory=${slashOutcome.attachMemory} (agent path)`,
+      );
+    }
   }
 
   // ---- 5b. shared space thread history prepend (Issue #186 A 業務影響大) ----
@@ -1032,11 +1072,35 @@ export async function handleChatQueue(
 }
 
 // ---------------------------------------------------------------------------
+// helper: slash skills data loader
+// ---------------------------------------------------------------------------
+
+/**
+ * cma_skills.json の TS port は本中間版では未配線 (= `cma_skills.json` を
+ * Worker bundle に焼く配線は別 follow-up)。`/help` 短絡経路用に空 skillsData
+ * を返す stub。env に skill 定義注入経路ができたら、ここで JSON parse して
+ * SkillsData 型を返す形に差替する (= 関数境界は維持されるので caller 影響なし)。
+ *
+ * 現状の動作:
+ *   - `/help` → 「スキルが登録されていません。」を返す (= 最小だが安全)
+ *   - `/costguard` → handler 経路で短絡 (本関数の skillsData は無関係)
+ *   - その他 `/cmd` → resolveSkillRun が 「未登録」 reply を返す
+ *
+ * Issue #186 follow-up で cma_skills.json TS port + env 配線が完了したら、
+ * 本関数を `JSON.parse(env.CMA_SKILLS_JSON || '{}')` 等に差替する。
+ */
+function loadSlashSkillsData(env: Env): SkillsData {
+  void env; // 中間版では env 未参照 (= 配線完了後に CMA_SKILLS_JSON / KV 経由読み)
+  return { skills: {} };
+}
+
+// ---------------------------------------------------------------------------
 // follow-up scope notes (= 中間版で省略した機能、別 Issue で対応)
 // ---------------------------------------------------------------------------
 //
 // TODO(#186 follow-up): 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
-// TODO(#186 follow-up): /costguard command の決定論短絡ハンドラ
+// TODO(#186 follow-up): /costguard 本体 handler 配線 (cost-guard.ts handle 関数 + slashHandlers.costguard 注入)
+// TODO(#186 follow-up): cma_skills.json TS port + loadSlashSkillsData env 配線
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
