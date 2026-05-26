@@ -13,6 +13,15 @@ export function resolveAnthropicBaseURL(env: Env): string {
   return env.ANTHROPIC_BASE_URL || ANTHROPIC_DEFAULT_BASE_URL;
 }
 
+/**
+ * Python source (`cma_lib.py`) accepts the production CMA secret name first,
+ * then the generic SDK name. Keep Workers on the same contract so a Cloud Run
+ * secret copy named `ANTHROPIC_API_KEY_CMA` is sufficient.
+ */
+export function resolveAnthropicApiKey(env: Env): string {
+  return (env.ANTHROPIC_API_KEY_CMA || env.ANTHROPIC_API_KEY || "").trim();
+}
+
 // The managed-agents endpoints also gate behind a `?beta=true` query
 // parameter (in addition to the header). Every SDK call appends it — see
 // e.g. node_modules/@anthropic-ai/sdk/resources/beta/sessions/sessions.mjs.
@@ -35,7 +44,7 @@ export async function anthropic(
   body?: unknown,
 ): Promise<Response> {
   const headers: Record<string, string> = {
-    "x-api-key": env.ANTHROPIC_API_KEY,
+    "x-api-key": resolveAnthropicApiKey(env),
     "anthropic-version": ANTHROPIC_VERSION,
     "anthropic-beta": ANTHROPIC_BETA,
     "content-type": "application/json",

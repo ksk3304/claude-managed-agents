@@ -15,6 +15,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
+  buildAnthropicClient,
   sendAndStreamWithToolDispatch,
   type ToolDispatcher,
 } from '../src/lib/session';
@@ -52,6 +53,13 @@ function makeFakeClient(opts: FakeClientOptions): Anthropic {
 }
 
 describe('sendAndStreamWithToolDispatch', () => {
+  it('buildAnthropicClient accepts ANTHROPIC_API_KEY_CMA fallback', () => {
+    const client = buildAnthropicClient({
+      ANTHROPIC_API_KEY_CMA: 'sk-ant-cma',
+    } as Env);
+    expect(client).not.toBeNull();
+  });
+
   it('accumulates text events into assistantText', async () => {
     const client = makeFakeClient({
       events: [

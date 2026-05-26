@@ -176,7 +176,7 @@ export default {
 async function runDailyReportCron(env: Env): Promise<void> {
   const client = buildAnthropicClient(env);
   if (client === null) {
-    console.error("[cron] daily-report skipped: ANTHROPIC_API_KEY missing");
+    console.error("[cron] daily-report skipped: Anthropic API key missing");
     return;
   }
   const model = env.DAILY_REPORT_MODEL || "claude-haiku-4-5";

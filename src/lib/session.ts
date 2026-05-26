@@ -19,7 +19,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { ANTHROPIC_BETA } from '../anthropic';
+import { ANTHROPIC_BETA, resolveAnthropicApiKey } from '../anthropic';
 import type { MemoryStoreResourceParam } from '../types/memory';
 import type { EmailSendMarker } from '../types/agentmail';
 import { parseEmailSendMarkers } from './email-send-marker';
@@ -31,7 +31,7 @@ import { parseEmailSendMarkers } from './email-send-marker';
  * that is fatal.
  */
 export function buildAnthropicClient(env: Env): Anthropic | null {
-  const apiKey = env.ANTHROPIC_API_KEY;
+  const apiKey = resolveAnthropicApiKey(env);
   if (!apiKey) return null;
   const baseURL = env.ANTHROPIC_BASE_URL || undefined;
   return new Anthropic({

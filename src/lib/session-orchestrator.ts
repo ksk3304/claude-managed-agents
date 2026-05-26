@@ -85,7 +85,7 @@ export function chatThreadSessionKey(
  */
 export interface OrchestrateChatTurnInput {
   env: Env;
-  /** Pre-built Anthropic client. Falsy when ANTHROPIC_API_KEY missing. */
+  /** Pre-built Anthropic client. Falsy when Anthropic API key secrets are missing. */
   client: Anthropic | null;
   senderEmail: string;
   spaceName: string;
@@ -181,7 +181,7 @@ export interface OrchestrateChatTurnResult {
 /**
  * orchestrator の致命的エラー型。caller (chat-event-handler) が
  * msg.retry() か commit か判定する。
- *   - `no_anthropic_client`     — ANTHROPIC_API_KEY 未設定 / buildAnthropicClient null
+ *   - `no_anthropic_client`     — Anthropic API key 未設定 / buildAnthropicClient null
  *   - `sessions_create_failed`  — sessions.create 失敗 (transient = retry 推奨)
  *   - `stream_failed`           — sendAndStreamWithToolDispatch throw (timeout / SDK error)
  */
@@ -226,7 +226,7 @@ export async function orchestrateChatTurn(
   if (input.client === null) {
     throw new OrchestratorFailure(
       'no_anthropic_client',
-      'ANTHROPIC_API_KEY missing — cannot drive session',
+      'Anthropic API key missing — cannot drive session',
     );
   }
   const client = input.client;

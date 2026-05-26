@@ -15,6 +15,7 @@
 declare namespace Cloudflare {
   interface Env {
     ANTHROPIC_API_KEY: string;
+    ANTHROPIC_API_KEY_CMA?: string;
     ANTHROPIC_BASE_URL?: string;
     ENVIRONMENT_ID: string;
     OAUTH_VAULT_KEY: string;
