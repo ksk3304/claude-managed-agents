@@ -53,6 +53,14 @@ import {
   CHAT_POST_MARKER_REGEX,
 } from '../lib/chat-post-marker';
 import { resolveChatAlias } from '../lib/chat-alias-resolver';
+import {
+  fetchThreadMessages,
+  formatThreadHistory,
+  recordHistoryFailure,
+  clearHistoryFailure,
+  handleHistoryFetchPermanentFailure,
+  isHistoryPermanentlyFailed,
+} from '../lib/chat-history';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
@@ -209,6 +217,43 @@ export async function handleChatEvent(
       `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
         `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
     );
+  }
+
+  // ---- 5b. shared space thread history prepend (Issue #186 A 業務影響大) ----
+  // shared space + thread reply 時のみ thread の過去 message を fetch して
+  // agent prompt の先頭に挿入する。DM では skip (= 1 対 1 session memory で
+  // カバー)。fetch failure は WARN + 空 fallback で従来挙動を破壊しない。
+  // permanent failure (= 連続 3 回失敗) 後は KV mark で skip。
+  if (!isDm && threadName && env.CHAT_SA_KEY_JSON) {
+    const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
+    if (!isPermFail) {
+      try {
+        const history = await fetchThreadMessages(
+          { saKeyJson: env.CHAT_SA_KEY_JSON },
+          spaceName,
+          threadName,
+        );
+        const historyBlock = formatThreadHistory(history, {
+          currentMessageName: message.name ?? '',
+        });
+        if (historyBlock) {
+          bodyText = `${historyBlock}\n\n${bodyText}`;
+        }
+        await clearHistoryFailure(env.MAKOTO_KV, threadName);
+      } catch (err) {
+        const failure = await recordHistoryFailure(env.MAKOTO_KV, threadName);
+        console.warn(
+          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        if (failure.permanent) {
+          await handleHistoryFetchPermanentFailure(
+            env.MAKOTO_KV,
+            threadName,
+            'fetch_failure',
+          );
+        }
+      }
+    }
   }
 
   // ---- 6. orchestrate session ----
