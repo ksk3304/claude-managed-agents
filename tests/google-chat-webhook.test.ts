@@ -183,9 +183,7 @@ describe('google-chat webhook handler', () => {
 
     const resp = await handleGoogleChatWebhook(req, env);
     expect(resp.status).toBe(200);
-    const json = (await resp.json()) as { ok: boolean; duplicate?: boolean };
-    expect(json.ok).toBe(true);
-    expect(json.duplicate).toBeUndefined();
+    await expect(resp.json()).resolves.toEqual({});
 
     const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
     expect(sent).toHaveLength(1);
@@ -213,9 +211,7 @@ describe('google-chat webhook handler', () => {
 
     const resp = await handleGoogleChatWebhook(req, env);
     expect(resp.status).toBe(200);
-    const json = (await resp.json()) as { ok: boolean; skipped?: boolean };
-    expect(json.ok).toBe(true);
-    expect(json.skipped).toBe(true);
+    await expect(resp.json()).resolves.toEqual({});
     const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
     expect(sent).toHaveLength(0);
   });
@@ -229,14 +225,12 @@ describe('google-chat webhook handler', () => {
     const jwt1 = await signJwt(fixture);
     const r1 = await handleGoogleChatWebhook(buildRequest(body, `Bearer ${jwt1}`), env);
     expect(r1.status).toBe(200);
-    const j1 = (await r1.json()) as { ok: boolean; duplicate?: boolean };
-    expect(j1.duplicate).toBeUndefined();
+    await expect(r1.json()).resolves.toEqual({});
 
     const jwt2 = await signJwt(fixture);
     const r2 = await handleGoogleChatWebhook(buildRequest(body, `Bearer ${jwt2}`), env);
     expect(r2.status).toBe(200);
-    const j2 = (await r2.json()) as { ok: boolean; duplicate?: boolean };
-    expect(j2.duplicate).toBe(true);
+    await expect(r2.json()).resolves.toEqual({});
 
     const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
     expect(sent).toHaveLength(1);

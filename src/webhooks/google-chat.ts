@@ -403,15 +403,19 @@ function isMessageEvent(
  * `POST /webhooks/google-chat` route handler。`src/index.ts` から dispatch。
  *
  * 応答 contract:
- *   - 200 OK + `{ ok: true }`                        — MESSAGE event 受理 + Queue 投入
- *   - 200 OK + `{ ok: true, skipped: true }`          — 非 MESSAGE event
- *   - 200 OK + `{ ok: true, duplicate: true }`        — 同一 message.name 再送
+ *   - 200 OK + `{}`                                  — MESSAGE event 受理 + Queue 投入
+ *   - 200 OK + `{}`                                  — 非 MESSAGE event / duplicate
  *   - 401 Unauthorized                                — Authorization header 欠落 / JWT 検証失敗
  *   - 400 Bad Request                                 — malformed JSON
  *   - 500 Internal Server Error                       — Queue 投入失敗 / 公開鍵 fetch 失敗
  *
  * Google Chat は 2xx で ack、4xx/5xx で retry (= Pub/Sub と同様の
  * at-least-once 配送)。dedupe で二重投入を防ぐ。
+ *
+ * Workspace Add-on mode では `{ ok: true }` のような独自 JSON は
+ * DataActions / RenderActions ではないため、Chat UI に「応答がありません」
+ * が出る。後続 Queue から Chat API で非同期投稿する場合は、公式どおり
+ * 空 JSON `{}` を返す。
  */
 export async function handleGoogleChatWebhook(
   request: Request,
@@ -491,7 +495,7 @@ export async function handleGoogleChatWebhook(
     console.log(
       `[chat-webhook] skip non-message type=${event.type} cfRay=${cfRay}`,
     );
-    return Response.json({ ok: true, skipped: true });
+    return Response.json({});
   }
 
   // ---- 6. dedupe claim ----
@@ -511,7 +515,7 @@ export async function handleGoogleChatWebhook(
     console.log(
       `[chat-webhook] duplicate state=${claim.state} eventKey=${eventKey} cfRay=${cfRay}`,
     );
-    return Response.json({ ok: true, duplicate: true });
+    return Response.json({});
   }
   if ((claim.state !== 'NEW' && claim.state !== 'TAKEOVER') ||
       claim.owner === undefined || claim.version === undefined) {
@@ -551,5 +555,5 @@ export async function handleGoogleChatWebhook(
   console.log(
     `[chat-webhook] enqueued eventKey=${eventKey} sender=${event.message.sender?.name ?? ''} cfRay=${cfRay}`,
   );
-  return Response.json({ ok: true });
+  return Response.json({});
 }
