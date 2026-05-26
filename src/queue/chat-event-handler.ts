@@ -23,7 +23,7 @@
  *   9. `commitDone` で dedupe commit
  *
  * 中間版 = **含まない** もの (Cloud Run 完全実装比、follow-up Issue で対応):
- *   - 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
+ *   - (済 #186 既知 #1 + O) 画像 / PDF / Office 添付処理 = `src/lib/attachment-processing.ts` で port 済
  *   - `/costguard` mutation 系 (status 以外、Phase 2 では `cost-guard-command.ts`
  *     で status のみ port 済 = LLM 経由ゼロで budget 状態を返す。enable /
  *     disable / pause / set / confirm / cancel は Worker 側 Firestore overlay
@@ -45,6 +45,7 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import {
   ChatApiError,
   deleteChatMessage,
@@ -476,6 +477,41 @@ export async function handleChatEvent(
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
+
+  // ---- 6-pre. attachment processing (Issue #186 既知 #1 + O) ----
+  // 画像 / PDF / Office 添付を Anthropic Sessions API の content block 群に
+  // 変換する。env.CHAT_SA_KEY_JSON があるときだけ走らせ、空ならスキップ
+  // (= 旧 path 完全互換、deploy 段階的 rollout 対応)。
+  // 失敗で全体落とさないため try/catch で吸収し、cleanup は finally で必ず実行。
+  let attachmentBlocks: Awaited<ReturnType<typeof buildAllAttachmentBlocks>> = {
+    extraBlocks: [],
+    notice: null,
+    uploadedFileIds: [],
+    cleanup: async () => undefined,
+  };
+  if (env.CHAT_SA_KEY_JSON && message.attachment && message.attachment.length > 0) {
+    try {
+      attachmentBlocks = await buildAllAttachmentBlocks(
+        { saKeyJson: env.CHAT_SA_KEY_JSON, anthropic: client },
+        { attachment: message.attachment },
+      );
+      if (attachmentBlocks.extraBlocks.length > 0) {
+        console.log(
+          `[chat-event] attachments wired eventKey=${eventKey} ` +
+            `blocks=${attachmentBlocks.extraBlocks.length} ` +
+            `uploaded=${attachmentBlocks.uploadedFileIds.length}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[chat-event] attachment build failed eventKey=${eventKey}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  const attachmentNotice = attachmentBlocks.notice;
+  const extraContentBlocks = attachmentBlocks.extraBlocks;
+
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -492,134 +528,151 @@ export async function handleChatEvent(
   let sessionId: string;
   let assistantText: string;
   try {
-    const orchestrated = await orchestrateChatTurn({
-      env,
-      client,
-      senderEmail,
-      spaceName,
-      spaceType,
-      threadName,
-      bodyText,
-      userMapping,
-      personaSpec: PERSONA_SPEC,
-      toolsSpec: TOOLS_SPEC,
-      toolDispatcher: (toolName, toolInput) =>
-        dispatchMakotoTool(toolName, toolInput, {
-          env,
-          userSlug: userMapping.user_slug,
-          boundMessageId: '',
-          callerSessionId: sessionIdRef.current,
-        }),
-      // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
-      // false) 起動時は KV thread session lookup/put を bypass。
-      forceFreshSession,
-    });
-    sessionId = orchestrated.sessionId;
-    sessionIdRef.current = sessionId;
-    assistantText = orchestrated.assistantText;
-
-    // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
-    // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
-    // session.ts の `sendAndStreamWithToolDispatch` が cap (custom_tool_use /
-    // built-in tool / session_watchdog) を踏むと `stopReason` を返す。
-    // それが Python `_CAP_STOP_REASONS` 等価かを判定し、env flag が enable
-    // なら recovery turn を 1 度だけ追撃し、得られた本文で assistantText を
-    // 置換する。失敗/空/timeout/disabled は 既存挙動 (= 部分テキストの
-    // まま) を温存する (= silent skip しない = 必ず構造化ログを残す)。
-    //
-    // session.ts の stopReason → Python `_CAP_STOP_REASONS` 用語 mapping:
-    //   - `'custom_tool_call_cap'`  (TS, custom_tool_use 上限超過)
-    //       → `'tool_call_cap'`     (Python `_CAP_STOP_REASONS[0]`)
-    //   - `'tool_call_cap'`         (TS, built-in tool 上限超過)
-    //       → `'tool_call_cap'`     (Python 同名)
-    //   - `'session_watchdog'`      (TS, 壁時計超過)
-    //       → `'session_watchdog'`  (Python 同名)
-    //   - その他                    → mapping なし = recovery 対象外
-    const capRecoveryConfig = resolveCapRecoveryConfig({
-      ...(env.CMA_REACTIVE_MAX_TOOL_CALLS !== undefined
-        ? { CMA_REACTIVE_MAX_TOOL_CALLS: env.CMA_REACTIVE_MAX_TOOL_CALLS }
-        : {}),
-      ...(env.CMA_REACTIVE_CAP_RECOVERY_ENABLED !== undefined
-        ? {
-            CMA_REACTIVE_CAP_RECOVERY_ENABLED:
-              env.CMA_REACTIVE_CAP_RECOVERY_ENABLED,
-          }
-        : {}),
-    });
-    const pythonStopReason = mapToPythonCapStopReason(orchestrated.stopReason);
-    if (
-      pythonStopReason !== null &&
-      shouldAttemptCapRecovery(pythonStopReason, capRecoveryConfig)
-    ) {
-      const executor: CapRecoveryStreamExecutor = async ({
-        sessionId: sid,
-        recoveryPrompt,
-        maxToolCalls,
-        toolDispatcher,
-      }) => {
-        const res = await sendAndStreamWithToolDispatch(client, {
-          sessionId: sid,
-          userMessage: recoveryPrompt,
-          toolDispatcher,
-          maxToolCalls,
-        });
-        return {
-          text: res.assistantText,
-          stopReason: res.stopReason ?? res.terminalEventType ?? '',
-        };
-      };
-      const recoveryResult = await runCapRecovery({
-        sessionId,
-        executor,
+    try {
+      const orchestrated = await orchestrateChatTurn({
+        env,
+        client,
+        senderEmail,
+        spaceName,
+        spaceType,
+        threadName,
+        bodyText,
+        userMapping,
+        personaSpec: PERSONA_SPEC,
+        toolsSpec: TOOLS_SPEC,
+        extraContentBlocks,
+        toolDispatcher: (toolName, toolInput) =>
+          dispatchMakotoTool(toolName, toolInput, {
+            env,
+            userSlug: userMapping.user_slug,
+            boundMessageId: '',
+            callerSessionId: sessionIdRef.current,
+          }),
+        // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
+        // false) 起動時は KV thread session lookup/put を bypass。
+        forceFreshSession,
       });
-      const degraded =
-        recoveryResult.toolNames.length > 0 ||
-        (recoveryResult.stopReason !== '' &&
-          mapToPythonCapStopReason(recoveryResult.stopReason) !== null);
-      console.log(
-        `[chat-event] cap_recovery outcome=${recoveryResult.outcome} ` +
-          `eventKey=${eventKey} session=${sessionId} ` +
-          `orig_stop=${pythonStopReason} rec_stop=${recoveryResult.stopReason || 'n/a'} ` +
-          `rec_chars=${recoveryResult.text.length} ` +
-          `rec_tools=${recoveryResult.toolNames.join(',') || 'n/a'} ` +
-          `rec_degraded=${degraded} ` +
-          `rec_error=${recoveryResult.error || 'n/a'}`,
-      );
-      if (recoveryResult.outcome === 'recovered' && recoveryResult.text) {
-        // 収集済み部分テキストを recovered 本文で置換。
-        // Python `collected[:] = [_rec["text"]]` + `_recovery_suppressed_cap_notice`
-        // と同等の効果 (TS 中間版では cap notice 自体が未実装なので「置換」だけ
-        // 行えば cap notice 抑止 = no-op で済む)。
-        assistantText = recoveryResult.text;
-      }
-    }
-  } catch (err) {
-    // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
-    // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
-    // 全体は落とさない (= 上流 retry/skip 経路を優先)。
-    if (placeholderName) {
-      await safeDeletePlaceholder(env, placeholderName, eventKey);
-    }
-    if (err instanceof OrchestratorFailure) {
-      if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
-        // transient → release & retry
-        console.error(
-          `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
+      sessionId = orchestrated.sessionId;
+      sessionIdRef.current = sessionId;
+      assistantText = orchestrated.assistantText;
+
+      // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
+      // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
+      // session.ts の `sendAndStreamWithToolDispatch` が cap (custom_tool_use /
+      // built-in tool / session_watchdog) を踏むと `stopReason` を返す。
+      // それが Python `_CAP_STOP_REASONS` 等価かを判定し、env flag が enable
+      // なら recovery turn を 1 度だけ追撃し、得られた本文で assistantText を
+      // 置換する。失敗/空/timeout/disabled は 既存挙動 (= 部分テキストの
+      // まま) を温存する (= silent skip しない = 必ず構造化ログを残す)。
+      //
+      // session.ts の stopReason → Python `_CAP_STOP_REASONS` 用語 mapping:
+      //   - `'custom_tool_call_cap'`  (TS, custom_tool_use 上限超過)
+      //       → `'tool_call_cap'`     (Python `_CAP_STOP_REASONS[0]`)
+      //   - `'tool_call_cap'`         (TS, built-in tool 上限超過)
+      //       → `'tool_call_cap'`     (Python 同名)
+      //   - `'session_watchdog'`      (TS, 壁時計超過)
+      //       → `'session_watchdog'`  (Python 同名)
+      //   - その他                    → mapping なし = recovery 対象外
+      const capRecoveryConfig = resolveCapRecoveryConfig({
+        ...(env.CMA_REACTIVE_MAX_TOOL_CALLS !== undefined
+          ? { CMA_REACTIVE_MAX_TOOL_CALLS: env.CMA_REACTIVE_MAX_TOOL_CALLS }
+          : {}),
+        ...(env.CMA_REACTIVE_CAP_RECOVERY_ENABLED !== undefined
+          ? {
+              CMA_REACTIVE_CAP_RECOVERY_ENABLED:
+                env.CMA_REACTIVE_CAP_RECOVERY_ENABLED,
+            }
+          : {}),
+      });
+      const pythonStopReason = mapToPythonCapStopReason(orchestrated.stopReason);
+      if (
+        pythonStopReason !== null &&
+        shouldAttemptCapRecovery(pythonStopReason, capRecoveryConfig)
+      ) {
+        const executor: CapRecoveryStreamExecutor = async ({
+          sessionId: sid,
+          recoveryPrompt,
+          maxToolCalls,
+          toolDispatcher,
+        }) => {
+          const res = await sendAndStreamWithToolDispatch(client, {
+            sessionId: sid,
+            userMessage: recoveryPrompt,
+            toolDispatcher,
+            maxToolCalls,
+          });
+          return {
+            text: res.assistantText,
+            stopReason: res.stopReason ?? res.terminalEventType ?? '',
+          };
+        };
+        const recoveryResult = await runCapRecovery({
+          sessionId,
+          executor,
+        });
+        const degraded =
+          recoveryResult.toolNames.length > 0 ||
+          (recoveryResult.stopReason !== '' &&
+            mapToPythonCapStopReason(recoveryResult.stopReason) !== null);
+        console.log(
+          `[chat-event] cap_recovery outcome=${recoveryResult.outcome} ` +
+            `eventKey=${eventKey} session=${sessionId} ` +
+            `orig_stop=${pythonStopReason} rec_stop=${recoveryResult.stopReason || 'n/a'} ` +
+            `rec_chars=${recoveryResult.text.length} ` +
+            `rec_tools=${recoveryResult.toolNames.join(',') || 'n/a'} ` +
+            `rec_degraded=${degraded} ` +
+            `rec_error=${recoveryResult.error || 'n/a'}`,
         );
-        await safeRelease(env, eventKey, claim);
-        return { kind: 'release_and_retry', reason: err.reason };
+        if (recoveryResult.outcome === 'recovered' && recoveryResult.text) {
+          // 収集済み部分テキストを recovered 本文で置換。
+          // Python `collected[:] = [_rec["text"]]` + `_recovery_suppressed_cap_notice`
+          // と同等の効果 (TS 中間版では cap notice 自体が未実装なので「置換」だけ
+          // 行えば cap notice 抑止 = no-op で済む)。
+          assistantText = recoveryResult.text;
+        }
       }
-      // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
-      console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
-      await safeCommit(env, eventKey, claim);
-      return { kind: 'skipped', reason: err.reason };
+    } catch (err) {
+      // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
+      // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
+      // 全体は落とさない (= 上流 retry/skip 経路を優先)。
+      if (placeholderName) {
+        await safeDeletePlaceholder(env, placeholderName, eventKey);
+      }
+      if (err instanceof OrchestratorFailure) {
+        if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
+          // transient → release & retry
+          console.error(
+            `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
+          );
+          await safeRelease(env, eventKey, claim);
+          return { kind: 'release_and_retry', reason: err.reason };
+        }
+        // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
+        console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
+        await safeCommit(env, eventKey, claim);
+        return { kind: 'skipped', reason: err.reason };
+      }
+      // Unknown throw — defensive: release & retry
+      console.error(
+        `[chat-event] orchestrator threw eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      await safeRelease(env, eventKey, claim);
+      return { kind: 'release_and_retry', reason: 'unknown_orchestrator_throw' };
     }
-    // Unknown throw — defensive: release & retry
-    console.error(
-      `[chat-event] orchestrator threw eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    await safeRelease(env, eventKey, claim);
-    return { kind: 'release_and_retry', reason: 'unknown_orchestrator_throw' };
+  } finally {
+    // Anthropic Files API へ upload した file_id は 1 ターン使い切りで delete
+    // する (= 500GB/org 枠を食わない使い捨て運用、Python `_delete_from_files_api`
+    // 等価)。orchestrate の成否を問わず必ず実行。
+    if (attachmentBlocks.uploadedFileIds.length > 0) {
+      try {
+        await attachmentBlocks.cleanup();
+      } catch (cleanupErr) {
+        console.warn(
+          `[chat-event] attachment cleanup failed eventKey=${eventKey}: ` +
+            `${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`,
+        );
+      }
+    }
   }
 
   // ---- 7. parse markers + dispatch ----
@@ -687,7 +740,12 @@ export async function handleChatEvent(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
     );
   }
-  const finalText = scrubbed.text;
+  // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
+  // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
+  // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
+  const finalText = attachmentNotice
+    ? `${scrubbed.text}\n\n${attachmentNotice}`.trim()
+    : scrubbed.text;
   if (finalText.trim().length > 0) {
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
@@ -1395,7 +1453,7 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // follow-up scope notes (= 中間版で省略した機能、別 Issue で対応)
 // ---------------------------------------------------------------------------
 //
-// TODO(#186 follow-up): 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
+// (done #186 既知 #1 + O): 画像 / PDF / Office 添付処理 = `attachment-processing.ts`
 // TODO(#186 follow-up): cma_skills.json TS port + loadSlashSkillsData env 配線
 // TODO(#186 follow-up): /costguard mutation 系 (enable / disable / pause / set
 //                       / confirm / cancel) port (Worker 側 Firestore overlay

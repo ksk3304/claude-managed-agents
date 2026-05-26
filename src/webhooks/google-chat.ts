@@ -90,6 +90,19 @@ export interface ChatEventPayload {
         };
       };
     }>;
+    /**
+     * Google Chat REST API の `messagePayload.message.attachment[]`。Issue
+     * #186 既知 #1 + O で image / PDF / Office 添付処理を有効化する際に
+     * 必要 (`src/lib/attachment-processing.ts:buildAllAttachmentBlocks`).
+     * normalize 時の `mp.message` cast 経由で透過的に通る (= field 名そのまま)。
+     */
+    attachment?: Array<{
+      contentType?: string;
+      contentName?: string;
+      name?: string;
+      source?: string;
+      attachmentDataRef?: { resourceName?: string };
+    }> | null;
   };
   space?: { name: string; type?: string; displayName?: string };
   user?: { name: string; displayName?: string; email?: string };

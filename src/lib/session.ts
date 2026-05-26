@@ -81,10 +81,25 @@ export async function createSessionWithResources(
   return created.id;
 }
 
+/**
+ * User message content block — the SDK accepts an array of typed blocks
+ * (`text` / `image` / `document` / etc) on `user.message`. The bridge
+ * doesn't model every block variant exhaustively; consumers (e.g. the
+ * attachment-processing helper) pass already-typed blocks and the
+ * caller can prepend / append extra blocks alongside the main text.
+ *
+ * Issue: ksk3304/makoto-prime#186 既知 #1 + O (image / PDF / Office 添付).
+ */
+export type UserMessageContentBlock = Record<string, unknown> & { type: string };
+
 export interface SendAndStreamInput {
   sessionId: string;
-  /** Plain-text user message to inject into the session. */
-  userMessage: string;
+  /**
+   * User message to inject. `string` (plain text) は単一 text block に
+   * wrap される。content block 配列を直接渡すと (画像 / 文書 / 追加 text を
+   * 含む) そのまま `user.message.content` に乗る。
+   */
+  userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
 }
@@ -150,13 +165,11 @@ export async function sendAndStream(
     events: [
       {
         type: 'user.message',
-        content: [
-          { type: 'text', text: input.userMessage },
-        ],
+        content: toUserMessageContent(input.userMessage),
       },
     ],
     betas: [ANTHROPIC_BETA],
-  } as Parameters<typeof client.beta.sessions.events.send>[1]);
+  } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
   // Now drain. We type the iterator loosely because the SDK's event
   // union covers many shapes the bridge does not need to model
@@ -198,6 +211,22 @@ export async function sendAndStream(
   };
 }
 
+/**
+ * Normalise the `userMessage` field into the typed-block array shape
+ * the SDK expects on `user.message.content`. Plain strings get wrapped
+ * into a single `{type:'text', text:...}` block; pre-built arrays are
+ * passed through unchanged (= attachment-processing builds image /
+ * document blocks ahead of time).
+ */
+function toUserMessageContent(
+  userMessage: string | UserMessageContentBlock[],
+): UserMessageContentBlock[] {
+  if (typeof userMessage === 'string') {
+    return [{ type: 'text', text: userMessage }];
+  }
+  return userMessage;
+}
+
 function pickString(ev: Record<string, unknown>, key: string): string | undefined {
   const v = ev[key];
   return typeof v === 'string' && v.length > 0 ? v : undefined;
@@ -235,7 +264,12 @@ export type ToolDispatcher = (
 
 export interface SendAndStreamWithToolDispatchInput {
   sessionId: string;
-  userMessage: string;
+  /**
+   * Same shape as `SendAndStreamInput.userMessage` — plain text or a
+   * typed content-block array. See `UserMessageContentBlock` for the
+   * looser block shape.
+   */
+  userMessage: string | UserMessageContentBlock[];
   toolDispatcher: ToolDispatcher;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
@@ -310,16 +344,18 @@ export async function sendAndStreamWithToolDispatch(
     input.sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC;
 
   // Push the inbound user.message first. Identical wrapping to
-  // `sendAndStream` (typed-block array with single text block).
+  // `sendAndStream`: wrap a string into a single text block, otherwise
+  // pass the typed content array straight through (= image / document
+  // attachments are pre-built by the caller, see attachment-processing.ts).
   await client.beta.sessions.events.send(input.sessionId, {
     events: [
       {
         type: 'user.message',
-        content: [{ type: 'text', text: input.userMessage }],
+        content: toUserMessageContent(input.userMessage),
       },
     ],
     betas: [ANTHROPIC_BETA],
-  } as Parameters<typeof client.beta.sessions.events.send>[1]);
+  } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
   const stream = await client.beta.sessions.events.stream(input.sessionId, {
     betas: [ANTHROPIC_BETA],

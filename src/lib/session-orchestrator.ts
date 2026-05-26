@@ -29,6 +29,7 @@ import {
   sendAndStreamWithToolDispatch,
   type SendAndStreamResult,
   type ToolDispatcher,
+  type UserMessageContentBlock,
 } from './session';
 import {
   buildMakotoSystemPrompt,
@@ -86,6 +87,13 @@ export interface OrchestrateChatTurnInput {
   personaSpec: string;
   toolsSpec: string;
   toolDispatcher: ToolDispatcher;
+  /**
+   * 追加 content blocks (= image / document / 追加 text)。Cloud Run の
+   * `_build_user_message` 経路相当 — 添付処理 helper が組み立てた blocks
+   * をここに渡すと最小 envelope の text block の後ろに連結される。空配列
+   * または未指定なら従来通り text-only。
+   */
+  extraContentBlocks?: UserMessageContentBlock[];
   /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
@@ -273,9 +281,20 @@ export async function orchestrateChatTurn(
   // 中間版 = 最小 envelope。完全版 (cap-recovery + intent + speaker prefix
   // + 添付通知) は別 Issue で対応 (= Cloud Run `_build_user_message` 経路の port)。
   const senderLabel = input.senderEmail;
-  const userMessage =
+  const userMessageText =
     `<context>space_type=${input.spaceType || 'UNKNOWN'} sender=${senderLabel}</context>\n` +
     `<user_message>${input.bodyText}</user_message>`;
+
+  // 添付処理 (Issue #186 既知 #1 + O) で組み立てた image / document / text blocks
+  // があれば text の後ろに連結する。Cloud Run `cma_gchat_bot.py` では
+  // `messages.create(messages=[{"role":"user","content":[text, image, document...]}])`
+  // と並ぶ形式を取っており、Workers 側も同じ並び順を踏襲する (= 文書内容を
+  // 読ませる前に user 意図 text を提示)。
+  const extraBlocks = input.extraContentBlocks ?? [];
+  const userMessage: string | UserMessageContentBlock[] =
+    extraBlocks.length === 0
+      ? userMessageText
+      : [{ type: 'text', text: userMessageText }, ...extraBlocks];
 
   // ---- stream consume ----
   let streamResult: SendAndStreamResult;
