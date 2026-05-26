@@ -306,21 +306,46 @@ export interface FormatThreadHistoryOptions {
 }
 
 /**
- * Format a chronological history list into an agent-facing Markdown
- * block. Mirrors `_format_thread_history` minus speaker-resolver
- * integration (= TS port carries forward the same fail-closed posture
- * for unknown speakers: their lines are dropped from the body and the
- * count is appended as a notice).
+ * Structured result of formatting thread history. Mirrors the spirit of
+ * Python `_format_thread_history`'s implicit metadata (the count is
+ * embedded in the warning text). The TS port surfaces it explicitly so
+ * the speaker-gate wire-up can branch on `unresolvedCount > 0` without
+ * regex-parsing the rendered body.
  *
- * Returns an empty string when `messages` is empty OR when every
- * candidate line is filtered out (= excluded current message, empty
- * text). Caller checks `.length === 0` and skips prepend in that case.
+ * - `text`: same string as `formatThreadHistory` returns (= chronological
+ *   markdown block, possibly with `⚠️` notice appended; `''` when input
+ *   is empty / fully filtered).
+ * - `unresolvedCount`: distinct count of unknown-speaker chat_user_ids
+ *   encountered (de-duplicated). Used by `src/lib/speaker-gate.ts` to
+ *   decide whether CHAT_POST / external tools should be gated. Zero when
+ *   every history line resolved to a known label (or when input was empty).
  */
-export function formatThreadHistory(
+export interface ThreadHistoryFormatResult {
+  text: string;
+  unresolvedCount: number;
+}
+
+/**
+ * Format a chronological history list into an agent-facing Markdown
+ * block AND surface structured metadata (unresolved speaker count).
+ * Mirrors `_format_thread_history` minus speaker-resolver integration
+ * (= TS port carries forward the same fail-closed posture for unknown
+ * speakers: their lines are dropped from the body and the count is
+ * appended as a notice).
+ *
+ * Returns `text: ''` when `messages` is empty OR when every candidate
+ * line is filtered out (= excluded current message, empty text). Caller
+ * checks `.text.length === 0` and skips prepend in that case.
+ *
+ * `unresolvedCount` is the de-duplicated count of unknown-speaker
+ * chat_user_ids; surfaces "履歴に未登録者が実在" to the speaker-gate
+ * wire-up (= `hasUnresolvedSpeakers` in `_compute_chat_post_gate`).
+ */
+export function formatThreadHistoryWithMeta(
   messages: readonly ThreadHistoryMessage[],
   options: FormatThreadHistoryOptions = {},
-): string {
-  if (!messages.length) return '';
+): ThreadHistoryFormatResult {
+  if (!messages.length) return { text: '', unresolvedCount: 0 };
   const current = options.currentMessageName ?? '';
   const botUser = options.botUserName ?? '';
   const lines: string[] = ['## スレッド過去履歴（時系列順）'];
@@ -348,7 +373,7 @@ export function formatThreadHistory(
 
   if (rendered === 0 && unresolvedIds.length === 0) {
     // Every message was either the current one or text-empty.
-    return '';
+    return { text: '', unresolvedCount: 0 };
   }
 
   let body = rendered > 0 ? lines.join('\n') : '';
@@ -361,7 +386,19 @@ export function formatThreadHistory(
       '- 上記発言は本文を履歴から物理除外済。\n';
     body = body ? body + warning : warning.trimStart();
   }
-  return body;
+  return { text: body, unresolvedCount: unresolvedIds.length };
+}
+
+/**
+ * Backward-compatible string-only wrapper around
+ * `formatThreadHistoryWithMeta`. Callers that need the unresolved count
+ * (= speaker-gate wire-up) should use the `WithMeta` variant directly.
+ */
+export function formatThreadHistory(
+  messages: readonly ThreadHistoryMessage[],
+  options: FormatThreadHistoryOptions = {},
+): string {
+  return formatThreadHistoryWithMeta(messages, options).text;
 }
 
 /**

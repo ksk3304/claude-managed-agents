@@ -28,7 +28,8 @@
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
  *   - intent-detector 統合 (intent ベース dispatch 分岐)
  *   - Cold continuation の SignalB 経由 thread-self-scan
- *   - 未解決 speaker gate (= speaker-resolver は呼ばず notice prefix のみ簡略)
+ *   - 外部ツール gate の actor 駆動完全実装 (= `_compute_external_tool_gate`
+ *     wire-up。CHAT_POST gate = 未解決 speaker 軸は Issue #186 既知 #6 で完了)
  *
  * Failure isolation:
  *   - LLM stream throw   → msg.retry() 経由で event 再配送 (= claim を release
@@ -55,7 +56,7 @@ import {
 import { resolveChatAlias } from '../lib/chat-alias-resolver';
 import {
   fetchThreadMessages,
-  formatThreadHistory,
+  formatThreadHistoryWithMeta,
   recordHistoryFailure,
   clearHistoryFailure,
   handleHistoryFetchPermanentFailure,
@@ -66,6 +67,7 @@ import {
   buildSpaceContextBlock,
   type RosterFetchResult,
 } from '../lib/space-roster';
+import { applyChatPostGateToText } from '../lib/speaker-gate';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
@@ -269,6 +271,14 @@ export async function handleChatEvent(
   // agent prompt の先頭に挿入する。DM では skip (= 1 対 1 session memory で
   // カバー)。fetch failure は WARN + 空 fallback で従来挙動を破壊しない。
   // permanent failure (= 連続 3 回失敗) 後は KV mark で skip。
+  //
+  // Issue #186 既知 #6 (speaker-gate 完全実装): 履歴に未登録 chat_user_id が
+  // 存在した場合は `hasUnresolvedSpeakers=true` を立て、後段 7b の
+  // CHAT_POST dispatch を gate する (= Python `_compute_chat_post_gate` +
+  // `_strip_chat_post_on_unresolved` 等価)。fetch 失敗時は false を維持し
+  // 旧挙動 (= 履歴なし → gate しない) を破壊しない。DM では shared space
+  // 履歴自体存在しないため、初期値 false のまま CHAT_POST も自然に通る。
+  let hasUnresolvedSpeakers = false;
   if (!isDm && threadName && env.CHAT_SA_KEY_JSON) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
@@ -278,11 +288,19 @@ export async function handleChatEvent(
           spaceName,
           threadName,
         );
-        const historyBlock = formatThreadHistory(history, {
+        const historyResult = formatThreadHistoryWithMeta(history, {
           currentMessageName: message.name ?? '',
         });
-        if (historyBlock) {
-          bodyText = `${historyBlock}\n\n${bodyText}`;
+        if (historyResult.text) {
+          bodyText = `${historyResult.text}\n\n${bodyText}`;
+        }
+        if (historyResult.unresolvedCount > 0) {
+          hasUnresolvedSpeakers = true;
+          console.warn(
+            `[chat-event] unresolved_speakers detected eventKey=${eventKey} ` +
+              `thread=${threadName} count=${historyResult.unresolvedCount} ` +
+              `— CHAT_POST will be gated`,
+          );
         }
         await clearHistoryFailure(env.MAKOTO_KV, threadName);
       } catch (err) {
@@ -312,6 +330,12 @@ export async function handleChatEvent(
   // history より前に来る、l.4271-4272)。
   // fetch / build failure は WARN + skip で従来挙動を破壊しない (failure
   // isolation、placeholder POST と同思想)。
+  //
+  // Issue #186 既知 #6: roster fetch が `kind: 'failure'` を返した場合も
+  // CHAT_POST gate のシグナルとして hasUnresolvedSpeakers を立てる。bot
+  // が space member を一切識別できない状態で別 space に CHAT_POST するのは
+  // 履歴 latch と同じ権限事故源 (= unknown member 混在 thread からの横展開)
+  // のため、保守的に gate 側へ倒す (= 「分からない時は止める」)。
   if (!isDm && env.CHAT_SA_KEY_JSON) {
     try {
       const rosterResult: RosterFetchResult = await fetchSpaceMemberRoster(
@@ -335,6 +359,15 @@ export async function handleChatEvent(
             `[chat-event] space_context injected without roster eventKey=${eventKey} ` +
               `space=${spaceName} roster_failure=${rosterResult.reason}`,
           );
+          // Issue #186 既知 #6: roster 取得失敗 = bot が member を識別不能
+          // → CHAT_POST gate を発動 (保守的 fail-safe)。
+          if (!hasUnresolvedSpeakers) {
+            hasUnresolvedSpeakers = true;
+            console.warn(
+              `[chat-event] unresolved_speakers from roster failure eventKey=${eventKey} ` +
+                `space=${spaceName} reason=${rosterResult.reason} — CHAT_POST will be gated`,
+            );
+          }
         }
       }
     } catch (err) {
@@ -439,10 +472,29 @@ export async function handleChatEvent(
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
   //     しつつ posting する。`parseChatPostMarker` は first-match のみ返す
   //     設計なので、本文を進めながら繰り返し parse する。
+  //
+  // Issue #186 既知 #6: shared space で未解決 speaker (= roster fetch 失敗 /
+  // member 未識別) が居る場合、CHAT_POST 全 marker を `applyChatPostGateToText`
+  // で先に strip し、`dispatchChatPostMarkers` には marker のない本文を渡す
+  // (= Python `_strip_chat_post_on_unresolved` + `_handle_chat_post_marker`
+  // のスキップ等価)。これにより未確認ユーザー混在 thread から別 space への
+  // 横展開 (= 権限事故源) を機械的に塞ぐ。gate されなかった場合 (hasUnresolved=false
+  // or DM) は素通し = 旧挙動温存。
+  const chatPostGateApplication = applyChatPostGateToText(
+    emailParsed.cleanedText,
+    hasUnresolvedSpeakers,
+  );
+  if (chatPostGateApplication.decision.gate) {
+    console.log(
+      `[chat-event] CHAT_POST gated eventKey=${eventKey} ` +
+        `reason=${chatPostGateApplication.decision.reason} ` +
+        `(unresolved speakers in history)`,
+    );
+  }
   const chatPostResult = await dispatchChatPostMarkers(
     env,
     eventKey,
-    emailParsed.cleanedText,
+    chatPostGateApplication.text,
     spaceName,
     threadName,
   );
@@ -1154,7 +1206,11 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
-// TODO(#186 follow-up): 未解決 speaker gate (speaker-resolver.ts 完全統合)
+// ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で
+//    history fetch 結果に未登録 chat_user_id が居るとき CHAT_POST 全 marker
+//    を `applyChatPostGateToText` で strip。speaker-resolver.ts pure 関数群
+//    + speaker-gate.ts wire-up 経路。external tool gate は actor 駆動軸で
+//    別途 #186 follow-up)。
 // TODO(#186 follow-up): CHAT_POST alias resolver port (= cma_gchat_send.resolve_space)
 // TODO(#186 follow-up): user_mapping default fallback (= 既知ユーザ以外の処理)
 // TODO(#186 follow-up): annotation-based mention detection (= _is_for_bot 完全 port)
