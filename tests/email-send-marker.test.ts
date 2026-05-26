@@ -66,6 +66,36 @@ describe('parseEmailSendMarkers', () => {
     expect(result.cleanedText).toBe('before\n\nafter');
   });
 
+  it('parses marker JSON when body contains literal newlines', () => {
+    const text =
+      '以下の内容で送信します:\n' +
+      'EMAIL_SEND:{"to":"a@x","subject":"猫","body":"1行目\n\n2行目"}';
+    const result = parseAssistantText(text);
+    expect(result.failures).toHaveLength(0);
+    expect(result.markers).toHaveLength(1);
+    expect(result.markers[0]!.body).toBe('1行目\n\n2行目');
+    expect(result.cleanedText).toBe('以下の内容で送信します:');
+  });
+
+  it('parses marker JSON across lines when newlines are escaped', () => {
+    const text =
+      '以下の内容で送信します:\n' +
+      'EMAIL_SEND:{\n' +
+      '  "to":"a@x",\n' +
+      '  "subject":"猫",\n' +
+      '  "body":"1行目\\n\\n2行目"\n' +
+      '}';
+    const result = parseAssistantText(text);
+    expect(result.failures).toHaveLength(0);
+    expect(result.markers).toHaveLength(1);
+    expect(result.markers[0]).toMatchObject({
+      to: 'a@x',
+      subject: '猫',
+      body: '1行目\n\n2行目',
+    });
+    expect(result.cleanedText).toBe('以下の内容で送信します:');
+  });
+
   it('captures in_reply_to_message_id when present', () => {
     const m = parseEmailSendMarkers(
       'EMAIL_SEND:{"to":"a@x","subject":"s","body":"b","in_reply_to_message_id":"msg_abc"}',

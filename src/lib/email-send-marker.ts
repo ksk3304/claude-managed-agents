@@ -23,6 +23,7 @@
 import type { EmailSendMarker } from '../types/agentmail';
 
 const EMAIL_SEND_MARKER_RE = /EMAIL_SEND:(\{[^\n]+\})/g;
+const EMAIL_SEND_PREFIX = 'EMAIL_SEND:';
 
 export interface ParseResult {
   /** All markers successfully parsed, in source order. */
@@ -65,26 +66,119 @@ export function parseEmailSendMarkers(assistantText: string): EmailSendMarker[] 
 export function parseAssistantText(assistantText: string): ParseResult {
   const markers: EmailSendMarker[] = [];
   const failures: ParseFailure[] = [];
-  let cleanedText = assistantText;
-  // We walk the matches with a fresh RegExp instance per call so the
-  // module-level `g`-flagged regex's lastIndex state doesn't leak
-  // across calls.
-  const localRe = new RegExp(EMAIL_SEND_MARKER_RE.source, EMAIL_SEND_MARKER_RE.flags);
-  for (const match of assistantText.matchAll(localRe)) {
-    const rawJson = match[1];
-    if (!rawJson) continue;
+  const spans = extractEmailSendSpans(assistantText);
+  for (const span of spans) {
     try {
-      const parsed = parseOne(rawJson);
+      const parsed = parseOne(span.json);
       markers.push(parsed);
     } catch (err) {
       failures.push({
-        raw: match[0]!,
+        raw: span.raw,
         reason: err instanceof Error ? err.message : String(err),
       });
     }
   }
-  cleanedText = assistantText.replace(localRe, '').replace(/\n{3,}/g, '\n\n').trim();
+  const cleanedText = removeSpans(assistantText, spans)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   return { markers, failures, cleanedText };
+}
+
+interface EmailSendSpan {
+  start: number;
+  end: number;
+  raw: string;
+  json: string;
+}
+
+function extractEmailSendSpans(text: string): EmailSendSpan[] {
+  const spans: EmailSendSpan[] = [];
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const prefixAt = text.indexOf(EMAIL_SEND_PREFIX, searchFrom);
+    if (prefixAt === -1) break;
+    const jsonStart = text.indexOf('{', prefixAt + EMAIL_SEND_PREFIX.length);
+    if (jsonStart === -1) {
+      spans.push({
+        start: prefixAt,
+        end: lineEnd(text, prefixAt),
+        raw: text.slice(prefixAt, lineEnd(text, prefixAt)),
+        json: '',
+      });
+      searchFrom = prefixAt + EMAIL_SEND_PREFIX.length;
+      continue;
+    }
+    const jsonEnd = findBalancedJsonObjectEnd(text, jsonStart);
+    if (jsonEnd === -1) {
+      const end = lineEnd(text, jsonStart);
+      spans.push({
+        start: prefixAt,
+        end,
+        raw: text.slice(prefixAt, end),
+        json: text.slice(jsonStart, end),
+      });
+      searchFrom = end;
+      continue;
+    }
+    const end = jsonEnd + 1;
+    spans.push({
+      start: prefixAt,
+      end,
+      raw: text.slice(prefixAt, end),
+      json: text.slice(jsonStart, end),
+    });
+    searchFrom = end;
+  }
+  return spans;
+}
+
+function findBalancedJsonObjectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      depth += 1;
+      continue;
+    }
+    if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function lineEnd(text: string, start: number): number {
+  const idx = text.indexOf('\n', start);
+  return idx === -1 ? text.length : idx;
+}
+
+function removeSpans(text: string, spans: EmailSendSpan[]): string {
+  if (spans.length === 0) return text;
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    out += text.slice(cursor, span.start);
+    cursor = span.end;
+  }
+  out += text.slice(cursor);
+  return out;
 }
 
 function parseOne(rawJson: string): EmailSendMarker {
@@ -92,7 +186,11 @@ function parseOne(rawJson: string): EmailSendMarker {
   try {
     data = JSON.parse(rawJson);
   } catch (err) {
-    throw new Error(`EMAIL_SEND JSON parse: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      data = JSON.parse(escapeLiteralControlCharsInJsonStrings(rawJson));
+    } catch {
+      throw new Error(`EMAIL_SEND JSON parse: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(`EMAIL_SEND payload must be a JSON object, got ${typeof data}`);
@@ -126,6 +224,51 @@ function parseOne(rawJson: string): EmailSendMarker {
   }
 
   return marker;
+}
+
+function escapeLiteralControlCharsInJsonStrings(rawJson: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < rawJson.length; i += 1) {
+    const ch = rawJson[i]!;
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        out += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        out += ch;
+        inString = false;
+        continue;
+      }
+      if (ch === '\n') {
+        out += '\\n';
+        continue;
+      }
+      if (ch === '\r') {
+        out += '\\r';
+        continue;
+      }
+      if (ch === '\t') {
+        out += '\\t';
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 /**
