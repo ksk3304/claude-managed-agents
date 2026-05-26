@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   normalizeSenderEmail,
   readUserMapping,
+  readUserMappingWithDefault,
   resolveSenderToResources,
 } from '../src/lib/memory-attach';
 import { makeKv } from './helpers';
@@ -77,5 +78,58 @@ describe('readUserMapping / resolveSenderToResources', () => {
       }),
     );
     expect(await readUserMapping(kv, 'ALICE+SUB@example.com')).not.toBeNull();
+  });
+});
+
+describe('readUserMappingWithDefault (Issue #186 follow-up #8)', () => {
+  it('direct hit → isDefault=false (default key untouched)', async () => {
+    const kv = makeKv();
+    await kv.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({
+        user_slug: 'alice',
+        agent_id: 'agent_a',
+        memory_attachments: [],
+      }),
+    );
+    const r = await readUserMappingWithDefault(kv, 'alice@example.com', 'guest');
+    expect(r).not.toBeNull();
+    expect(r!.isDefault).toBe(false);
+    expect(r!.mapping.user_slug).toBe('alice');
+  });
+
+  it('miss + defaultSlug set + default mapping exists → isDefault=true', async () => {
+    const kv = makeKv();
+    await kv.put(
+      'user_mapping:guest',
+      JSON.stringify({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        memory_attachments: [],
+      }),
+    );
+    const r = await readUserMappingWithDefault(kv, 'stranger@example.com', 'guest');
+    expect(r).not.toBeNull();
+    expect(r!.isDefault).toBe(true);
+    expect(r!.mapping.user_slug).toBe('guest');
+    expect(r!.mapping.agent_id).toBe('agent_default');
+  });
+
+  it('miss + defaultSlug undefined → null (legacy unknown_sender behaviour)', async () => {
+    const kv = makeKv();
+    const r = await readUserMappingWithDefault(kv, 'stranger@example.com', undefined);
+    expect(r).toBeNull();
+  });
+
+  it('miss + defaultSlug blank (whitespace) → null (treated as unset)', async () => {
+    const kv = makeKv();
+    const r = await readUserMappingWithDefault(kv, 'stranger@example.com', '   ');
+    expect(r).toBeNull();
+  });
+
+  it('miss + defaultSlug set but default mapping absent in KV → null', async () => {
+    const kv = makeKv();
+    const r = await readUserMappingWithDefault(kv, 'stranger@example.com', 'guest');
+    expect(r).toBeNull();
   });
 });

@@ -661,6 +661,61 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
+  it('Case 14b: user_mapping 不在 + DEFAULT_USER_SLUG 設定済 + default mapping 存在 → default で resolve + committed (#186 follow-up #8)', async () => {
+    const env = buildEnv({
+      envOverrides: { DEFAULT_USER_SLUG: 'guest' } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({ senderEmail: 'stranger@example.com' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    // Write the default mapping under `user_mapping:<slug>` (Python keeps
+    // `default` inside the same JSON file; KV port flattens to a
+    // dedicated key — see memory-attach.ts:readUserMappingWithDefault).
+    await env.MAKOTO_KV.put(
+      'user_mapping:guest',
+      JSON.stringify({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        memory_attachments: [],
+      }),
+    );
+
+    installFakeAnthropic({
+      sessionId: 'sesn_default_1',
+      events: [
+        { type: 'agent.message.text', text: 'ゲストモードで応答します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // 既存版 (= placeholder POST 未実装の baseline) と placeholder 版の双方で
+    // 動くよう、Chat 投稿の最終本文に "ゲストモード" が含まれていれば PASS と
+    // する。placeholder 経路では PATCH 経由、baseline では直接 POST。
+    const allTexts = [
+      ...chatApiMock.posts.map((p) => p.text),
+      // placeholder 版 (= updateChatMessage の patches array) も拾う。型は
+      // 動的に存在チェック (baseline では undefined)。
+      ...(((chatApiMock as unknown as { patches?: Array<{ text: string }> }).patches) ?? []).map(
+        (p) => p.text,
+      ),
+    ];
+    expect(allTexts.some((t) => t.includes('ゲストモード'))).toBe(true);
+  });
+
+  it('Case 14c: user_mapping 不在 + DEFAULT_USER_SLUG 未設定 → 従来の unknown_sender skip (回帰防止)', async () => {
+    const env = buildEnv(); // DEFAULT_USER_SLUG 未設定
+    const msg = buildQueueMsg({ senderEmail: 'stranger2@example.com' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('skipped');
+    if (result.kind === 'skipped') expect(result.reason).toBe('unknown_sender');
+    expect(chatApiMock.posts).toHaveLength(0);
+  });
+
   it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 設定済 → manager.create_job が呼ばれ "予定登録" 結果が current space に流れる', async () => {
     const env = buildEnv({
       envOverrides: {

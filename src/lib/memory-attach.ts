@@ -77,6 +77,57 @@ export function normalizeSenderEmail(raw: string): string {
 }
 
 /**
+ * Result of `readUserMappingWithDefault` — wraps the mapping with an
+ * `isDefault` flag so the caller can log / mark default-route resolutions
+ * separately from direct hits. Same shape as `UserMappingValue` plus the
+ * flag (Issue #186 follow-up #8).
+ */
+export interface UserMappingResolution {
+  mapping: UserMappingValue;
+  isDefault: boolean;
+}
+
+/**
+ * Chat-path mapping resolver with optional `default` fallback. Ported
+ * from `cma_session_resolver.py:SessionCredentialResolver.resolve`
+ * (l.418-446) — when sender_email is not in `users`, fall back to a
+ * `default` entry if one exists.
+ *
+ * Lookup order:
+ *   1. `user_mapping:<email>` (exact, normalized email)
+ *   2. `user_mapping:<defaultSlug>` (only when `defaultSlug` is set and #1 misses)
+ *
+ * Returns `null` when both miss → caller skips with `unknown_sender`
+ * (legacy behaviour preserved when `defaultSlug` is unset / blank or
+ * its mapping is absent from KV).
+ *
+ * NB: This is intentionally chat-path only. The mail-path resolver
+ * (`resolveSenderToResources` below) keeps fail-close semantics —
+ * misrouting a mail to the wrong identity is worse than dropping it
+ * (private-data exposure risk; see Python comment at
+ * cma_session_resolver.py:441-444 about not leaking raw email in
+ * exception args).
+ */
+export async function readUserMappingWithDefault(
+  kv: KVNamespace,
+  senderEmail: string,
+  defaultSlug: string | undefined,
+): Promise<UserMappingResolution | null> {
+  const direct = await readUserMapping(kv, senderEmail);
+  if (direct !== null) return { mapping: direct, isDefault: false };
+  if (!defaultSlug) return null;
+  const slug = defaultSlug.trim();
+  if (slug.length === 0) return null;
+  // `default` mapping is stored under the same KV prefix as named users
+  // so the parent CLI can write it the same way as any other entry
+  // (`scripts/cma_memory_init.py` convention). Python keeps `default`
+  // inside the same JSON file; the KV port flattens to a dedicated key.
+  const raw = await kv.get(`${KV_USER_MAPPING_PREFIX}:${slug}`, 'json');
+  if (raw === null) return null;
+  return { mapping: raw as UserMappingValue, isDefault: true };
+}
+
+/**
  * Read one `user_mapping:<email>` KV entry. Returns null when absent;
  * caller decides whether to fall back to a `default` mapping or
  * fail-close.
