@@ -633,11 +633,21 @@ async function safePost(
     return;
   }
   try {
+    // Python `_reply_to_chat:l.1247-1249` と等価: thread 指定時は
+    // `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD` を必須で
+    // 付ける。これがないと Chat REST API のデフォルト動作で「新規 thread
+    // として post」される (= 2026-05-26 reactive bot 実機検証で表示崩れ
+    // 確認、Python と等価合わせ)。
     await postChatMessage(
       { saKeyJson: saKey },
       spaceName,
       text,
-      threadName ? { threadName } : {},
+      threadName
+        ? {
+            threadName,
+            threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
+          }
+        : {},
     );
   } catch (err) {
     const reason =

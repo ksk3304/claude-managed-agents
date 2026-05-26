@@ -290,7 +290,31 @@ export async function sendAndStreamWithToolDispatch(
       const evType = typeof ev.type === 'string' ? ev.type : '';
 
       // 1. text-bearing events — accumulate into assistantText.
-      const text = pickString(ev, 'text') ?? pickString(ev, 'delta');
+      // Anthropic Managed Agents の実 event shape (Python `cma_lib.py:2730-2734`
+      // を一次ソースに):
+      //   { type: 'agent.message', content: [{ type: 'text', text: '...' }, ...] }
+      // top-level の `ev.text` / `ev.delta` ではなく **content[] 配列内の各
+      // block の text field** を集計する必要がある (= 2026-05-26 reactive
+      // bot 実機検証で発覚、空 assistantText → empty clean text → 投稿
+      // skip の根本原因)。
+      let text: string | undefined;
+      if (evType === 'agent.message') {
+        const content = (ev as { content?: Array<Record<string, unknown>> })
+          .content;
+        if (Array.isArray(content)) {
+          const parts: string[] = [];
+          for (const block of content) {
+            const t = pickString(block, 'text');
+            if (t) parts.push(t);
+          }
+          if (parts.length > 0) text = parts.join('');
+        }
+      }
+      // fallback: top-level の `text` / `delta` (= 旧仕様 / partial delta
+      // event、念のため残置で後方互換)
+      if (!text) {
+        text = pickString(ev, 'text') ?? pickString(ev, 'delta');
+      }
       if (text) assistantText += text;
 
       // 2. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時

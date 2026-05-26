@@ -377,6 +377,62 @@ function base64Decode(b64: string): Uint8Array {
   return out;
 }
 
+/**
+ * Patch an existing Chat message's text. Used by the placeholder
+ * post → update pattern (= Cloud Run `cma_gchat_bot.py:l.1861-1875`
+ * `_update_chat_message`):
+ *   1. Bot posts a placeholder (= "...MAKOTOくんが入力中") immediately
+ *      to ack the user's message → Google Chat client stops the
+ *      "MAKOTOくん から応答ありません" timeout error.
+ *   2. Bot does the heavy session.create + LLM stream + marker parse.
+ *   3. When done, bot PATCHes the placeholder's resource name with the
+ *      final reply text → user sees the placeholder rewritten in place.
+ *
+ * `messageName` is the full resource name returned by `postChatMessage`
+ * (e.g. `spaces/AAA/messages/BBB.CCC`). `updateMask=text` is the only
+ * mask we use today; expand if cards/attachments are needed later.
+ */
+export async function updateChatMessage(
+  deps: ChatApiDeps,
+  messageName: string,
+  text: string,
+): Promise<void> {
+  if (!messageName || !messageName.startsWith('spaces/')) {
+    throw new Error(
+      `updateChatMessage: messageName must start with 'spaces/' (got ${messageName})`,
+    );
+  }
+  if (!text || text.length === 0) {
+    throw new Error('updateChatMessage: text must be non-empty');
+  }
+
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const scopes = deps.scopes ?? [CHAT_BOT_SCOPE];
+  const token = await getChatAccessToken(deps, scopes);
+
+  // PATCH /v1/{messageName}?updateMask=text (= Python l.1867-1870 等価)
+  const url = `${CHAT_API_BASE}/${messageName}?updateMask=text`;
+  assertBridgeEgressAllowed(url, 'chat-api:updateChatMessage');
+
+  const response = await fetchImpl(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!response.ok) {
+    const errorText = await safeReadText(response);
+    throw new ChatApiError(
+      `Chat REST PATCH failed status=${response.status} message=${messageName} body=${errorText.slice(0, 300)}`,
+      response.status,
+      errorText,
+    );
+  }
+}
+
 /** Reset the module-level cache. Tests only. */
 export function _resetChatTokenCacheForTests(): void {
   cachedToken = null;

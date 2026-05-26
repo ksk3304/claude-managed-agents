@@ -35,7 +35,7 @@
  */
 
 import {
-  importX509,
+  importJWK,
   jwtVerify,
   decodeProtectedHeader,
   type JWTPayload,
@@ -92,9 +92,23 @@ export interface ChatQueueMessage {
 // 公開鍵 cache + fetch
 // ============================================================================
 
-const GOOGLE_CHAT_ISSUER = 'chat@system.gserviceaccount.com';
-const GOOGLE_X509_URL =
-  'https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com';
+// Google Chat HTTPS push の OIDC JWT は標準 Google OIDC token なので
+// iss claim は `https://accounts.google.com` か `accounts.google.com` の
+// いずれか (公式 doc: https://developers.google.com/workspace/chat/verify-requests-from-chat
+// "for standard Google OIDC tokens, verify that the value of the iss claim
+// in the ID token is equal to https://accounts.google.com or
+// accounts.google.com")。歴史的 email-form `chat@system.gserviceaccount.com`
+// は email field の値であって iss claim ではない (2026-05-26 実機検証で
+// "unexpected iss" 判明、3 候補全部 accept で安全側に倒す)。
+const GOOGLE_CHAT_ISSUERS = [
+  'https://accounts.google.com',
+  'accounts.google.com',
+  'chat@system.gserviceaccount.com',
+];
+// 旧: chat@system の X.509 cert dict を見ていたが、実機の JWT は Google
+// 標準 OIDC JWK Set (`oauth2/v3/certs`) の key で sign されている
+// (= 2026-05-26 実機検証で kid mismatch 判明)。標準 JWKS に切替。
+const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
 const PUBLIC_KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 時間
 
 interface PublicKeyCacheEntry {
@@ -111,30 +125,33 @@ interface PublicKeyCacheEntry {
 let publicKeyCache: PublicKeyCacheEntry | null = null;
 
 /**
- * Google の X.509 公開鍵 endpoint を引いて kid -> CryptoKey の Map に
- * 変換する。`{kid: PEM string}` 形式 JSON が返る前提。
- * jose の `importX509` で X.509 PEM を CryptoKey に変換。
+ * Google 標準 OIDC JWK Set (`oauth2/v3/certs`) を引いて kid -> CryptoKey
+ * の Map に変換する。response は `{keys: [{kid, kty, n, e, alg, use}, ...]}`
+ * の JWK Set 形式。jose の `importJWK` で各 JWK を CryptoKey に変換。
  *
  * 失敗時は throw、呼出元が 500 にマップする。
  */
 async function fetchGooglePublicKeys(): Promise<Map<string, CryptoKey>> {
-  assertBridgeEgressAllowed(GOOGLE_X509_URL, 'google-chat-webhook:fetchPublicKeys');
-  const res = await fetch(GOOGLE_X509_URL);
+  assertBridgeEgressAllowed(GOOGLE_JWKS_URL, 'google-chat-webhook:fetchPublicKeys');
+  const res = await fetch(GOOGLE_JWKS_URL);
   if (!res.ok) {
     throw new Error(
       `google-chat public key fetch failed: status=${res.status}`,
     );
   }
-  const data = (await res.json()) as Record<string, string>;
+  const data = (await res.json()) as {
+    keys?: Array<Record<string, string>>;
+  };
   const out = new Map<string, CryptoKey>();
-  for (const [kid, pem] of Object.entries(data)) {
-    if (typeof pem !== 'string') continue;
+  for (const jwk of data.keys ?? []) {
+    const kid = jwk.kid;
+    if (typeof kid !== 'string' || !kid) continue;
     try {
-      const key = (await importX509(pem, 'RS256')) as unknown as CryptoKey;
+      const key = (await importJWK(jwk, 'RS256')) as unknown as CryptoKey;
       out.set(kid, key);
     } catch (err) {
       console.warn(
-        `[chat-webhook] importX509 skip kid=${kid}: ${err instanceof Error ? err.message : String(err)}`,
+        `[chat-webhook] importJWK skip kid=${kid}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -215,7 +232,7 @@ export async function verifyGoogleChatJwt(
 
   try {
     const { payload } = await jwtVerify(jwt, key, {
-      issuer: GOOGLE_CHAT_ISSUER,
+      issuer: GOOGLE_CHAT_ISSUERS,
       audience: expectedAudience,
       algorithms: ['RS256'],
     });
@@ -242,6 +259,96 @@ function isChatEventPayload(v: unknown): v is ChatEventPayload {
   const o = v as Record<string, unknown>;
   if (typeof o.type !== 'string') return false;
   return true;
+}
+
+/**
+ * 実際の Google Chat HTTPS push の payload を `ChatEventPayload` 形式に
+ * 正規化する。Workspace Add-on モード (= screenshot で「この Chat アプリを
+ * Workspace アドオンとしてビルドします」cb 付き) の payload は Cloud Run
+ * `cma_gchat_bot.py:l.3819` の dispatch logic と同じ envelope:
+ *
+ *   {
+ *     "commonEventObject": {...},
+ *     "chat": {
+ *       "user": {...},
+ *       "eventTime": "...",
+ *       "messagePayload":     { space, message },   // MESSAGE
+ *       "addedToSpacePayload":   { space },           // ADDED_TO_SPACE
+ *       "removedFromSpacePayload": { space },          // REMOVED_FROM_SPACE
+ *       "buttonClickedPayload": { ... }                // CARD_CLICKED
+ *     }
+ *   }
+ *
+ * `type` field は無く、`chat.*Payload` キーの存在で event 種別が決まる。
+ * 旧仕様 (= `{ type, message, space }` 直接) も後方互換で accept する
+ * (= 主に test fixture / 古い integration 経路用)。返り値が null なら
+ * 上位で invalid shape として 400 を返す。
+ */
+function normalizeChatEventPayload(raw: unknown): ChatEventPayload | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+
+  // Workspace Add-on envelope
+  const chat = obj.chat as Record<string, unknown> | undefined;
+  if (chat && typeof chat === 'object') {
+    const eventTime =
+      typeof chat.eventTime === 'string' ? chat.eventTime : undefined;
+    const user = chat.user as ChatEventPayload['user'] | undefined;
+
+    const pickSpace = (
+      p: unknown,
+    ): ChatEventPayload['space'] | undefined => {
+      if (p && typeof p === 'object') {
+        const sp = (p as Record<string, unknown>).space;
+        if (sp && typeof sp === 'object') {
+          return sp as ChatEventPayload['space'];
+        }
+      }
+      return undefined;
+    };
+
+    if ('messagePayload' in chat) {
+      const mp = chat.messagePayload as
+        | Record<string, unknown>
+        | undefined;
+      const message = mp?.message as ChatEventPayload['message'] | undefined;
+      const space = pickSpace(mp);
+      const result: ChatEventPayload = { type: 'MESSAGE' };
+      if (eventTime) result.eventTime = eventTime;
+      if (message) result.message = message;
+      if (space) result.space = space;
+      if (user) result.user = user;
+      return result;
+    }
+    if ('addedToSpacePayload' in chat) {
+      const result: ChatEventPayload = { type: 'ADDED_TO_SPACE' };
+      if (eventTime) result.eventTime = eventTime;
+      const space = pickSpace(chat.addedToSpacePayload);
+      if (space) result.space = space;
+      if (user) result.user = user;
+      return result;
+    }
+    if ('removedFromSpacePayload' in chat) {
+      const result: ChatEventPayload = { type: 'REMOVED_FROM_SPACE' };
+      if (eventTime) result.eventTime = eventTime;
+      const space = pickSpace(chat.removedFromSpacePayload);
+      if (space) result.space = space;
+      if (user) result.user = user;
+      return result;
+    }
+    if ('buttonClickedPayload' in chat) {
+      const result: ChatEventPayload = { type: 'CARD_CLICKED' };
+      if (eventTime) result.eventTime = eventTime;
+      if (user) result.user = user;
+      return result;
+    }
+    // chat envelope だが既知 payload キーなし → unknown event、skip
+    return { type: 'UNKNOWN_CHAT_EVENT' };
+  }
+
+  // 旧仕様 (`{ type, message, space, ... }`) 直接形式
+  if (isChatEventPayload(raw)) return raw;
+  return null;
 }
 
 function isMessageEvent(
@@ -341,11 +448,11 @@ export async function handleGoogleChatWebhook(
     console.warn(`[chat-webhook] reject invalid-json cfRay=${cfRay}`);
     return Response.json({ error: 'invalid JSON' }, { status: 400 });
   }
-  if (!isChatEventPayload(parsed)) {
+  const event = normalizeChatEventPayload(parsed);
+  if (!event) {
     console.warn(`[chat-webhook] reject invalid-shape cfRay=${cfRay}`);
     return Response.json({ error: 'invalid payload shape' }, { status: 400 });
   }
-  const event = parsed;
 
   // ---- 5. event type filter ----
   if (!isMessageEvent(event)) {
