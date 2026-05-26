@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  driveCreateDoc,
+  driveCreateFile,
   driveDelete,
   driveGetFileMetadata,
   driveReadExport,
@@ -100,7 +100,7 @@ describe('driveReadExport', () => {
   });
 });
 
-describe('driveCreateDoc', () => {
+describe('driveCreateFile', () => {
   it('uploads a small text file via multipart', async () => {
     const fetcher = makeFetchMock(async (url, init) => {
       expect(url).toContain('/upload/drive/v3');
@@ -110,7 +110,7 @@ describe('driveCreateDoc', () => {
       expect(ct).toMatch(/multipart\/related/);
       return jsonResponse(200, { id: 'new-id', name: 'doc.txt' });
     });
-    const r = await driveCreateDoc(
+    const r = await driveCreateFile(
       { name: 'doc.txt', content: 'hi', mime_type: 'text/plain' },
       baseDeps(fetcher),
     );
@@ -121,7 +121,7 @@ describe('driveCreateDoc', () => {
     const fetcher = makeFetchMock(async () => new Response('', { status: 200 }));
     const big = 'x'.repeat(2_000_000);
     await expect(
-      driveCreateDoc({ name: 'x', content: big }, baseDeps(fetcher)),
+      driveCreateFile({ name: 'x', content: big }, baseDeps(fetcher)),
     ).rejects.toThrow();
   });
 });

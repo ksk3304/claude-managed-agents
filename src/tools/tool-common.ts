@@ -9,7 +9,7 @@
  *   - A token-cancelling Google API fetch wrapper (401 → invalidate +
  *     one-shot retry, 5xx → exponential backoff, 30 s timeout).
  *   - A KV-backed confirm-token store for two-step destructive tools
- *     (`drive_delete`, `drive_create_doc`). The Python implementation
+ *     (`drive_delete`). The Python implementation
  *     uses a process-local `dict` + `threading.Lock`; on Cloudflare
  *     Workers we need durable storage that survives short-lived worker
  *     invocations, hence KV with native 60-second-minimum TTL.
@@ -332,7 +332,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ----------------------------------------------------------------------------
-// Confirm-token store (drive_delete / drive_create_doc destructive 2-step)
+// Confirm-token store (drive_delete destructive 2-step)
 // ----------------------------------------------------------------------------
 
 export interface ConfirmTokenEntry {

@@ -30,7 +30,7 @@
  */
 
 import {
-  driveCreateDoc,
+  driveCreateFile,
   driveDelete,
   driveGetFileMetadata,
   driveReadExport,
@@ -39,8 +39,8 @@ import {
 } from '../tools/drive';
 import {
   sheetsAppend,
-  sheetsClear,
-  sheetsGet,
+  sheetsCreate,
+  sheetsRead,
   sheetsUpdate,
   type SheetsToolDeps,
 } from '../tools/sheets';
@@ -61,24 +61,24 @@ export type MakotoToolName =
   | 'drive_search'
   | 'drive_get_file_metadata'
   | 'drive_read_export'
-  | 'drive_create_doc'
+  | 'drive_create_file'
   | 'drive_delete'
-  | 'sheets_get'
-  | 'sheets_append'
+  | 'sheets_create'
+  | 'sheets_read'
   | 'sheets_update'
-  | 'sheets_clear'
+  | 'sheets_append'
   | 'calendar_list_events';
 
 export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_search',
   'drive_get_file_metadata',
   'drive_read_export',
-  'drive_create_doc',
+  'drive_create_file',
   'drive_delete',
-  'sheets_get',
-  'sheets_append',
+  'sheets_create',
+  'sheets_read',
   'sheets_update',
-  'sheets_clear',
+  'sheets_append',
   'calendar_list_events',
 ];
 
@@ -200,30 +200,30 @@ export async function dispatchMakotoTool(
         return ok(
           await driveReadExport(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
         );
-      case 'drive_create_doc':
+      case 'drive_create_file':
         return ok(
-          await driveCreateDoc(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await driveCreateFile(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
         );
       case 'drive_delete':
         // drive_delete requires the confirm token store + bound message id.
         return ok(
           await driveDelete(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, true)),
         );
-      case 'sheets_get':
+      case 'sheets_create':
         return ok(
-          await sheetsGet(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
+          await sheetsCreate(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
-      case 'sheets_append':
+      case 'sheets_read':
         return ok(
-          await sheetsAppend(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
+          await sheetsRead(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'sheets_update':
         return ok(
           await sheetsUpdate(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
-      case 'sheets_clear':
+      case 'sheets_append':
         return ok(
-          await sheetsClear(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
+          await sheetsAppend(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'calendar_list_events':
         return ok(

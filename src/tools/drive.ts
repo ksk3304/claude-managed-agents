@@ -13,9 +13,9 @@
  *   - the inbound RFC 822 Message-ID as `boundMessageId` so Issue #126
  *     (same-inbound-message confirmation skip) is enforced.
  *
- * `drive_create_doc` is the rename of Python's `_exec_drive_create_file`
- * — same multipart-upload contract; the user-visible name in
- * `CUSTOM_TOOLS` follows the plan-draft naming.
+ * `drive_create_file` is the TS port of Python's `_exec_drive_create_file`
+ * — same multipart-upload contract; tool name matches Python's
+ * `DRIVE_CREATE_FILE_TOOL_DEF` (`scripts/cma_lib.py:1727`).
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 step 8 — 層 6)
  * Source: `scripts/cma_lib.py:799-1396` (drive helpers + 5 _exec_drive_*).
@@ -375,13 +375,13 @@ export async function driveReadExport(
 }
 
 // ============================================================================
-// 4. drive_create_doc (Python `_exec_drive_create_file` renamed)
+// 4. drive_create_file (Python: _exec_drive_create_file)
 // ============================================================================
 
-const DRIVE_CREATE_DOC_KNOWN_KEYS = new Set(['name', 'content', 'mime_type', 'parents']);
-const DRIVE_CREATE_DOC_MAX_BYTES = 1024 * 1024;
+const DRIVE_CREATE_FILE_KNOWN_KEYS = new Set(['name', 'content', 'mime_type', 'parents']);
+const DRIVE_CREATE_FILE_MAX_BYTES = 1024 * 1024;
 
-export interface DriveCreateDocResult {
+export interface DriveCreateFileResult {
   id?: string;
   name?: string;
   mimeType?: string;
@@ -399,20 +399,20 @@ export interface DriveCreateDocResult {
  * `parents` MUST be valid Drive folder ids; the regex check happens
  * before we ever encode them into the upload body.
  */
-export async function driveCreateDoc(
+export async function driveCreateFile(
   input: Record<string, unknown>,
   deps: DriveToolDeps,
-): Promise<DriveCreateDocResult> {
-  rejectUnknownKeys(input, DRIVE_CREATE_DOC_KNOWN_KEYS, 'drive_create_doc');
-  const name = requireNonEmptyString(input.name, 'name', 'drive_create_doc');
+): Promise<DriveCreateFileResult> {
+  rejectUnknownKeys(input, DRIVE_CREATE_FILE_KNOWN_KEYS, 'drive_create_file');
+  const name = requireNonEmptyString(input.name, 'name', 'drive_create_file');
   if (typeof input.content !== 'string') {
-    throw new ToolSchemaError('drive_create_doc: content (string) is required');
+    throw new ToolSchemaError('drive_create_file: content (string) is required');
   }
   const content = input.content;
   const contentBytes = utf8ByteLength(content);
-  if (contentBytes > DRIVE_CREATE_DOC_MAX_BYTES) {
+  if (contentBytes > DRIVE_CREATE_FILE_MAX_BYTES) {
     throw new ToolSchemaError(
-      `drive_create_doc: content too large (${contentBytes} bytes > ${DRIVE_CREATE_DOC_MAX_BYTES})`,
+      `drive_create_file: content too large (${contentBytes} bytes > ${DRIVE_CREATE_FILE_MAX_BYTES})`,
     );
   }
   const mimeType =
@@ -424,13 +424,13 @@ export async function driveCreateDoc(
   if (input.parents !== undefined) {
     if (!Array.isArray(input.parents)) {
       throw new ToolSchemaError(
-        'drive_create_doc: parents must be array of strings',
+        'drive_create_file: parents must be array of strings',
       );
     }
     parents = input.parents.map((p) => {
       if (typeof p !== 'string' || !/^[A-Za-z0-9_-]+$/.test(p)) {
         throw new ToolSchemaError(
-          `drive_create_doc: parents id ${JSON.stringify(String(p).slice(0, 32))} must match [A-Za-z0-9_-]+`,
+          `drive_create_file: parents id ${JSON.stringify(String(p).slice(0, 32))} must match [A-Za-z0-9_-]+`,
         );
       }
       return p;
@@ -475,18 +475,18 @@ export async function driveCreateDoc(
   if (resp.status === 403) {
     const snippet = await safeErrorSnippet(resp);
     throw new GoogleApiToolError(
-      `drive_create_doc permission_denied (HTTP 403): ${snippet}`,
+      `drive_create_file permission_denied (HTTP 403): ${snippet}`,
       { status: 403, bodySnippet: snippet },
     );
   }
   if (!resp.ok) {
     const snippet = await safeErrorSnippet(resp);
     throw new GoogleApiToolError(
-      `drive_create_doc HTTP ${resp.status}: ${snippet}`,
+      `drive_create_file HTTP ${resp.status}: ${snippet}`,
       { status: resp.status, bodySnippet: snippet },
     );
   }
-  return (await resp.json()) as DriveCreateDocResult;
+  return (await resp.json()) as DriveCreateFileResult;
 }
 
 // ============================================================================

@@ -5,8 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   sheetsAppend,
-  sheetsClear,
-  sheetsGet,
+  sheetsCreate,
+  sheetsRead,
   sheetsUpdate,
   type SheetsToolDeps,
 } from '../src/tools/sheets';
@@ -23,7 +23,77 @@ function deps(fetcher: typeof fetch): SheetsToolDeps {
   return { accessToken: 'ya29.test', fetcher };
 }
 
-describe('sheetsGet', () => {
+describe('sheetsCreate', () => {
+  it('POSTs title and returns spreadsheet_id / url / title', async () => {
+    const fetcher = makeFetchMock(async (url, init) => {
+      expect(url).toBe('https://sheets.googleapis.com/v4/spreadsheets');
+      expect(init.method).toBe('POST');
+      expect(JSON.parse(String(init.body))).toEqual({
+        properties: { title: 'My Sheet' },
+      });
+      return jsonResponse(200, {
+        spreadsheetId: 'sid-1',
+        spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/sid-1/edit',
+        properties: { title: 'My Sheet' },
+      });
+    });
+    const r = await sheetsCreate({ title: 'My Sheet' }, deps(fetcher));
+    expect(r.spreadsheet_id).toBe('sid-1');
+    expect(r.spreadsheet_url).toBe(
+      'https://docs.google.com/spreadsheets/d/sid-1/edit',
+    );
+    expect(r.title).toBe('My Sheet');
+  });
+
+  it('rejects empty title with schema error', async () => {
+    const fetcher = makeFetchMock(async () => jsonResponse(200, {}));
+    await expect(
+      sheetsCreate({ title: '' }, deps(fetcher)),
+    ).rejects.toThrow(/title \(string, non-empty\) is required/);
+  });
+
+  it('rejects unknown keys', async () => {
+    const fetcher = makeFetchMock(async () => jsonResponse(200, {}));
+    await expect(
+      sheetsCreate(
+        { title: 'ok', bogus: 1 } as Record<string, unknown>,
+        deps(fetcher),
+      ),
+    ).rejects.toThrow(/unknown key/);
+  });
+
+  it('403 raises scope_insufficient error', async () => {
+    const fetcher = makeFetchMock(async () =>
+      new Response('forbidden', { status: 403 }),
+    );
+    await expect(
+      sheetsCreate({ title: 'X' }, deps(fetcher)),
+    ).rejects.toThrow(/scope_insufficient: HTTP 403/);
+  });
+
+  it('400 raises HTTP error with status code', async () => {
+    const fetcher = makeFetchMock(async () =>
+      new Response('bad request', { status: 400 }),
+    );
+    await expect(
+      sheetsCreate({ title: 'X' }, deps(fetcher)),
+    ).rejects.toThrow(/sheets_create HTTP 400/);
+  });
+
+  it('invalid JSON body raises invalid_json error', async () => {
+    const fetcher = makeFetchMock(async () =>
+      new Response('not json', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await expect(
+      sheetsCreate({ title: 'X' }, deps(fetcher)),
+    ).rejects.toThrow(/sheets_create invalid_json/);
+  });
+});
+
+describe('sheetsRead', () => {
   it('returns values + range + major_dimension', async () => {
     const fetcher = makeFetchMock(async () =>
       jsonResponse(200, {
@@ -35,7 +105,7 @@ describe('sheetsGet', () => {
         majorDimension: 'ROWS',
       }),
     );
-    const r = await sheetsGet(
+    const r = await sheetsRead(
       { spreadsheet_id: 'spr', range: 'Sheet1!A1:B2' },
       deps(fetcher),
     );
@@ -46,7 +116,7 @@ describe('sheetsGet', () => {
   it('rejects unknown keys', async () => {
     const fetcher = makeFetchMock(async () => jsonResponse(200, {}));
     await expect(
-      sheetsGet(
+      sheetsRead(
         { spreadsheet_id: 'a', range: 'A1', bogus: 1 } as Record<string, unknown>,
         deps(fetcher),
       ),
@@ -91,16 +161,5 @@ describe('sheetsUpdate', () => {
       deps(fetcher),
     );
     expect(r.updated_cells).toBe(2);
-  });
-});
-
-describe('sheetsClear', () => {
-  it('POSTs to :clear and returns cleared_range', async () => {
-    const fetcher = makeFetchMock(async (url) => {
-      expect(url).toContain(':clear');
-      return jsonResponse(200, { clearedRange: 'A1:B5' });
-    });
-    const r = await sheetsClear({ spreadsheet_id: 'spr', range: 'A1:B5' }, deps(fetcher));
-    expect(r.cleared_range).toBe('A1:B5');
   });
 });

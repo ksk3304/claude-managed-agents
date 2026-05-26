@@ -1,22 +1,19 @@
 /**
  * Google Sheets custom tools for the MAKOTO bridge.
  *
- * Four functions matching the plan-draft v3 §step 8 surface:
- *   - `sheetsGet`     → Python `_exec_sheets_read` (renamed for the
- *                       agent-facing name `sheets_get`)
- *   - `sheetsAppend`  → Python `_exec_sheets_append`
- *   - `sheetsUpdate`  → Python `_exec_sheets_update`
- *   - `sheetsClear`   → NEW (no Python counterpart; uses Google's
- *                       `spreadsheets.values.clear` endpoint). plan-
- *                       draft v3 lists this in place of the legacy
- *                       `sheets_create` to give the agent a way to
- *                       wipe a range without re-issuing a full update.
+ * Four functions matching Python's `get_sheets_tool_dispatch` surface
+ * (`scripts/cma_lib.py:2543-2548`):
+ *
+ *   - `sheetsCreate` → Python `_exec_sheets_create` (`cma_lib.py:2148-2190`)
+ *   - `sheetsRead`   → Python `_exec_sheets_read`   (`cma_lib.py:2193-2245`)
+ *   - `sheetsUpdate` → Python `_exec_sheets_update` (`cma_lib.py:2248-2312`)
+ *   - `sheetsAppend` → Python `_exec_sheets_append` (`cma_lib.py:2315-2397`)
  *
  * Same stateless-function shape as `drive.ts`. The dispatcher in
  * layer 7 wires the access token through `SheetsToolDeps.accessToken`.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 step 8 — 層 6)
- * Source: `scripts/cma_lib.py:1947-2236` (sheets_* helpers).
+ * Source: `scripts/cma_lib.py:2148-2397` (sheets_* helpers).
  */
 
 import {
@@ -79,39 +76,116 @@ function encodeSheetsRange(range: string): string {
 }
 
 // ============================================================================
-// 1. sheets_get (Python: _exec_sheets_read)
+// 1. sheets_create (Python: _exec_sheets_create)
 // ============================================================================
 
-const SHEETS_GET_KNOWN_KEYS = new Set(['spreadsheet_id', 'range']);
+const SHEETS_CREATE_KNOWN_KEYS = new Set(['title']);
 
-export interface SheetsGetResult {
+export interface SheetsCreateResult {
+  spreadsheet_id: string | null;
+  spreadsheet_url: string | null;
+  title: string | null;
+}
+
+/**
+ * Create a new Google Spreadsheet at My Drive root.
+ *
+ * Python: `_exec_sheets_create` (`scripts/cma_lib.py:2148-2190`).
+ * API: `POST {SHEETS_API_BASE}/spreadsheets`
+ *   body: `{properties: {title: "..."}}`
+ *   response: `{spreadsheetId, spreadsheetUrl, properties: {title}, ...}`
+ */
+export async function sheetsCreate(
+  input: Record<string, unknown>,
+  deps: SheetsToolDeps,
+): Promise<SheetsCreateResult> {
+  rejectUnknownKeys(input, SHEETS_CREATE_KNOWN_KEYS, 'sheets_create');
+  const title = requireNonEmptyString(input.title, 'title', 'sheets_create');
+
+  const url = `${SHEETS_API_BASE}/spreadsheets`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ properties: { title } }),
+    },
+    fetchOpts(deps),
+  );
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    if (resp.status === 403) {
+      throw new GoogleApiToolError(
+        `sheets_create scope_insufficient: HTTP 403: ${snippet}`,
+        { status: 403, bodySnippet: snippet },
+      );
+    }
+    throw new GoogleApiToolError(
+      `sheets_create HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  let body: unknown;
+  try {
+    body = await resp.json();
+  } catch (err) {
+    const snippet = (err instanceof Error ? err.message : String(err)).slice(0, 200);
+    throw new GoogleApiToolError(`sheets_create invalid_json: ${snippet}`);
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new GoogleApiToolError(
+      `sheets_create unexpected_response_type: ${body === null ? 'null' : Array.isArray(body) ? 'array' : typeof body}`,
+    );
+  }
+  const data = body as {
+    spreadsheetId?: string;
+    spreadsheetUrl?: string;
+    properties?: { title?: string };
+  };
+  return {
+    spreadsheet_id: typeof data.spreadsheetId === 'string' ? data.spreadsheetId : null,
+    spreadsheet_url: typeof data.spreadsheetUrl === 'string' ? data.spreadsheetUrl : null,
+    title:
+      data.properties && typeof data.properties.title === 'string'
+        ? data.properties.title
+        : null,
+  };
+}
+
+// ============================================================================
+// 2. sheets_read (Python: _exec_sheets_read)
+// ============================================================================
+
+const SHEETS_READ_KNOWN_KEYS = new Set(['spreadsheet_id', 'range']);
+
+export interface SheetsReadResult {
   range: string;
   values: unknown[][];
   major_dimension: string;
 }
 
-export async function sheetsGet(
+export async function sheetsRead(
   input: Record<string, unknown>,
   deps: SheetsToolDeps,
-): Promise<SheetsGetResult> {
-  rejectUnknownKeys(input, SHEETS_GET_KNOWN_KEYS, 'sheets_get');
+): Promise<SheetsReadResult> {
+  rejectUnknownKeys(input, SHEETS_READ_KNOWN_KEYS, 'sheets_read');
   const spreadsheetId = requireNonEmptyString(
     input.spreadsheet_id,
     'spreadsheet_id',
-    'sheets_get',
+    'sheets_read',
   );
-  const range = requireNonEmptyString(input.range, 'range', 'sheets_get');
+  const range = requireNonEmptyString(input.range, 'range', 'sheets_read');
   const url = `${SHEETS_API_BASE}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeSheetsRange(range)}`;
   const resp = await googleApiFetch(url, { method: 'GET' }, fetchOpts(deps));
   if (!resp.ok) {
     const snippet = await safeErrorSnippet(resp);
     if (resp.status === 403) {
       throw new GoogleApiToolError(
-        `sheets_get scope_insufficient: HTTP 403: ${snippet}`,
+        `sheets_read scope_insufficient: HTTP 403: ${snippet}`,
         { status: 403, bodySnippet: snippet },
       );
     }
-    throw new GoogleApiToolError(`sheets_get HTTP ${resp.status}: ${snippet}`, {
+    throw new GoogleApiToolError(`sheets_read HTTP ${resp.status}: ${snippet}`, {
       status: resp.status,
       bodySnippet: snippet,
     });
@@ -129,7 +203,67 @@ export async function sheetsGet(
 }
 
 // ============================================================================
-// 2. sheets_append
+// 3. sheets_update (Python: _exec_sheets_update)
+// ============================================================================
+
+const SHEETS_UPDATE_KNOWN_KEYS = new Set(['spreadsheet_id', 'range', 'values']);
+
+export interface SheetsUpdateResult {
+  spreadsheet_id: string;
+  updated_range: string;
+  updated_cells: number;
+}
+
+export async function sheetsUpdate(
+  input: Record<string, unknown>,
+  deps: SheetsToolDeps,
+): Promise<SheetsUpdateResult> {
+  rejectUnknownKeys(input, SHEETS_UPDATE_KNOWN_KEYS, 'sheets_update');
+  const spreadsheetId = requireNonEmptyString(
+    input.spreadsheet_id,
+    'spreadsheet_id',
+    'sheets_update',
+  );
+  const range = requireNonEmptyString(input.range, 'range', 'sheets_update');
+  const values = require2DArray(input.values, 'sheets_update');
+
+  const params = new URLSearchParams({ valueInputOption: 'RAW' });
+  const url = `${SHEETS_API_BASE}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeSheetsRange(range)}?${params.toString()}`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values }),
+    },
+    fetchOpts(deps),
+  );
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    if (resp.status === 403) {
+      throw new GoogleApiToolError(
+        `sheets_update scope_insufficient: HTTP 403: ${snippet}`,
+        { status: 403, bodySnippet: snippet },
+      );
+    }
+    throw new GoogleApiToolError(
+      `sheets_update HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  const body = (await resp.json()) as {
+    updatedRange?: string;
+    updatedCells?: number;
+  };
+  return {
+    spreadsheet_id: spreadsheetId,
+    updated_range: body.updatedRange ?? '',
+    updated_cells: typeof body.updatedCells === 'number' ? body.updatedCells : 0,
+  };
+}
+
+// ============================================================================
+// 4. sheets_append (Python: _exec_sheets_append)
 // ============================================================================
 
 const SHEETS_APPEND_KNOWN_KEYS = new Set(['spreadsheet_id', 'range', 'values']);
@@ -192,127 +326,5 @@ export async function sheetsAppend(
     updated_range: updates.updatedRange ?? '',
     updated_cells:
       typeof updates.updatedCells === 'number' ? updates.updatedCells : 0,
-  };
-}
-
-// ============================================================================
-// 3. sheets_update
-// ============================================================================
-
-const SHEETS_UPDATE_KNOWN_KEYS = new Set(['spreadsheet_id', 'range', 'values']);
-
-export interface SheetsUpdateResult {
-  spreadsheet_id: string;
-  updated_range: string;
-  updated_cells: number;
-}
-
-export async function sheetsUpdate(
-  input: Record<string, unknown>,
-  deps: SheetsToolDeps,
-): Promise<SheetsUpdateResult> {
-  rejectUnknownKeys(input, SHEETS_UPDATE_KNOWN_KEYS, 'sheets_update');
-  const spreadsheetId = requireNonEmptyString(
-    input.spreadsheet_id,
-    'spreadsheet_id',
-    'sheets_update',
-  );
-  const range = requireNonEmptyString(input.range, 'range', 'sheets_update');
-  const values = require2DArray(input.values, 'sheets_update');
-
-  const params = new URLSearchParams({ valueInputOption: 'RAW' });
-  const url = `${SHEETS_API_BASE}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeSheetsRange(range)}?${params.toString()}`;
-  const resp = await googleApiFetch(
-    url,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ values }),
-    },
-    fetchOpts(deps),
-  );
-  if (!resp.ok) {
-    const snippet = await safeErrorSnippet(resp);
-    if (resp.status === 403) {
-      throw new GoogleApiToolError(
-        `sheets_update scope_insufficient: HTTP 403: ${snippet}`,
-        { status: 403, bodySnippet: snippet },
-      );
-    }
-    throw new GoogleApiToolError(
-      `sheets_update HTTP ${resp.status}: ${snippet}`,
-      { status: resp.status, bodySnippet: snippet },
-    );
-  }
-  const body = (await resp.json()) as {
-    updatedRange?: string;
-    updatedCells?: number;
-  };
-  return {
-    spreadsheet_id: spreadsheetId,
-    updated_range: body.updatedRange ?? '',
-    updated_cells: typeof body.updatedCells === 'number' ? body.updatedCells : 0,
-  };
-}
-
-// ============================================================================
-// 4. sheets_clear  (new — no Python counterpart)
-// ============================================================================
-//
-// Google Sheets API: `spreadsheets.values.clear`
-//   POST {SHEETS_API_BASE}/spreadsheets/{id}/values/{range}:clear
-//   body: {} (no payload required; the URL specifies what to clear)
-//
-// Plan-draft v3 lists this in `sheets.ts`'s 4-tool set; the legacy
-// `sheets_create` is intentionally absent because new-spreadsheet
-// creation lives elsewhere (operators provision spreadsheets via the
-// dashboard, the bridge writes into them but doesn't mint them).
-
-const SHEETS_CLEAR_KNOWN_KEYS = new Set(['spreadsheet_id', 'range']);
-
-export interface SheetsClearResult {
-  spreadsheet_id: string;
-  cleared_range: string;
-}
-
-export async function sheetsClear(
-  input: Record<string, unknown>,
-  deps: SheetsToolDeps,
-): Promise<SheetsClearResult> {
-  rejectUnknownKeys(input, SHEETS_CLEAR_KNOWN_KEYS, 'sheets_clear');
-  const spreadsheetId = requireNonEmptyString(
-    input.spreadsheet_id,
-    'spreadsheet_id',
-    'sheets_clear',
-  );
-  const range = requireNonEmptyString(input.range, 'range', 'sheets_clear');
-
-  const url = `${SHEETS_API_BASE}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeSheetsRange(range)}:clear`;
-  const resp = await googleApiFetch(
-    url,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    },
-    fetchOpts(deps),
-  );
-  if (!resp.ok) {
-    const snippet = await safeErrorSnippet(resp);
-    if (resp.status === 403) {
-      throw new GoogleApiToolError(
-        `sheets_clear scope_insufficient: HTTP 403: ${snippet}`,
-        { status: 403, bodySnippet: snippet },
-      );
-    }
-    throw new GoogleApiToolError(
-      `sheets_clear HTTP ${resp.status}: ${snippet}`,
-      { status: resp.status, bodySnippet: snippet },
-    );
-  }
-  const body = (await resp.json()) as { clearedRange?: string };
-  return {
-    spreadsheet_id: spreadsheetId,
-    cleared_range: body.clearedRange ?? range,
   };
 }
