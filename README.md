@@ -25,6 +25,10 @@ button (git-based, runs in Workers Builds) and a terminal-based
 
 This repository deploys a Workers-based control plane for running Claude Managed Agents on Cloudflare.
 
+MAKOTOくん固有の agent / skill / session 設計は
+[docs/agent-session-skill-design.md](./docs/agent-session-skill-design.md) を参照。
+正本は `makoto-prime/products/makoto-kun/specs/cloudflare-agent-session-skill-design.md`。
+
 Claude Managed Agents will send a webhook to your Worker when an agent session begin or ends. The
 control plane spins up a sandbox for each session, syncs state across session sleeps, and shuts down
 the sandbox when the session ends.
