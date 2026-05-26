@@ -90,6 +90,20 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
+  /**
+   * Action skill (= attach_memory=false) 起動時に true で渡す (Issue #186
+   * 既知 #4 intent-detector 統合)。
+   *
+   * true のとき:
+   *   - KV thread session lookup を skip (= 既存 session を再利用しない)
+   *   - sessions.create で生成した新 sessionId を KV put しない
+   *     (= 次ターン以降も ephemeral 経路を踏ませる)
+   *
+   * 効果: Cloud Run `cma_gchat_bot.py:_handle_event:l.4002-4013` 等価。
+   * 「スレッド 2 通目以降の "メールして" が前セッションの memory + bash
+   * 前提で暴走する」(incident 2026-05-08 同根) を防ぐ。
+   */
+  forceFreshSession?: boolean;
 }
 
 export interface OrchestrateChatTurnResult {
@@ -188,13 +202,17 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
+  // `forceFreshSession=true` のときは KV lookup を skip (= 既存 session を
+  // 再利用しない、Issue #186 既知 #4 intent-detector 統合)。Cloud Run
+  // `_handle_event:l.4002-4013` 等価で「スレッド 2 通目以降の メールして」
+  // が前セッションの memory + bash 前提で暴走する」を防ぐ。
   const sessionKey = chatThreadSessionKey(
     input.senderEmail,
     input.spaceName,
     input.threadName,
   );
   let sessionId: string | null = null;
-  if (sessionKey !== null) {
+  if (sessionKey !== null && !input.forceFreshSession) {
     try {
       sessionId = await kv.get(sessionKey);
     } catch (err) {
@@ -226,9 +244,13 @@ export async function orchestrateChatTurn(
     isNewSession = true;
     console.log(
       `[chat-event] created session=${sessionId} agent=${input.userMapping.agent_id} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
+        `user=${input.userMapping.user_slug} space=${input.spaceName}` +
+        (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
-    if (sessionKey !== null) {
+    // `forceFreshSession=true` のときは KV put も skip (= 次ターン以降も
+    // 毎回 ephemeral 経路を踏ませる)。Cloud Run `_handle_event:l.4010-4013`
+    // 「session_key = None で thread_sessions に保存しない」と等価。
+    if (sessionKey !== null && !input.forceFreshSession) {
       try {
         await kv.put(sessionKey, sessionId, {
           expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,

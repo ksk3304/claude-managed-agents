@@ -15,8 +15,13 @@ import {
   detectActionSkillIntent,
   detectAllIntents,
   parseCommand,
+  type ActionSkillIntent,
   type SkillsData,
 } from '../src/lib/intent-detector';
+import {
+  ACTION_SKILL_INTENT_TABLE,
+  buildIntentPrefix,
+} from '../src/queue/chat-event-handler';
 
 // ---------------------------------------------------------------------------
 // parseCommand
@@ -319,5 +324,81 @@ describe('detectAllIntents', () => {
     const r = detectAllIntents('スケジュールに入れて、メールも送って');
     expect(r.mail).not.toBeNull();
     expect(r.schedule).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration: chat-event-handler 経路の wire up (Issue #186 既知 #4)
+//
+// `chat-event-handler.ts` から export した `ACTION_SKILL_INTENT_TABLE` + 該当
+// helper を直接呼んで「intent 判定 → forceFreshSession 決定 → bodyText 注釈
+// 注入」の組合せが Python `_handle_event:l.4001-4031` と同等に動くことを
+// 確認する。orchestrator/KV/Anthropic SDK までを mock した E2E は
+// `chat-event-handler.test.ts` に既存ケースが多数あり、本ファイルでは pure
+// な intent decision logic 単位での integration に絞る (= 1 reactive turn
+// で intent-detector が触る出力点を全部触る)。
+// ---------------------------------------------------------------------------
+
+describe('Integration: chat-event-handler intent wiring', () => {
+  it('case A: explicit /mail slash command → forceFreshSession=true + intent prefix annotated', () => {
+    // 1 reactive turn の bodyText 相当 (mention strip 済 + history 未 prepend)
+    const bodyText = '/mail to:bob@example.com 件名 hello 本文 wip';
+
+    const intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+
+    // Python `_detect_action_skill_intent` (l.1219) 等価: /mail は
+    // attach_memory:false → isActionSkill=true
+    expect(intent).not.toBeNull();
+    expect(intent!.command).toBe('/mail');
+    expect(intent!.source).toBe('slash_command');
+    expect(intent!.isActionSkill).toBe(true);
+
+    // chat-event-handler の forceFreshSession 決定式と等価
+    // (= orchestrator が KV lookup/put を bypass する条件)
+    const forceFreshSession = intent!.isActionSkill === true;
+    expect(forceFreshSession).toBe(true);
+
+    // bodyText の注釈 prefix (= context 質向上、l.4001-4031 stderr ログ相当を
+    // bodyText 内に顕在化させて agent が即把握できるようにする)
+    const prefix = buildIntentPrefix(intent);
+    expect(prefix).toBe('[intent: action_skill /mail]');
+  });
+
+  it('case B: implicit mail intent (no slash) → forceFreshSession=true + implicit hint', () => {
+    // Python l.4025-4027 等価: 「foo@example.com に資料を送って」は
+    // _detect_mail_intent HIT → 擬似 command='/mail' に escalate
+    const bodyText = 'foo@example.com に資料を送って';
+
+    const intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+
+    expect(intent).not.toBeNull();
+    expect(intent!.command).toBe('/mail');
+    expect(intent!.source).toBe('mail_intent');
+    expect(intent!.isActionSkill).toBe(true);
+
+    // forceFreshSession は action skill 起動の implicit 経路でも有効
+    const forceFreshSession = intent!.isActionSkill === true;
+    expect(forceFreshSession).toBe(true);
+
+    // 暗黙 intent は明示 slash と区別された hint を出す (= source 由来の差)
+    const prefix = buildIntentPrefix(intent);
+    expect(prefix).toBe('[intent: mail (implicit)]');
+  });
+
+  it('case C: chitchat (no intent) → forceFreshSession=false + no prefix (= 既存 session 継続)', () => {
+    // 通常会話: Python `_detect_action_skill_intent` (l.1214) で
+    // command=None → (False, None) を返し、`is_action_skill=False`
+    const bodyText = 'お疲れさまです、今日の進捗を確認したいです';
+
+    const intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+    expect(intent).toBeNull(); // 既存 session 継続経路
+
+    // forceFreshSession は false (= orchestrator が KV lookup/put を実行 =
+    // continuation 継続、Python l.3993/4015-4019 等価)
+    const forceFreshSession = intent !== null && (intent as ActionSkillIntent).isActionSkill === true;
+    expect(forceFreshSession).toBe(false);
+
+    // 注釈 prefix は空 (= bytes 等価で旧経路と同じ bodyText を agent に渡す)
+    expect(buildIntentPrefix(intent)).toBe('');
   });
 });

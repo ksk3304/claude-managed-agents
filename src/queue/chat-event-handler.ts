@@ -29,7 +29,6 @@
  *     disable / pause / set / confirm / cancel は Worker 側 Firestore overlay
  *     永続層の未実装ゆえ 503 拒否)。
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
- *   - intent-detector 統合 (intent ベース dispatch 分岐)
  *   - Cold continuation の SignalB 経由 thread-self-scan
  *   - 外部ツール gate の actor 駆動完全実装 (= `_compute_external_tool_gate`
  *     wire-up。CHAT_POST gate = 未解決 speaker 軸は Issue #186 既知 #6 で完了)
@@ -84,6 +83,11 @@ import {
   type CapRecoveryStreamExecutor,
 } from '../lib/cap-recovery';
 import { parseAssistantText } from '../lib/email-send-marker';
+import {
+  detectActionSkillIntent,
+  type ActionSkillIntent,
+  type SkillsData,
+} from '../lib/intent-detector';
 import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
@@ -97,7 +101,6 @@ import {
 } from '../lib/session-log';
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
-import type { SkillsData } from '../lib/intent-detector';
 import { sendAndStreamWithToolDispatch } from '../lib/session';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
@@ -120,6 +123,30 @@ import type { EmailSendMarker } from '../types/agentmail';
  * 失敗時に `deleteChatMessage` で残骸 cleanup する (#186 UX 致命傷)。
  */
 const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
+
+/**
+ * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
+ * false` skill 集合を TS 側で持つ subset (Issue #186 既知 #4 intent-detector
+ * 統合)。chat-event-handler は intent 判定 (= action skill 起動の有無) だけ
+ * のために使うので、Python full SkillsData を移植する必要はなく、`/mail` と
+ * `/schedule` の 2 件のみ持つ。
+ *
+ * Python 一次ソース: `scripts/cma_skills.json` (attach_memory: false の skill
+ * のみ列挙)。Python `_detect_action_skill_intent` (l.1193) は `skill_def.get
+ * ("attach_memory", True)` を見るので、未登録 skill (= ここに無い skill) は
+ * `isActionSkill=false` 扱い (= 既存 session 継続) になり、Python と同等。
+ *
+ * 注: persona/tools の動的 spec とは独立した「intent 判定専用テーブル」。
+ * skill を追加するときは Python 側 cma_skills.json と本テーブルを両方更新
+ * する (= 同名 skill が登録されたら本テーブルに `attach_memory: false` で
+ * 追加。drift 防止)。
+ */
+export const ACTION_SKILL_INTENT_TABLE: SkillsData = {
+  skills: {
+    '/mail': { attach_memory: false },
+    '/schedule': { attach_memory: false },
+  },
+};
 
 /**
  * 1 reactive event を処理する。返り値は consumer (= `queue` handler) が
@@ -400,6 +427,47 @@ export async function handleChatEvent(
       );
     }
   }
+  // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
+  // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
+  // intent-detector に通して以下を決定:
+  //   - `isActionSkill=true` なら orchestrator に `forceFreshSession=true` を
+  //     渡し既存 thread session 継続を破棄 (Python l.4002-4013 等価)
+  //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
+  //   - intent 種別を user message envelope の <context> に prefix 注入
+  //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
+  // 危険語句 / 過剰 dispatch 防止:
+  //   - intent 判定はあくまで「session 経路 + context prefix 注入」までで、
+  //     ここで /mail や /schedule の skill 自体を invoke することはしない
+  //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
+  //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
+  const intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  const forceFreshSession = intent?.isActionSkill === true;
+  if (intent !== null) {
+    if (intent.source === 'mail_intent') {
+      console.log(
+        `[chat-event] mail intent detected eventKey=${eventKey} command=${intent.command}`,
+      );
+    } else if (intent.source === 'schedule_intent') {
+      console.log(
+        `[chat-event] schedule intent detected eventKey=${eventKey} command=${intent.command}`,
+      );
+    }
+    if (forceFreshSession) {
+      console.log(
+        `[chat-event] continuation discarded for action skill eventKey=${eventKey} ` +
+          `command=${intent.command} source=${intent.source}`,
+      );
+    }
+  }
+  // intent 種別を bodyText の先頭に注釈として注入 (= 既存 envelope への最小
+  // hint。本注釈は agent が intent を考慮した応答を返しやすくするため。
+  // history block より前に挿入し、agent が「今ターンの intent は ...」と
+  // 認識した上で履歴を読めるようにする)。null 時は注入しない (= 旧経路と
+  // bytes 等価)。
+  const intentPrefix = buildIntentPrefix(intent);
+  if (intentPrefix) {
+    bodyText = `${intentPrefix}\n${bodyText}`;
+  }
 
   // ---- 6. orchestrate session ----
   const client = buildAnthropicClient(env);
@@ -442,6 +510,9 @@ export async function handleChatEvent(
           boundMessageId: '',
           callerSessionId: sessionIdRef.current,
         }),
+      // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
+      // false) 起動時は KV thread session lookup/put を bypass。
+      forceFreshSession,
     });
     sessionId = orchestrated.sessionId;
     sessionIdRef.current = sessionId;
@@ -974,6 +1045,21 @@ function mapToPythonCapStopReason(
   }
 }
 
+/**
+ * intent-detector 結果から bodyText 先頭に注入する 1 行 hint を組み立てる
+ * (Issue #186 既知 #4)。
+ */
+export function buildIntentPrefix(intent: ActionSkillIntent | null): string {
+  if (intent === null) return '';
+  if (intent.source === 'slash_command') {
+    const kind = intent.isActionSkill ? 'action_skill' : 'command';
+    return `[intent: ${kind} ${intent.command}]`;
+  }
+  if (!intent.isActionSkill) return '';
+  if (intent.source === 'mail_intent') return `[intent: mail (implicit)]`;
+  if (intent.source === 'schedule_intent') return `[intent: schedule (implicit)]`;
+  return '';
+}
 
 // ---------------------------------------------------------------------------
 // helper: safe wrappers (never throw)
@@ -1316,7 +1402,9 @@ function loadSlashSkillsData(env: Env): SkillsData {
 //                       永続層が必要、Issue #186 follow-up)。Phase 2 では
 //                       status のみ port 済 (= `cost-guard-command.ts`)。
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
-// TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)
+// Done (Issue #186 既知 #4): intent-detector 統合 (= forceFreshSession +
+//   bodyText intent prefix。完全な /mail /schedule skill dispatch 自体は
+//   `_resolve_skill_run` 全体 port の follow-up に温存)。
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
 // ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で
 //    history fetch 結果に未登録 chat_user_id が居るとき CHAT_POST 全 marker
