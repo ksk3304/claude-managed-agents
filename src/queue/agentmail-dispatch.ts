@@ -74,6 +74,7 @@ import {
 } from '../lib/continuation';
 import { extractBody, extractThreadRefs, reChainDepth } from '../lib/email-thread';
 import { parseAssistantText } from '../lib/email-send-marker';
+import { fetchMailThreadMessages } from '../lib/mail-history';
 import { resolveSenderToResources } from '../lib/memory-attach';
 import {
   buildAnthropicClient,
@@ -186,11 +187,48 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     );
     userMessage = buildInitialUserMessage(message, isContinuation);
   } else {
-    // Existing session — use the continuation prompt with empty
-    // history for now (thread-history fetch is a follow-up).
-    userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, [])}`;
+    // Existing session — fetch prior thread messages so the
+    // continuation prompt carries full context into the agent. Mirrors
+    // Python `cma_agentmail_inbound.py:_fetch_thread_messages` (l.2027)
+    // + `build_continuation_prompt` (l.2090).
+    //
+    // Failure mode: `fetchMailThreadMessages` returns `[]` on every
+    // error (no API key / missing inbox / 4xx / 5xx / network). The
+    // continuation flow stays usable with an empty history (= same as
+    // pre-fetch behaviour). We deliberately don't gate the reply on
+    // this fetch — a stuck threads endpoint should never block the
+    // agent from at least responding to the latest inbound.
+    const inboxIdForHistory = extractInboxId(event);
+    const threadId =
+      typeof message.thread_id === 'string' && message.thread_id.length > 0
+        ? message.thread_id
+        : '';
+    let history: AgentMailMessage[] = [];
+    if (inboxIdForHistory && threadId) {
+      try {
+        history = await fetchMailThreadMessages(env, inboxIdForHistory, threadId);
+      } catch (err) {
+        // Defensive: `fetchMailThreadMessages` is documented to swallow
+        // every error, but if a future change ever bubbles one we still
+        // want the dispatcher to proceed with empty history rather than
+        // dropping the inbound entirely.
+        console.warn(
+          `[agentmail-dispatch] mail history fetch threw eventKey=${eventKey} thread_id=${threadId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        history = [];
+      }
+    } else {
+      console.warn(
+        `[agentmail-dispatch] mail history skipped eventKey=${eventKey} reason=${
+          !inboxIdForHistory ? 'no_inbox_id' : 'no_thread_id'
+        }`,
+      );
+    }
+    userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, history)}`;
     console.log(
-      `[agentmail-dispatch] continuing session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey}`,
+      `[agentmail-dispatch] continuing session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey} history=${history.length}`,
     );
   }
 
