@@ -109,10 +109,22 @@ describe('fetchSpaceMemberRoster — happy path', () => {
               member: { name: 'users/100', displayName: 'Alice' },
             },
             {
+              state: 'JOINED',
               member: { name: 'users/200', displayName: 'Bob' },
+            },
+            // Removed / left users can be returned by the API; they must not
+            // be surfaced as current space members.
+            {
+              state: 'NOT_A_MEMBER',
+              member: { name: 'users/250', displayName: 'Removed User' },
+            },
+            {
+              state: 'INVITED',
+              member: { name: 'users/260', displayName: 'Invited User' },
             },
             // displayName 空でも key は登録される (Python l.3214 等価)
             {
+              state: 'JOINED',
               member: { name: 'users/300', displayName: '' },
             },
             // member 欠落 / name 空は drop
@@ -135,6 +147,8 @@ describe('fetchSpaceMemberRoster — happy path', () => {
       expect(result.members.get('users/100')).toBe('Alice');
       expect(result.members.get('users/200')).toBe('Bob');
       expect(result.members.get('users/300')).toBe('');
+      expect(result.members.has('users/250')).toBe(false);
+      expect(result.members.has('users/260')).toBe(false);
       expect(result.members.size).toBe(3);
     }
     // pageSize=200 in URL (Python `_MEMBER_LIST_PAGE_SIZE`)
