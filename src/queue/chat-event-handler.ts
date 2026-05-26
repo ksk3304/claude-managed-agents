@@ -25,7 +25,6 @@
  * 中間版 = **含まない** もの (Cloud Run 完全実装比、follow-up Issue で対応):
  *   - 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
  *   - `/costguard` command の決定論短絡ハンドラ
- *   - SCHEDULE_ACTION marker の scheduler 登録
  *   - placeholder POST (= 「入力中」表示後 reply で書き換え)
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
  *   - intent-detector 統合 (intent ベース dispatch 分岐)
@@ -49,9 +48,11 @@ import {
   parseChatPostMarkerDetailed,
   CHAT_POST_MARKER_REGEX,
 } from '../lib/chat-post-marker';
+import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
 import { readUserMapping } from '../lib/memory-attach';
+import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
   orchestrateChatTurn,
@@ -260,9 +261,20 @@ export async function handleChatEvent(
     threadName,
   );
 
-  // 7c. current space 投稿 (clean 後本文)
-  // 7c-1. internal-state redaction を最終ガード (= safety net)。
-  const scrubbed = scrubInternalStateForChat(chatPostResult.cleanedText, `chat:${sessionId}`);
+  // 7c. SCHEDULE_ACTION markers (Issue #186 #5 follow-up = 実 dispatch)。
+  //     env (CHAT_SA_KEY_JSON + GCP_SCHEDULER_PROJECT + GCP_SCHEDULER_LOCATION)
+  //     が揃っているときだけ activate する (= 既存挙動破壊しない、deploy
+  //     gradual rollout の余地を残す)。失敗は WARN log + 元 cleanedText
+  //     で投稿継続 (failure isolation)。
+  const scheduleResult = await dispatchScheduleActionMarkers(
+    env,
+    eventKey,
+    chatPostResult.cleanedText,
+  );
+
+  // 7d. current space 投稿 (clean 後本文)
+  // 7d-1. internal-state redaction を最終ガード (= safety net)。
+  const scrubbed = scrubInternalStateForChat(scheduleResult.cleanedText, `chat:${sessionId}`);
   if (scrubbed.hits.length > 0) {
     console.warn(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
@@ -516,6 +528,59 @@ function stripMarkerRange(
 }
 
 // ---------------------------------------------------------------------------
+// helper: dispatch SCHEDULE_ACTION markers
+// ---------------------------------------------------------------------------
+
+interface ScheduleDispatchResult {
+  /**
+   * SCHEDULE_ACTION marker dispatch 後の本文。env 未設定 or dispatch
+   * 失敗時は入力 inputText をそのまま返す (= 既存挙動を破壊しない)。
+   * dispatch 成功時は `handleScheduleActionMarker` の `combinedText`
+   * (= prefix + 実行結果集約) で置き換わる。
+   */
+  cleanedText: string;
+}
+
+async function dispatchScheduleActionMarkers(
+  env: Env,
+  eventKey: string,
+  inputText: string,
+): Promise<ScheduleDispatchResult> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  const project = env.GCP_SCHEDULER_PROJECT;
+  const location = env.GCP_SCHEDULER_LOCATION;
+  if (!saKey || !project || !location) {
+    // env 未設定 = SCHEDULE_ACTION dispatch は skip (deploy gradual rollout)。
+    // marker が本文に含まれていても strip せず scrub 層に任せる (= 旧 path 完全互換)。
+    return { cleanedText: inputText };
+  }
+  try {
+    const managerDeps: Parameters<typeof createCloudSchedulerManager>[0] = {
+      saKeyJson: saKey,
+      project,
+      location,
+    };
+    if (env.SCHEDULER_HANDLER_TOPIC_PREFIX) {
+      managerDeps.handlerTopicPrefix = env.SCHEDULER_HANDLER_TOPIC_PREFIX;
+    }
+    const manager = createCloudSchedulerManager(managerDeps);
+    const result = await handleScheduleActionMarker(inputText, manager);
+    if (result.markerCount > 0) {
+      console.log(
+        `[chat-event] SCHEDULE_ACTION dispatched eventKey=${eventKey} markers=${result.markerCount}`,
+      );
+    }
+    return { cleanedText: result.combinedText };
+  } catch (err) {
+    console.warn(
+      `[chat-event] SCHEDULE_ACTION dispatch failed eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // 失敗時は元の cleanedText で投稿継続。
+    return { cleanedText: inputText };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // helper: bot detection + mention strip
 // ---------------------------------------------------------------------------
 
@@ -721,7 +786,6 @@ export async function handleChatQueue(
 //
 // TODO(#186 follow-up): 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
 // TODO(#186 follow-up): /costguard command の決定論短絡ハンドラ
-// TODO(#186 follow-up): SCHEDULE_ACTION marker の scheduler 登録
 // TODO(#186 follow-up): placeholder POST + reply 書き換え (「入力中」表示)
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)

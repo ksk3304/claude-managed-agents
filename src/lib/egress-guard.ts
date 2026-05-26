@@ -46,6 +46,8 @@ export const MAKOTO_BRIDGE_EGRESS_ALLOWLIST: readonly string[] = [
   'api.agentmail.to',
   // Google OAuth — refresh + revoke + SA JWT token exchange.
   'oauth2.googleapis.com',
+  // Cloud Scheduler — bot から CRUD のみ (Issue #186 SCHEDULE_ACTION dispatch)。
+  'cloudscheduler.googleapis.com',
   // Google Drive / Sheets / Calendar / Chat APIs — base + upload subdomain.
   'www.googleapis.com',
   'sheets.googleapis.com',

@@ -77,6 +77,52 @@ vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   };
 });
 
+// SCHEDULE_ACTION dispatch — Cloud Scheduler REST client は本 spec の
+// scope 外 (= cloud-scheduler-client.test.ts で個別に検証する)。ここでは
+// `createCloudSchedulerManager` を mock し、各 manager method 呼出を
+// capture して assert する。throwManager オプションで失敗系も flip 可。
+interface SchedulerMockState {
+  capturedCalls: Array<{ method: string; args: unknown[] }>;
+  /** true なら manager の create_job が throw して dispatch failure 経路を発火させる。 */
+  shouldThrow: boolean;
+}
+const schedulerMock: SchedulerMockState = {
+  capturedCalls: [],
+  shouldThrow: false,
+};
+vi.mock('../src/lib/cloud-scheduler-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/cloud-scheduler-client')>();
+  return {
+    ...actual,
+    createCloudSchedulerManager: (_deps: unknown) => {
+      const record = (method: string) => (...args: unknown[]) => {
+        schedulerMock.capturedCalls.push({ method, args });
+        if (schedulerMock.shouldThrow && method === 'create_job') {
+          throw new Error('mock scheduler create_job failure');
+        }
+        return undefined as unknown;
+      };
+      return {
+        list_jobs: async () => {
+          schedulerMock.capturedCalls.push({ method: 'list_jobs', args: [] });
+          return [];
+        },
+        format_job_list: () => '(empty)',
+        get_job: async (jobId: string) => {
+          schedulerMock.capturedCalls.push({ method: 'get_job', args: [jobId] });
+          return null;
+        },
+        create_job: record('create_job'),
+        pause_job: record('pause_job'),
+        resume_job: record('resume_job'),
+        delete_job: record('delete_job'),
+        run_job_once: record('run_job_once'),
+        update_job: record('update_job'),
+      };
+    },
+  };
+});
+
 // ---------------------------------------------------------------------------
 // Fake Anthropic SDK
 // ---------------------------------------------------------------------------
@@ -250,6 +296,8 @@ async function putMapping(env: Env, email: string, opts: { withSessionLog?: bool
 
 beforeEach(() => {
   chatApiMock.posts.length = 0;
+  schedulerMock.capturedCalls.length = 0;
+  schedulerMock.shouldThrow = false;
   installFakeAnthropic(null);
 });
 
@@ -611,6 +659,111 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('skipped');
     if (result.kind === 'skipped') expect(result.reason).toBe('unknown_sender');
     expect(chatApiMock.posts).toHaveLength(0);
+  });
+
+  it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 設定済 → manager.create_job が呼ばれ "予定登録" 結果が current space に流れる', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+        SCHEDULER_HANDLER_TOPIC_PREFIX: 'cma-scheduler-',
+      } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_sched_1',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '了解しました、登録します。\n' +
+            'SCHEDULE_ACTION:{"action":"create","job_id":"daily-x","cron":"0 10 * * *","handler":"cma_session","payload":{"prompt":"朝のレポート"},"description":"朝レポ"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // manager.create_job が 1 回呼ばれた (get_job が先行する Python l.1119 等価)
+    expect(schedulerMock.capturedCalls.some((c) => c.method === 'create_job')).toBe(true);
+    expect(schedulerMock.capturedCalls.some((c) => c.method === 'get_job')).toBe(true);
+    // current space 投稿に「✅ `daily-x` 登録」が含まれる (Python l.1122 byte 等価)
+    const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
+    expect(post).toBeDefined();
+    expect(post!.text).toContain('登録');
+    expect(post!.text).toContain('daily-x');
+    expect(post!.text).not.toContain('SCHEDULE_ACTION:');
+  });
+
+  it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 未設定 → dispatch skip + 既存 chat 投稿のみ', async () => {
+    const env = buildEnv(); // env 未設定 (= 既存挙動)
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_sched_skip',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '応答です。\n' +
+            'SCHEDULE_ACTION:{"action":"list"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    // manager は呼ばれない
+    expect(schedulerMock.capturedCalls).toHaveLength(0);
+    // current space 投稿はある (= 旧挙動完全互換)。SCHEDULE_ACTION 文字列は本文に残る可能性。
+    expect(chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA')).toBeDefined();
+  });
+
+  it('SCHEDULE_ACTION marker: manager throw → WARN log + 元 cleanedText で投稿継続', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    // 注: handleScheduleActionMarker 内部の execScheduleAction は manager の
+    // throw を **catch して result.combinedText の `❌` メッセージ** に変換する
+    // (Python l.1149-1150 と等価)。したがって chat-event-handler 側の WARN
+    // path (= 全体 throw) を発火させるには、manager 取得自体は成功させつつ
+    // create_job が throw する shape にする → 内部 catch で `❌ \`...\`:
+    // Error: ...` が combinedText に乗る。
+    schedulerMock.shouldThrow = true;
+
+    installFakeAnthropic({
+      sessionId: 'sesn_sched_throw',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '登録します。\n' +
+            'SCHEDULE_ACTION:{"action":"create","job_id":"will-fail","cron":"0 10 * * *","payload":{}}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
+    expect(post).toBeDefined();
+    // failure isolation: 投稿は行われ、❌ メッセージが本文に含まれる。
+    expect(post!.text).toContain('will-fail');
+    expect(post!.text).toContain('❌');
   });
 
   it('session-log: DM mapping ありなら memory create が呼ばれる', async () => {

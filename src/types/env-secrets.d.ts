@@ -96,5 +96,27 @@ declare namespace Cloudflare {
      * Provisioned via `wrangler secret put AGENTMAIL_DEFAULT_INBOX_ID`.
      */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
+    /**
+     * GCP project ID hosting Cloud Scheduler jobs (Issue #186
+     * SCHEDULE_ACTION dispatch)。`cma-bot-mp-20260501` 既定。未設定だと
+     * `chat-event-handler.ts` 側で SCHEDULE_ACTION marker dispatch を
+     * **skip** する (= 既存挙動を破壊せず、env 設定で activate)。
+     *
+     * Provisioned via `wrangler secret put GCP_SCHEDULER_PROJECT` or
+     * declared in `wrangler.jsonc` vars.
+     */
+    GCP_SCHEDULER_PROJECT?: string;
+    /**
+     * Cloud Scheduler ロケーション (= GCP region)。`asia-northeast1`
+     * 既定。未設定だと SCHEDULE_ACTION dispatch を skip する。
+     */
+    GCP_SCHEDULER_LOCATION?: string;
+    /**
+     * handler 名 → Pub/Sub topic 名 の組み立て prefix。`cma-scheduler-`
+     * 既定。`<prefix><handler>` で topic 名を生成する (= Cloud Run 側の
+     * 単一 topic `cma-scheduled-jobs` モデルとは別に、Cloudflare 側は
+     * handler 別 topic モデルで分けて運用する)。
+     */
+    SCHEDULER_HANDLER_TOPIC_PREFIX?: string;
   }
 }
