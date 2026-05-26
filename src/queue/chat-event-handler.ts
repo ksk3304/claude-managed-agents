@@ -45,6 +45,7 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import { buildMailSendSkills } from '../lib/attached-skills';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
@@ -506,6 +507,13 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
+  const attachedSkills =
+    intent?.command === '/mail' ? buildMailSendSkills(env) : [];
+  if (intent?.command === '/mail' && attachedSkills.length === 0) {
+    console.warn(
+      `[chat-event] mail intent without MAIL_SEND_SKILL_ID eventKey=${eventKey}`,
+    );
+  }
 
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
@@ -547,6 +555,7 @@ export async function handleChatEvent(
               },
             }
           : {}),
+        ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,
