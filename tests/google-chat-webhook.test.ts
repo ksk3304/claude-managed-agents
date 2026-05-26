@@ -2,50 +2,27 @@
  * Unit tests for `src/webhooks/google-chat.ts` — Phase A ingress
  * (JWT verify + dedupe claim + Queue enqueue).
  *
- * Test fixture strategy:
- *   - RSA-PSS / RSASSA-PKCS1-v1_5 RSA key pair を test 内で動的生成 (= jose
- *     の `generateKeyPair('RS256')`)。public key を X.509 PEM
- *     (jose の `exportSPKI` だと SPKI なので、Google が出す X.509
- *     certificate 形式に変換する代わりに、本 test では `importSPKI` を
- *     使う path に handler を切り替えず、handler の `importX509` を
- *     monkey-patch せずに、`exportSPKI` の結果を「`-----BEGIN CERTIFICATE-----`
- *     と書かれた偽 PEM」として fetch mock から返す ─ jose の
- *     `importX509` は X.509 DER parser を内蔵しているため、SPKI を
- *     CERTIFICATE と詐称しても失敗する)。
- *
- *     代わりに、本 test では module-level cache を直接書き換える
- *     test-only helper を `_resetPublicKeyCacheForTesting` 経由で
- *     使うのではなく、jose の private/public key を生成してから
- *     **生 CryptoKey を cache に直接突っ込む** test 専用 entrypoint を
- *     使えるようにする方が薄い。
- *
- *     ここでは fetch mock が return する body の中に "PEM" として
- *     `exportSPKI` の結果 (= BEGIN PUBLIC KEY ... PEM) を入れ、handler
- *     側で本来 `importX509` で読むはずの所を回避するために、
- *     `vi.mock('jose', ...)` で `importX509` を `importSPKI` に
- *     差し替える。これにより handler 本体の logic
- *     (= cache / kid 引き / claim verify) は本物のまま検証できる。
+ * Test fixture strategy (2026-05-26 update):
+ *   - 本番 src は `importJWK` + JWKS endpoint (`oauth2/v3/certs`) を使う
+ *     ので、test fixture は JWK Set 形式の response を返す。
+ *   - jose の `generateKeyPair('RS256', { extractable: true })` で RSA key
+ *     pair を生成し、`exportJWK(publicKey)` で JWK を取り出し、
+ *     `{kid, alg, use}` を付与して fetch mock の response body
+ *     `{keys: [...]}` に埋める。
+ *   - issuer は本番が 3 候補 (`https://accounts.google.com` /
+ *     `accounts.google.com` / `chat@system.gserviceaccount.com`) を accept
+ *     するので、test は `'accounts.google.com'` (= 標準 OIDC) を既定で
+ *     使う。issuer mismatch test は 3 候補以外 (`'attacker@example.com'`)
+ *     を使って拒否されることを確認する。
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   SignJWT,
   generateKeyPair,
-  exportSPKI,
-  importSPKI,
+  exportJWK,
+  type JWK,
 } from 'jose';
-
-// `importX509` を `importSPKI` に差し替える。本来 Google が返す PEM は
-// X.509 certificate だが、テスト fixture は SPKI public key で十分 (jose の
-// JWT verify は最終的に CryptoKey を見るだけで、cert chain validation は
-// 行わない)。
-vi.mock('jose', async (importOriginal) => {
-  const orig = await importOriginal<typeof import('jose')>();
-  return {
-    ...orig,
-    importX509: orig.importSPKI,
-  };
-});
 
 import {
   handleGoogleChatWebhook,
@@ -57,27 +34,29 @@ import {
 import { makeFakeQueue, makeMakotoDb } from './makoto-helpers';
 
 const PROJECT_NUMBER = '192588613210';
-const ISSUER = 'chat@system.gserviceaccount.com';
-const X509_URL =
-  'https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com';
+const ISSUER = 'accounts.google.com';
+const JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
 
 interface KeyFixture {
   kid: string;
   privateKey: CryptoKey;
   publicKey: CryptoKey;
-  /** "PEM" body that the fetch mock returns under this kid. */
-  pem: string;
+  /** JWK object that the fetch mock returns under this kid. */
+  jwk: JWK & { kid: string; alg: string; use: string };
 }
 
 async function makeKeyFixture(kid = 'k1'): Promise<KeyFixture> {
   const { privateKey, publicKey } = await generateKeyPair('RS256', {
     extractable: true,
   });
-  const pem = await exportSPKI(publicKey);
-  // Sanity: the SPKI export must round-trip through importSPKI to confirm
-  // the in-memory fixture is valid.
-  await importSPKI(pem, 'RS256');
-  return { kid, privateKey, publicKey, pem };
+  const baseJwk = await exportJWK(publicKey);
+  const jwk = {
+    ...baseJwk,
+    kid,
+    alg: 'RS256',
+    use: 'sig',
+  } as JWK & { kid: string; alg: string; use: string };
+  return { kid, privateKey, publicKey, jwk };
 }
 
 interface SignedJwtOptions {
@@ -124,7 +103,7 @@ function makePublicKeyFetchMock(
           ? input.toString()
           : (input as Request).url;
     calls.push(url);
-    if (url !== X509_URL) {
+    if (url !== JWKS_URL) {
       throw new Error(`unexpected fetch url=${url}`);
     }
     if (opts.status && opts.status >= 400) {
@@ -133,9 +112,8 @@ function makePublicKeyFetchMock(
     if (opts.body !== undefined) {
       return new Response(opts.body, { status: 200 });
     }
-    const dict: Record<string, string> = {};
-    for (const f of fixtures) dict[f.kid] = f.pem;
-    return new Response(JSON.stringify(dict), {
+    const jwks = { keys: fixtures.map((f) => f.jwk) };
+    return new Response(JSON.stringify(jwks), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -313,6 +291,9 @@ describe('google-chat webhook handler', () => {
     const fixture = await makeKeyFixture('k1');
     globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
     const env = envWith();
+    // attacker@example.com は 3 候補 (https://accounts.google.com /
+    // accounts.google.com / chat@system.gserviceaccount.com) いずれにも
+    // 該当しないので拒否される。
     const jwt = await signJwt(fixture, { iss: 'attacker@example.com' });
     const body = JSON.stringify(makeMessageEvent('spaces/A/messages/M1'));
     const resp = await handleGoogleChatWebhook(
