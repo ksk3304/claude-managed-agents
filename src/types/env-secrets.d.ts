@@ -100,6 +100,17 @@ declare namespace Cloudflare {
      */
     GCHAT_BOT_USER_NAME?: string;
     /**
+     * `/costguard` 運用者コマンドの mutation 系 (enable / disable / pause /
+     * set / etc.) を実行できる admin email の csv (= Cloud Run 側
+     * `COST_GUARD_ADMIN_EMAILS` 等価、Python `cost_guard/command.py:l.33`)。
+     * 未設定 = fail-closed (status 閲覧のみ可、mutation 全拒否)。
+     *
+     * Used by `src/lib/cost-guard-command.ts:handleCostGuardCommand`.
+     *
+     * Provisioned via `wrangler secret put COST_GUARD_ADMIN_EMAILS`.
+     */
+    COST_GUARD_ADMIN_EMAILS?: string;
+    /**
      * AgentMail inbox id used by the reactive Chat bot for outbound
      * EMAIL_SEND markers. Cloud Run の `cma-bot` inbox 等価 — 1 つの bot
      * 全体で 1 inbox を共有。未設定だと EMAIL_SEND marker は warn skip

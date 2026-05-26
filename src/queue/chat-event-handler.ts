@@ -24,7 +24,10 @@
  *
  * 中間版 = **含まない** もの (Cloud Run 完全実装比、follow-up Issue で対応):
  *   - 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
- *   - `/costguard` command の決定論短絡ハンドラ
+ *   - `/costguard` mutation 系 (status 以外、Phase 2 では `cost-guard-command.ts`
+ *     で status のみ port 済 = LLM 経由ゼロで budget 状態を返す。enable /
+ *     disable / pause / set / confirm / cancel は Worker 側 Firestore overlay
+ *     永続層の未実装ゆえ 503 拒否)。
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
  *   - intent-detector 統合 (intent ベース dispatch 分岐)
  *   - Cold continuation の SignalB 経由 thread-self-scan
@@ -69,6 +72,10 @@ import {
 } from '../lib/space-roster';
 import { applyChatPostGateToText } from '../lib/speaker-gate';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
+import {
+  parseCostGuardCommand,
+  handleCostGuardCommand,
+} from '../lib/cost-guard-command';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import {
   resolveCapRecoveryConfig,
@@ -240,16 +247,24 @@ export async function handleChatEvent(
     );
   }
 
-  // ---- 5a. slash-skill 決定論短絡 (#186 既知 #2 hook + /help) ----
-  // Cloud Run `_handle_event` の以下と等価:
-  //   - l.3949-3956 `/costguard` pre-branch (継続セッション・添付処理・LLM より前)
-  //   - l.4033-4035 `/help` 即返信 (skills 一覧をユーザーに返す)
-  //
-  // bodyText 先頭が `/<cmd>` のとき、agent を呼ばずに決定論で返答する。
-  // skillsData は本中間版では空 (= cma_skills.json TS port が別 follow-up
-  // 待ち)。空でも `/help` は「スキルが登録されていません。」を返せる ので
-  // bot 全体は落ちない (= follow-up で skillsData 配線時に自然に拡張)。
-  // `/costguard` handler 未配線時は fallthrough = 旧経路 (agent) へ。
+  // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
+  const cgCommand = parseCostGuardCommand(bodyText);
+  if (cgCommand) {
+    const cgText = await handleCostGuardCommand(
+      env,
+      cgCommand,
+      {
+        senderEmail,
+        guardDeps: { kv: env.MAKOTO_KV },
+      },
+    );
+    await safePost(env, spaceName, cgText, threadName, eventKey);
+    await safeCommit(env, eventKey, claim);
+    console.log(
+      `[chat-event] /costguard handled eventKey=${eventKey} sub=${cgCommand.subcommand}`,
+    );
+    return { kind: 'committed' };
+  }
   if (bodyText.startsWith('/')) {
     const slashSkillsData: SkillsData = loadSlashSkillsData(env);
     const slashHandlers: SlashSkillHandlers = {};
@@ -265,10 +280,6 @@ export async function handleChatEvent(
       await safeCommit(env, eventKey, claim);
       return { kind: 'committed' };
     }
-    // 'run' / 'fallthrough' はどちらも agent 経路に流す (orchestrator に委譲)。
-    // 'run' のとき `slashOutcome.prompt` / title は本中間版では未利用
-    // (= 既存 orchestrator が user_mapping / persona / tools spec から組立、
-    // skill 個別 system_prompt 上書き経路は follow-up で配線)。ログだけ残す。
     if (slashOutcome.kind === 'run') {
       console.log(
         `[chat-event] slash run eventKey=${eventKey} command=${slashOutcome.command} ` +
@@ -1299,8 +1310,11 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // ---------------------------------------------------------------------------
 //
 // TODO(#186 follow-up): 画像 / PDF / Office 添付処理 (= `_build_image_attachments`)
-// TODO(#186 follow-up): /costguard 本体 handler 配線 (cost-guard.ts handle 関数 + slashHandlers.costguard 注入)
 // TODO(#186 follow-up): cma_skills.json TS port + loadSlashSkillsData env 配線
+// TODO(#186 follow-up): /costguard mutation 系 (enable / disable / pause / set
+//                       / confirm / cancel) port (Worker 側 Firestore overlay
+//                       永続層が必要、Issue #186 follow-up)。Phase 2 では
+//                       status のみ port 済 (= `cost-guard-command.ts`)。
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // TODO(#186 follow-up): intent-detector 統合 (intent ベース dispatch 分岐)
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
