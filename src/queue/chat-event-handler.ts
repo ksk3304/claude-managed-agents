@@ -52,6 +52,7 @@ import {
   parseChatPostMarkerDetailed,
   CHAT_POST_MARKER_REGEX,
 } from '../lib/chat-post-marker';
+import { resolveChatAlias } from '../lib/chat-alias-resolver';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import { parseAssistantText } from '../lib/email-send-marker';
@@ -507,15 +508,20 @@ async function dispatchChatPostMarkers(
       continue;
     }
     const m = parsed.marker!;
-    // 中間版: alias 解決は省略、spaces/... 形式のみ受け付ける。
-    let targetSpace = m.spaceAlias;
-    const saKey = env.CHAT_SA_KEY_JSON;
-    if (!targetSpace.startsWith('spaces/')) {
+    // alias 解決: `spaces/...` 形式はそのまま通し、alias は台帳から resolve。
+    // 未登録 alias は throw → 従来の skip 動作と同等扱い (= marker strip + continue)。
+    let targetSpace: string;
+    try {
+      targetSpace = resolveChatAlias(m.spaceAlias);
+    } catch (err) {
       console.warn(
-        `[chat-event] CHAT_POST skip non-resource alias eventKey=${eventKey} alias=${JSON.stringify(m.spaceAlias)} ` +
-          `— TODO(#186 follow-up): alias resolver port`,
+        `[chat-event] CHAT_POST alias resolve fail eventKey=${eventKey} alias=${JSON.stringify(m.spaceAlias)}: ${err instanceof Error ? err.message : String(err)}`,
       );
-    } else if (!saKey) {
+      working = stripMarkerRange(working, m.range);
+      continue;
+    }
+    const saKey = env.CHAT_SA_KEY_JSON;
+    if (!saKey) {
       console.warn(
         `[chat-event] CHAT_POST skip eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
       );
