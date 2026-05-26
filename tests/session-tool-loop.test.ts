@@ -8,9 +8,12 @@
  *     result is posted back as `user.custom_tool_result`
  *   - terminal `session.status_idle` / `session.status_terminated` end the loop
  *   - tool-call soft cap breaks the loop with the cap label
+ *   - watchdog: built-in `agent.tool_use` cap + wall-clock cap send
+ *     `user.interrupt` and surface `stopReason` (Python
+ *     `cma_lib.py:_stream_until_settled` parity, Issue #186 H)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   sendAndStreamWithToolDispatch,
   type ToolDispatcher,
@@ -220,5 +223,93 @@ describe('sendAndStreamWithToolDispatch', () => {
     });
     expect(r.emailSendMarkers).toHaveLength(1);
     expect(r.emailSendMarkers[0]!.to).toBe('x@y');
+  });
+
+  // ============================================================
+  // Watchdog parity with Python `cma_lib.py:_stream_until_settled`
+  // (Issue ksk3304/makoto-prime#186 H). Three cases:
+  //   1. built-in tool cap → interrupt + stopReason='tool_call_cap'
+  //   2. wall-clock watchdog → interrupt + stopReason='session_watchdog'
+  //   3. normal settle → stopReason parsed from session.status_idle
+  // ============================================================
+
+  it('built-in agent.tool_use cap sends user.interrupt and returns stopReason=tool_call_cap', async () => {
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    // 4 consecutive built-in tool_use events; cap at 2 → after the 3rd
+    // observation the cap is exceeded (count=3 > max=2).
+    const builtins = Array.from({ length: 4 }, () => ({ type: 'agent.tool_use', name: 'bash' }));
+    const client = makeFakeClient({
+      events: [...builtins, { type: 'session.status_idle' }],
+      onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_tc',
+      userMessage: 'go',
+      toolDispatcher: dispatcher,
+      maxBuiltinToolCalls: 2,
+    });
+    expect(r.stopReason).toBe('tool_call_cap');
+    expect(r.terminalEventType).toBe('limit.builtin_tool_calls');
+    // Two sends expected: 1) initial user.message, 2) user.interrupt.
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.events[0]!.type).toBe('user.interrupt');
+  });
+
+  it('session watchdog sends user.interrupt and returns stopReason=session_watchdog when wall-clock cap is exceeded', async () => {
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    // Force Date.now() to advance past the watchdog on the very first
+    // per-event check. First call captures start, subsequent calls
+    // return start+99s — far above the 1s cap below.
+    let callCount = 0;
+    const base = 1_000_000;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      callCount++;
+      return callCount <= 1 ? base : base + 99_000;
+    });
+    try {
+      const client = makeFakeClient({
+        events: [
+          { type: 'agent.message.text_delta', text: 'partial' },
+          { type: 'session.status_idle' }, // would settle normally if watchdog didn't trip
+        ],
+        onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+      });
+      const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+      const r = await sendAndStreamWithToolDispatch(client, {
+        sessionId: 'sesn_wd',
+        userMessage: 'go',
+        toolDispatcher: dispatcher,
+        sessionWatchdogSec: 1,
+      });
+      expect(r.stopReason).toBe('session_watchdog');
+      expect(r.terminalEventType).toBe('limit.session_watchdog');
+      // Two sends: initial user.message + user.interrupt.
+      expect(sent).toHaveLength(2);
+      expect(sent[1]!.events[0]!.type).toBe('user.interrupt');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('normal settle parses stopReason from session.status_idle (end_turn)', async () => {
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'done.' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_ok',
+      userMessage: 'hi',
+      toolDispatcher: dispatcher,
+    });
+    expect(r.assistantText).toBe('done.');
+    expect(r.terminalEventType).toBe('session.status_idle');
+    expect(r.stopReason).toBe('end_turn');
   });
 });

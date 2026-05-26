@@ -99,6 +99,20 @@ export interface SendAndStreamResult {
   emailSendMarkers: EmailSendMarker[];
   /** Last terminal event type observed (`session.status_idle`/`session.status_terminated`). */
   terminalEventType?: string;
+  /**
+   * Reason the loop ended, mirroring Python `cma_lib.py:_stream_until_settled`'s
+   * `stop_reason` return value. Values:
+   *   - `end_turn` / `requires_action` / `max_tokens` … from
+   *     `session.status_idle` events.
+   *   - `tool_call_cap` … built-in tool call cap was hit and the bridge
+   *     sent `user.interrupt` to ask the agent to wind down.
+   *   - `session_watchdog` … wall-clock cap was hit and the bridge
+   *     sent `user.interrupt`.
+   *   - `stream_terminated` … `session.status_terminated` was seen.
+   *   - undefined … loop exited without observing a stop signal (e.g.
+   *     external `timeoutMs` AbortError thrown by `Promise.race`).
+   */
+  stopReason?: string;
 }
 
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
@@ -233,9 +247,35 @@ export interface SendAndStreamWithToolDispatchInput {
    * Queue consumer worker until the lease expires).
    */
   maxToolCalls?: number;
+  /**
+   * Soft cap on built-in tool calls (`agent.tool_use` — bash /
+   * web_search / code_execution / etc that the Anthropic runtime
+   * executes server-side). Mirrors Python's `max_tool_calls`
+   * (`cma_lib.py:2599-2601`). When exceeded the bridge sends
+   * `user.interrupt` and returns with `stopReason='tool_call_cap'`,
+   * so a runaway built-in tool can't pin the Worker invocation.
+   * Defaults to 15 (Python `_MAX_TOOL_CALLS_DEFAULT`).
+   */
+  maxBuiltinToolCalls?: number;
+  /**
+   * Wall-clock cap measured from the moment the stream starts draining
+   * (= `events.stream` opened). On expiry the bridge sends
+   * `user.interrupt` and returns with `stopReason='session_watchdog'`.
+   * Mirrors Python `session_watchdog_sec` (`cma_lib.py:2602`,
+   * default 600). Pass `0` to disable. Defaults to 600 (10 min).
+   *
+   * Distinct from `timeoutMs`: `timeoutMs` aborts the entire
+   * `Promise.race` with a throw, leaving the SDK stream half-open and
+   * the agent thinking. `sessionWatchdogSec` sends a proper
+   * interrupt so the agent can wind down gracefully and the loop
+   * returns partial results instead of throwing.
+   */
+  sessionWatchdogSec?: number;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;
+const DEFAULT_MAX_BUILTIN_TOOL_CALLS = 15;
+const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
  * Same shape as `sendAndStream` but with self-dispatch of
@@ -264,6 +304,10 @@ export async function sendAndStreamWithToolDispatch(
 ): Promise<SendAndStreamResult> {
   const timeoutMs = input.timeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS;
   const maxToolCalls = input.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
+  const maxBuiltinToolCalls =
+    input.maxBuiltinToolCalls ?? DEFAULT_MAX_BUILTIN_TOOL_CALLS;
+  const sessionWatchdogSec =
+    input.sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC;
 
   // Push the inbound user.message first. Identical wrapping to
   // `sendAndStream` (typed-block array with single text block).
@@ -283,10 +327,53 @@ export async function sendAndStreamWithToolDispatch(
 
   let assistantText = '';
   let terminalEventType: string | undefined;
+  let stopReason: string | undefined;
   let toolCalls = 0;
+  let builtinToolCalls = 0;
+  const startedAtMs = Date.now();
+
+  /**
+   * Fire `user.interrupt` so the agent stops generating. Mirrors the
+   * Python `_stream_until_settled` interrupt paths
+   * (`cma_lib.py:2717-2725` / `2744-2749` / `2891-2897`). Swallow any
+   * send error — by the time we're interrupting we've already decided
+   * to abandon the turn; logging is enough.
+   */
+  const sendInterrupt = async (reason: string): Promise<void> => {
+    try {
+      await client.beta.sessions.events.send(input.sessionId, {
+        events: [{ type: 'user.interrupt' }],
+        betas: [ANTHROPIC_BETA],
+      } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+    } catch (err) {
+      console.warn(
+        `[session] user.interrupt send failed (reason=${reason}) sessionId=${input.sessionId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
 
   const drain = (async () => {
     for await (const ev of stream as unknown as AsyncIterable<Record<string, unknown>>) {
+      // ---- session watchdog (時間 cap) ----
+      // Per-event check mirrors Python `cma_lib.py:2708-2728`. The SDK
+      // stream won't preempt mid-event, so a fully deadlocked stream
+      // (no event ever arrives) isn't covered here — `timeoutMs`
+      // (Promise.race) is the second line of defense for that case.
+      if (sessionWatchdogSec > 0) {
+        const elapsedSec = (Date.now() - startedAtMs) / 1000;
+        if (elapsedSec > sessionWatchdogSec) {
+          console.warn(
+            `[session] session_watchdog reached (elapsed=${elapsedSec.toFixed(1)}s, max=${sessionWatchdogSec}s); sending interrupt`,
+          );
+          await sendInterrupt('session_watchdog');
+          stopReason = 'session_watchdog';
+          terminalEventType = 'limit.session_watchdog';
+          break;
+        }
+      }
+
       const evType = typeof ev.type === 'string' ? ev.type : '';
 
       // 1. text-bearing events — accumulate into assistantText.
@@ -317,13 +404,36 @@ export async function sendAndStreamWithToolDispatch(
       }
       if (text) assistantText += text;
 
-      // 2. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時
+      // 2a. built-in tool use — bash / web_search / code_execution. The
+      // Anthropic runtime executes these server-side; we only count and
+      // interrupt on cap (Python `cma_lib.py:2735-2752`). A runaway
+      // built-in tool (e.g. web_search infinite chain) is the
+      // motivating case for this guard.
+      if (evType === 'agent.tool_use') {
+        builtinToolCalls += 1;
+        if (builtinToolCalls > maxBuiltinToolCalls) {
+          console.warn(
+            `[session] tool_call_cap reached (count=${builtinToolCalls}, max=${maxBuiltinToolCalls}); sending interrupt`,
+          );
+          await sendInterrupt('tool_call_cap');
+          stopReason = 'tool_call_cap';
+          terminalEventType = 'limit.builtin_tool_calls';
+          break;
+        }
+        continue;
+      }
+
+      // 2b. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時
       if (evType === 'agent.custom_tool_use') {
         toolCalls += 1;
         if (toolCalls > maxToolCalls) {
           console.warn(
             `[session] custom_tool_use cap reached (${maxToolCalls}); breaking event loop`,
           );
+          // Custom tool cap also interrupts so the agent doesn't keep
+          // streaming text we'd just discard.
+          await sendInterrupt('custom_tool_call_cap');
+          stopReason = 'custom_tool_call_cap';
           terminalEventType = 'limit.custom_tool_calls';
           break;
         }
@@ -373,6 +483,7 @@ export async function sendAndStreamWithToolDispatch(
               err instanceof Error ? err.message : String(err)
             }`,
           );
+          stopReason = 'events_send_failed';
           terminalEventType = 'error.events_send';
           break;
         }
@@ -380,8 +491,23 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       // 3. terminal events.
-      if (evType === 'session.status_idle' || evType === 'session.status_terminated') {
+      if (evType === 'session.status_idle') {
         terminalEventType = evType;
+        // Python `_stop_reason_type(event)` reads `event.stop_reason.type`.
+        // The SDK exposes it on the event as either a nested object
+        // ({type:'end_turn'}) or a bare string depending on shape.
+        const sr = (ev as { stop_reason?: unknown }).stop_reason;
+        if (typeof sr === 'string' && sr.length > 0) {
+          stopReason = sr;
+        } else if (sr && typeof sr === 'object') {
+          const t = pickString(sr as Record<string, unknown>, 'type');
+          if (t) stopReason = t;
+        }
+        break;
+      }
+      if (evType === 'session.status_terminated') {
+        terminalEventType = evType;
+        stopReason = 'stream_terminated';
         break;
       }
     }
@@ -401,6 +527,7 @@ export async function sendAndStreamWithToolDispatch(
     assistantText,
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
+    stopReason,
   };
 }
 
