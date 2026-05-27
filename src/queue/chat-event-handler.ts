@@ -1454,28 +1454,31 @@ async function safeDeletePlaceholder(
 }
 
 function canFetchThreadHistory(env: Env): boolean {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length > 0 && env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      `[chat-event] history user OAuth incomplete; service-account fallback available missing=${missing.join(',')}`,
+    );
+  }
   return Boolean(
-    (env.GCHAT_OAUTH_REFRESH_TOKEN_SEED &&
-      env.GCHAT_OAUTH_CLIENT_ID &&
-      env.GCHAT_OAUTH_CLIENT_SECRET &&
-      env.OAUTH_VAULT_KEY) ||
+    missing.length === 0 ||
       env.CHAT_SA_KEY_JSON,
   );
 }
 
 async function resolveThreadHistoryDeps(env: Env): Promise<ChatHistoryDeps> {
-  if (
-    env.GCHAT_OAUTH_REFRESH_TOKEN_SEED &&
-    env.GCHAT_OAUTH_CLIENT_ID &&
-    env.GCHAT_OAUTH_CLIENT_SECRET &&
-    env.OAUTH_VAULT_KEY
-  ) {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length === 0) {
+    const vaultKeyB64 = env.OAUTH_VAULT_KEY!;
+    const clientId = env.GCHAT_OAUTH_CLIENT_ID!;
+    const clientSecret = env.GCHAT_OAUTH_CLIENT_SECRET!;
+    const refreshTokenSeed = env.GCHAT_OAUTH_REFRESH_TOKEN_SEED!;
     const token = await getChatReadonlyAccessToken({
       kv: env.MAKOTO_KV,
-      vaultKeyB64: env.OAUTH_VAULT_KEY,
-      clientId: env.GCHAT_OAUTH_CLIENT_ID,
-      clientSecret: env.GCHAT_OAUTH_CLIENT_SECRET,
-      refreshTokenSeed: env.GCHAT_OAUTH_REFRESH_TOKEN_SEED,
+      vaultKeyB64,
+      clientId,
+      clientSecret,
+      refreshTokenSeed,
     });
     console.log(
       `[chat-event] history oauth token resolved source=${token.from_cache ? 'cache' : 'refresh'}`,
@@ -1485,12 +1488,21 @@ async function resolveThreadHistoryDeps(env: Env): Promise<ChatHistoryDeps> {
 
   if (env.CHAT_SA_KEY_JSON) {
     console.warn(
-      '[chat-event] history fetch using service-account fallback; user OAuth secrets incomplete',
+      `[chat-event] history fetch using service-account fallback; user OAuth secrets incomplete missing=${missing.join(',')}`,
     );
     return { saKeyJson: env.CHAT_SA_KEY_JSON };
   }
 
   throw new Error('thread history fetch is not configured');
+}
+
+function missingChatHistoryOAuthSecrets(env: Env): string[] {
+  const missing: string[] = [];
+  if (!env.GCHAT_OAUTH_REFRESH_TOKEN_SEED) missing.push('GCHAT_OAUTH_REFRESH_TOKEN_SEED');
+  if (!env.GCHAT_OAUTH_CLIENT_ID) missing.push('GCHAT_OAUTH_CLIENT_ID');
+  if (!env.GCHAT_OAUTH_CLIENT_SECRET) missing.push('GCHAT_OAUTH_CLIENT_SECRET');
+  if (!env.OAUTH_VAULT_KEY) missing.push('OAUTH_VAULT_KEY');
+  return missing;
 }
 
 async function safeCommit(
