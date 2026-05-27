@@ -34,6 +34,7 @@ import { pruneExpiredDedupe } from "./lib/dedupe";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import { buildAnthropicClient } from "./lib/session";
+import { recordRuntimeEvent } from "./lib/cma-observability";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -312,6 +313,20 @@ async function handleIssue202ChatObserve(
     return Response.json({ error: "queue send failed" }, { status: 500 });
   }
 
+  await recordRuntimeEvent({
+    db: env.DB,
+    ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+    maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+    eventKey,
+    messageId: messageName,
+    eventType: "issue_202_debug_enqueued",
+    source: "http-ingress",
+    detail: {
+      run_id: runId,
+      space_name_hash_input: spaceName,
+      thread_name_hash_input: threadName,
+    },
+  });
   console.log(`[issue-202-debug] enqueued eventKey=${eventKey}`);
   return Response.json({ ok: true, state: claim.state, eventKey, messageName });
 }

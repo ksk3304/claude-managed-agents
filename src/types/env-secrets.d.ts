@@ -22,6 +22,8 @@ declare namespace Cloudflare {
      * observability proof. Unset in normal operation; route returns 404.
      */
     MAKOTO_DEBUG_TOKEN?: string;
+    CMA_RUNTIME_EVENT_TTL_DAYS?: string;
+    CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS?: string;
     ENVIRONMENT_ID: string;
     OAUTH_VAULT_KEY: string;
     /**

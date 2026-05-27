@@ -99,6 +99,7 @@ import {
   orchestrateChatTurn,
   OrchestratorFailure,
 } from '../lib/session-orchestrator';
+import { recordRuntimeEvent } from '../lib/cma-observability';
 import {
   appendSessionLogMemory,
   isSharedSpace,
@@ -179,6 +180,20 @@ export async function handleChatEvent(
   void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
 
   const { eventKey, claim, payload } = body;
+  await recordRuntimeEvent({
+    db: env.DB,
+    ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+    maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+    eventKey,
+    messageId: payload.message?.name ?? null,
+    eventType: 'chat_event_consume_start',
+    source: 'queue-consumer',
+    detail: {
+      payload_type: payload.type,
+      space_type: payload.space?.type ?? null,
+      has_message: Boolean(payload.message),
+    },
+  });
 
   // ---- 1. claim 維持確認 ----
   const stillOwner = await confirmOwner(env.DB, eventKey, claim.owner, claim.version);
@@ -588,6 +603,23 @@ export async function handleChatEvent(
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
+      await recordRuntimeEvent({
+        db: env.DB,
+        ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+        maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+        eventKey,
+        sessionId,
+        messageId: message.name ?? null,
+        userSlug: userMapping.user_slug,
+        eventType: 'chat_event_session_completed',
+        source: 'queue-consumer',
+        detail: {
+          assistant_chars: assistantText.length,
+          terminal_event_type: orchestrated.terminalEventType ?? null,
+          stop_reason: orchestrated.stopReason ?? null,
+          is_new_session: orchestrated.isNewSession,
+        },
+      });
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
       // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。

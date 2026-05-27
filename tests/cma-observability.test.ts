@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   auditEnabled,
   recordSessionBind,
+  recordRuntimeEvent,
   redactForAudit,
   savePayloadAudit,
   sessionKeyHash,
@@ -63,6 +64,8 @@ describe('cma-observability', () => {
     expect(rows[0]!.session_id).toBe('sesn_1');
     expect(JSON.stringify(rows[0])).not.toContain('user@example.com');
     expect(JSON.stringify(rows[0])).not.toContain('spaces/AAA/threads/BBB');
+    const runtimeRows = [...db._tables.cma_worker_runtime_events.values()];
+    expect(runtimeRows.some((r) => r.event_type === 'cma_session_bind')).toBe(true);
     log.mockRestore();
   });
 
@@ -104,6 +107,35 @@ describe('cma-observability', () => {
     expect(rows[0]!.payload_json).toContain('[REDACTED_EMAIL]');
     expect(rows[0]!.payload_json).toContain('[REDACTED_TOKEN]');
     expect(rows[0]!.payload_json).not.toContain('user@example.com');
+    const runtimeRows = [...db._tables.cma_worker_runtime_events.values()];
+    expect(runtimeRows.some((r) => r.event_type === 'cma_payload_audit_saved')).toBe(true);
+    log.mockRestore();
+  });
+
+  it('records redacted runtime events for later Cloudflare-side reads', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const db = makeMakotoDb();
+    expect(
+      await recordRuntimeEvent({
+        db,
+        eventKey: 'chat:event:1',
+        sessionId: 'sesn_1',
+        messageId: 'spaces/AAA/messages/msg_1',
+        userSlug: 'k-seto',
+        eventType: 'history_fetch_failed',
+        level: 'WARN',
+        source: 'chat-history',
+        detail: {
+          error: '403 user@example.com spaces/AAA/threads/BBB sk-ant-abcdefghijklmnop',
+        },
+      }),
+    ).toBe(true);
+    const rows = [...db._tables.cma_worker_runtime_events.values()];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.event_type).toBe('history_fetch_failed');
+    expect(rows[0]!.detail_json).toContain('[REDACTED_EMAIL]');
+    expect(rows[0]!.detail_json).toContain('[REDACTED_TOKEN]');
+    expect(rows[0]!.detail_json).not.toContain('user@example.com');
     log.mockRestore();
   });
 });

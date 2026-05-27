@@ -8,9 +8,12 @@
 
 export const SESSION_BIND_TABLE = 'cma_session_binds';
 export const PAYLOAD_AUDIT_TABLE = 'cma_session_payload_audit';
+export const RUNTIME_EVENTS_TABLE = 'cma_worker_runtime_events';
 
 const DEFAULT_AUDIT_TTL_DAYS = 7;
+const DEFAULT_RUNTIME_EVENT_TTL_DAYS = 14;
 const DEFAULT_MAX_PAYLOAD_CHARS = 12_000;
+const DEFAULT_MAX_RUNTIME_DETAIL_CHARS = 6_000;
 
 const TOKEN_LIKE_RE =
   /(sk-ant-[A-Za-z0-9_-]{16,}|ya29\.[A-Za-z0-9_-]{16,}|whsec_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{16,}|Bearer\s+[A-Za-z0-9._~+/=-]{16,})/gi;
@@ -42,6 +45,20 @@ export interface PayloadAuditInput {
   userSlug?: string | null;
   sessionKeyHash?: string | null;
   payload: unknown;
+}
+
+export interface RuntimeEventInput {
+  db: D1Database;
+  ttlDays?: string | number | null;
+  maxDetailChars?: string | number | null;
+  eventKey: string;
+  sessionId?: string | null;
+  messageId?: string | null;
+  userSlug?: string | null;
+  eventType: string;
+  level?: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+  source?: string | null;
+  detail?: unknown;
 }
 
 export function auditEnabled(raw: string | null | undefined): boolean {
@@ -137,6 +154,21 @@ export async function recordSessionBind(input: SessionBindInput): Promise<string
       is_new_session: input.isNewSession,
     }),
   );
+  await recordRuntimeEvent({
+    db: input.db,
+    eventKey: input.eventKey,
+    sessionId: input.sessionId,
+    messageId: input.messageId ?? null,
+    userSlug: input.userSlug ?? null,
+    eventType: 'cma_session_bind',
+    source: 'session-orchestrator',
+    detail: {
+      session_key_hash: keyHash,
+      space_name_hash: spaceHash,
+      thread_name_hash: threadHash,
+      is_new_session: input.isNewSession,
+    },
+  });
   return keyHash;
 }
 
@@ -178,6 +210,19 @@ export async function savePayloadAudit(input: PayloadAuditInput): Promise<boolea
         payload_chars: payloadJson.length,
       }),
     );
+    await recordRuntimeEvent({
+      db: input.db,
+      eventKey: input.eventKey,
+      sessionId: input.sessionId,
+      messageId: input.messageId ?? null,
+      userSlug: input.userSlug ?? null,
+      eventType: 'cma_payload_audit_saved',
+      source: 'session-send',
+      detail: {
+        session_key_hash: input.sessionKeyHash ?? null,
+        payload_chars: payloadJson.length,
+      },
+    });
     return true;
   } catch (err) {
     console.warn(
@@ -186,6 +231,52 @@ export async function savePayloadAudit(input: PayloadAuditInput): Promise<boolea
         level: 'WARN',
         event_key: input.eventKey,
         session_id: input.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return false;
+  }
+}
+
+export async function recordRuntimeEvent(input: RuntimeEventInput): Promise<boolean> {
+  const ttlDays = positiveInt(input.ttlDays, DEFAULT_RUNTIME_EVENT_TTL_DAYS);
+  const maxChars = positiveInt(input.maxDetailChars, DEFAULT_MAX_RUNTIME_DETAIL_CHARS);
+  const redacted = redactForAudit(input.detail ?? {}, maxChars);
+  const detailJson = JSON.stringify(redacted);
+  const now = Date.now();
+  const id = `runtime_${now}_${crypto.randomUUID()}`;
+  try {
+    await input.db
+      .prepare(
+        `INSERT INTO cma_worker_runtime_events
+         (id, created_at_ms, expire_at_ms, event_key, session_id, message_id,
+          user_slug, event_type, level, source, detail_json, detail_chars)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+      )
+      .bind(
+        id,
+        now,
+        now + ttlDays * 24 * 60 * 60 * 1000,
+        input.eventKey,
+        input.sessionId ?? null,
+        input.messageId ?? null,
+        input.userSlug ?? null,
+        input.eventType,
+        input.level ?? 'INFO',
+        input.source ?? null,
+        detailJson,
+        detailJson.length,
+      )
+      .run();
+    return true;
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        event_type: 'cma_runtime_event_save_failed',
+        level: 'WARN',
+        event_key: input.eventKey,
+        session_id: input.sessionId ?? null,
+        failed_event_type: input.eventType,
         error: err instanceof Error ? err.message : String(err),
       }),
     );

@@ -30,6 +30,8 @@ declare namespace Cloudflare {
     CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
     CMA_AUDIT_TTL_DAYS?: string;
     CMA_AUDIT_MAX_TEXT_CHARS?: string;
+    CMA_RUNTIME_EVENT_TTL_DAYS?: string;
+    CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS?: string;
     MAKOTO_DEBUG_TOKEN?: string;
 
     // Browser Rendering REST credentials. Either both are present (REST

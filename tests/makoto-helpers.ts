@@ -32,6 +32,7 @@ interface MakotoTables {
   agentmail_webhook_seen: Map<string, FakeRow>;
   cma_session_binds: Map<string, FakeRow>;
   cma_session_payload_audit: Map<string, FakeRow>;
+  cma_worker_runtime_events: Map<string, FakeRow>;
   sent_messages: Map<string, FakeRow>;
   email_threads: Map<string, FakeRow>;
   sessions: Map<string, FakeRow>;
@@ -45,6 +46,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
     agentmail_webhook_seen: new Map(),
     cma_session_binds: new Map(),
     cma_session_payload_audit: new Map(),
+    cma_worker_runtime_events: new Map(),
     sent_messages: new Map(),
     email_threads: new Map(),
     sessions: new Map(),
@@ -289,6 +291,50 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         session_key_hash,
         payload_json,
         payload_chars,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cma_worker_runtime_events /i.test(trimmed)) {
+      const [
+        id,
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        session_id,
+        message_id,
+        user_slug,
+        event_type,
+        level,
+        source,
+        detail_json,
+        detail_chars,
+      ] = params as [
+        string,
+        number,
+        number,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        string,
+        string | null,
+        string | null,
+        number,
+      ];
+      tables.cma_worker_runtime_events.set(id, {
+        id,
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        session_id,
+        message_id,
+        user_slug,
+        event_type,
+        level,
+        source,
+        detail_json,
+        detail_chars,
       });
       return { results: [], meta: { changes: 1 } };
     }
