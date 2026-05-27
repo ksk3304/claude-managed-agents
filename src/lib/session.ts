@@ -23,6 +23,10 @@ import { ANTHROPIC_BETA, resolveAnthropicApiKey } from '../anthropic';
 import type { MemoryStoreResourceParam } from '../types/memory';
 import type { EmailSendMarker } from '../types/agentmail';
 import { parseEmailSendMarkers } from './email-send-marker';
+import {
+  saveUserMessagePayloadAudit,
+  type PayloadAuditConfig,
+} from './payload-audit';
 
 /**
  * Build an Anthropic SDK client. Mirrors `email-handler.ts:emailClient`
@@ -102,6 +106,8 @@ export interface SendAndStreamInput {
   userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
 }
 
 export interface SendAndStreamResult {
@@ -161,13 +167,15 @@ export async function sendAndStream(
   // document) rather than a raw string; we wrap into a single text
   // block here. Verified against
   // @anthropic-ai/sdk BetaManagedAgentsTextBlock shape.
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
@@ -271,6 +279,8 @@ export interface SendAndStreamWithToolDispatchInput {
    */
   userMessage: string | UserMessageContentBlock[];
   toolDispatcher: ToolDispatcher;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
   /**
@@ -347,13 +357,15 @@ export async function sendAndStreamWithToolDispatch(
   // `sendAndStream`: wrap a string into a single text block, otherwise
   // pass the typed content array straight through (= image / document
   // attachments are pre-built by the caller, see attachment-processing.ts).
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 

@@ -157,5 +157,14 @@ declare namespace Cloudflare {
      * scheduled 経路の recovery には影響しない (reactive 専用)。
      */
     CMA_REACTIVE_CAP_RECOVERY_ENABLED?: string;
+    /**
+     * Explicit opt-in for short-lived `user.message` payload audit in
+     * Cloudflare KV. Default off. Enable only while observing an incident.
+     */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Optional TTL in days for Cloudflare payload audit KV rows. */
+    CMA_AUDIT_TTL_DAYS?: string;
+    /** Optional max chars per string in Cloudflare payload audit records. */
+    CMA_AUDIT_MAX_TEXT_CHARS?: string;
   }
 }

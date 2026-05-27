@@ -397,6 +397,20 @@ export async function orchestrateChatTurn(
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+      payloadAudit: {
+        kv,
+        enabled: input.env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+        ttlDays: input.env.CMA_AUDIT_TTL_DAYS,
+        maxTextChars: input.env.CMA_AUDIT_MAX_TEXT_CHARS,
+        mode: 'chat',
+        context: {
+          sender_email: input.senderEmail,
+          space_name: input.spaceName,
+          space_type: input.spaceType,
+          thread_name: input.threadName ?? '',
+          agent_id: input.userMapping.agent_id,
+        },
+      },
     });
   } catch (err) {
     throw new OrchestratorFailure(

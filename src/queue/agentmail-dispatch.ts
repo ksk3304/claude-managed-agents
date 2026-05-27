@@ -247,6 +247,19 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           callerSessionId: sessionId!,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
+      payloadAudit: {
+        kv: env.MAKOTO_KV,
+        enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+        ttlDays: env.CMA_AUDIT_TTL_DAYS,
+        maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+        mode: 'agentmail',
+        context: {
+          event_key: eventKey,
+          sender_email: sender,
+          user_slug: userSlug,
+          agent_id: agentId,
+        },
+      },
     });
   } catch (err) {
     console.error(

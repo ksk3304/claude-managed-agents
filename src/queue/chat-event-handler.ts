@@ -608,6 +608,19 @@ export async function handleChatEvent(
             userMessage: recoveryPrompt,
             toolDispatcher,
             maxToolCalls,
+            payloadAudit: {
+              kv: env.MAKOTO_KV,
+              enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+              ttlDays: env.CMA_AUDIT_TTL_DAYS,
+              maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+              mode: 'chat-cap-recovery',
+              context: {
+                event_key: eventKey,
+                space_name: spaceName,
+                thread_name: threadName ?? '',
+                sender_email: senderEmail,
+              },
+            },
           });
           return {
             text: res.assistantText,
