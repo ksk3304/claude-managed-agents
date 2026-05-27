@@ -23,7 +23,6 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { getOrCreateResources, type AgentCacheBindings } from './agent-cache';
 import { hasAttachedSkills } from './attached-skills';
 import type { UserMappingValue } from './memory-attach';
 import {
@@ -151,9 +150,9 @@ export interface OrchestrateChatTurnInput {
    */
   cap?: CapEnvelopeOption;
   /**
-   * External Anthropic Skills to attach by creating / reusing a dedicated
-   * Managed Agent via `agent-cache`. Empty/undefined keeps the Console-mapped
-   * `userMapping.agent_id` path unchanged.
+   * Deprecated compatibility field. Attached skills must already live on the
+   * employee agent (`userMapping.agent_id`); this orchestrator no longer creates
+   * per-skill agents/environments.
    */
   attachedSkills?: Array<Record<string, unknown>> | null;
 }
@@ -280,71 +279,32 @@ export async function orchestrateChatTurn(
   if (sessionId === null) {
     const resources: MemoryStoreResourceParam[] =
       input.userMapping.memory_attachments.map(toResourceParam);
-    let agentId = input.userMapping.agent_id;
-    let environmentId = input.env.ENVIRONMENT_ID;
     const attachedSkills = input.attachedSkills ?? null;
-
     if (hasAttachedSkills(attachedSkills)) {
-      try {
-        const skillResources = await getOrCreateResources(
-          {
-            DB: input.env.DB as unknown as AgentCacheBindings['DB'],
-            MAKOTO_KV: input.env.MAKOTO_KV as unknown as AgentCacheBindings['MAKOTO_KV'],
-          },
-          async (createOpts) => {
-            const agent = await client.beta.agents.create({
-              name: createOpts.agentName,
-              model: createOpts.model,
-              system: createOpts.system,
-              tools: createOpts.tools as unknown as Anthropic.Beta.Agents.AgentCreateParams['tools'],
-              skills: createOpts.skills as unknown as Anthropic.Beta.Agents.AgentCreateParams['skills'],
-            });
-            const environment = await client.beta.environments.create({
-              name: createOpts.environmentName,
-            });
-            return { agent_id: agent.id, environment_id: environment.id };
-          },
-          {
-            agentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            environmentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            system: systemPromptInfo.systemPrompt,
-            skills: attachedSkills,
-            userSlug: input.userMapping.user_slug,
-          },
-        );
-        agentId = skillResources.agent_id;
-        environmentId = skillResources.environment_id;
-        console.log(
-          `[chat-event] attached-skill agent resolved agent=${agentId} ` +
-            `env=${environmentId} source=${skillResources.source} user=${input.userMapping.user_slug}`,
-        );
-      } catch (err) {
-        throw new OrchestratorFailure(
-          'sessions_create_failed',
-          `attached skill agent create failed for user=${input.userMapping.user_slug}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          err,
-        );
-      }
+      console.warn(
+        `[chat-event] attachedSkills ignored user=${input.userMapping.user_slug}; ` +
+          'using mapped employee agent/session',
+      );
     }
 
     try {
       sessionId = await createSessionWithResources(client, {
-        agentId,
-        environmentId,
+        agentId: input.userMapping.agent_id,
+        environmentId: input.env.ENVIRONMENT_ID,
         resources,
       });
     } catch (err) {
       throw new OrchestratorFailure(
         'sessions_create_failed',
-        `sessions.create failed for agent=${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+        `sessions.create failed for agent=${input.userMapping.agent_id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
         err,
       );
     }
     isNewSession = true;
     console.log(
-      `[chat-event] created session=${sessionId} agent=${agentId} ` +
+      `[chat-event] created session=${sessionId} agent=${input.userMapping.agent_id} ` +
         `user=${input.userMapping.user_slug} space=${input.spaceName}` +
         (input.forceFreshSession ? ' ephemeral=true' : ''),
     );

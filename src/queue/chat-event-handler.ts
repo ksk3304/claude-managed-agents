@@ -45,7 +45,6 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { buildMailSendSkills } from '../lib/attached-skills';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
@@ -444,8 +443,9 @@ export async function handleChatEvent(
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
   // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
   // intent-detector に通して以下を決定:
-  //   - `isActionSkill=true` なら orchestrator に `forceFreshSession=true` を
-  //     渡し既存 thread session 継続を破棄 (Python l.4002-4013 等価)
+  //   - `/mail` 以外の `isActionSkill=true` は orchestrator に
+  //     `forceFreshSession=true` を渡し既存 thread session 継続を破棄
+  //     (mail skill は既存社員 agent / session に統合する)
   //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
   //   - intent 種別を user message envelope の <context> に prefix 注入
   //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
@@ -461,7 +461,8 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
-  const forceFreshSession = intent?.isActionSkill === true;
+  const forceFreshSession =
+    intent?.isActionSkill === true && intent.command !== '/mail';
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -521,14 +522,6 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
-  const attachedSkills =
-    intent?.command === '/mail' ? buildMailSendSkills(env) : [];
-  if (intent?.command === '/mail' && attachedSkills.length === 0) {
-    console.warn(
-      `[chat-event] mail intent without MAIL_SEND_SKILL_ID eventKey=${eventKey}`,
-    );
-  }
-
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -569,7 +562,6 @@ export async function handleChatEvent(
               },
             }
           : {}),
-        ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,
@@ -577,8 +569,8 @@ export async function handleChatEvent(
             boundMessageId: '',
             callerSessionId: sessionIdRef.current,
           }),
-        // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
-        // false) 起動時は KV thread session lookup/put を bypass。
+        // Issue #208: mail skill は既存社員 agent / session へ統合するため
+        // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
       });
       sessionId = orchestrated.sessionId;
