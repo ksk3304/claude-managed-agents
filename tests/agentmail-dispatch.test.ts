@@ -220,6 +220,9 @@ describe('agentmailDispatch', () => {
       // sent_messages should have the outbound row.
       const sent = (ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('agentmail_auto_reply');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -393,6 +396,9 @@ describe('agentmailDispatch', () => {
         ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } }
       )._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('agentmail_auto_reply');
     } finally {
       globalThis.fetch = origFetch;
     }

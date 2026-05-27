@@ -417,6 +417,9 @@ describe('handleChatEvent', () => {
       const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
         ._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('chat_user_requested');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -671,9 +674,8 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this thread.
-    const sessionKey =
-      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
+    // pre-populate KV with existing session for this space scope.
+    const sessionKey = 'chat_scope_session:agent_001:space:spaces/ROOM10';
     await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
 
     const created: unknown[] = [];
@@ -692,6 +694,48 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(created).toHaveLength(0); // sessions.create skipped
     expect(sends).toEqual(['sesn_existing']);
+  });
+
+  it('Case 10b: legacy thread session KV hit → scope keyへ移行して継続', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10',
+      text: '@MAKOTOくん 続きの質問',
+      threadName: 'spaces/ROOM10/threads/T10',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const legacyKey =
+      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
+    const scopeKey = 'chat_scope_session:agent_001:space:spaces/ROOM10';
+    await env.MAKOTO_KV.put(legacyKey, 'sesn_legacy');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_be_used',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '続きへの応答です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(0);
+    expect(sends).toEqual(['sesn_legacy']);
+    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_legacy');
   });
 
   it('Case 11: confirmOwner 失敗 (successor TAKEOVER) → skip', async () => {

@@ -41,6 +41,22 @@ describe("findSessionByRfc822MessageId", () => {
     expect(hit).toEqual({ sessionId: "session_1", agentId: "agent_1" });
   });
 
+  it("records auto_reply_policy for audit", async () => {
+    const env = makeEnv();
+    await recordSentMessage(
+      env.DB,
+      "msg_policy",
+      "session_1",
+      "agent_1",
+      "alice@example.com",
+      "rfc-policy@example.com",
+      "agentmail_auto_reply",
+    );
+    expect(env.DB._tables.sent_messages.get("msg_policy")?.auto_reply_policy).toBe(
+      "agentmail_auto_reply",
+    );
+  });
+
   it("returns null when no row matches the message id", async () => {
     const env = makeEnv();
     const miss = await findSessionByRfc822MessageId(env.DB, "never-recorded@example.com");

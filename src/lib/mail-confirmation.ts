@@ -3,8 +3,8 @@
  *
  * The initial mail request is detected by `intent-detector`, but the follow-up
  * approval often contains no mail keywords ("はい、お願いします"). We therefore
- * look at visible thread history for a pending draft confirmation and route the
- * approval through the mail-send Skill as well.
+ * look at visible thread history for a pending draft confirmation and keep the
+ * approval on the same employee agent/session.
  */
 
 export function isMailSendApprovalText(text: string): boolean {
@@ -33,4 +33,3 @@ export function hasPendingMailSendDraft(historyBlock: string): boolean {
 export function isMailSendApprovalTurn(text: string, historyBlock: string): boolean {
   return isMailSendApprovalText(text) && hasPendingMailSendDraft(historyBlock);
 }
-

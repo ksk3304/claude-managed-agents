@@ -376,6 +376,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'agentmail_auto_reply',
         );
       }
     } catch (err) {

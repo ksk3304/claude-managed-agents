@@ -211,19 +211,20 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       return { results: [], meta: { changes } };
     }
 
-    // ----- sent_messages (with rfc822_msgid extension) -----
+    // ----- sent_messages (with rfc822_msgid + auto_reply_policy extension) -----
     if (
-      /^INSERT OR REPLACE INTO sent_messages \(message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid\) VALUES \(\?1, \?2, \?3, \?4, \?5, \?6\)$/i.test(
+      /^INSERT OR REPLACE INTO sent_messages \(message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid, auto_reply_policy\) VALUES \(\?1, \?2, \?3, \?4, \?5, \?6, \?7\)$/i.test(
         trimmed,
       )
     ) {
-      const [message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822] = params as [
+      const [message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822, auto_reply_policy] = params as [
         string,
         string,
         string,
         string,
         number,
         string | null,
+        string,
       ];
       tables.sent_messages.set(message_id, {
         message_id,
@@ -232,6 +233,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         to_addr,
         sent_at_ms,
         rfc822_msgid: rfc822 ?? null,
+        auto_reply_policy,
       });
       return { results: [], meta: { changes: 1 } };
     }

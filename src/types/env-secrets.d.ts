@@ -121,21 +121,6 @@ declare namespace Cloudflare {
      */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
     /**
-     * Anthropic custom Skill for outbound email composition. When present, the
-     * Google Chat `/mail` / natural-language mail intent path uses a managed
-     * agent with this skill attached, so the behavior is visible in Claude
-     * Console instead of living only in prompt hints.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_ID`.
-     */
-    MAIL_SEND_SKILL_ID?: string;
-    /**
-     * Optional pinned version for `MAIL_SEND_SKILL_ID`. Omit to use latest.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_VERSION`.
-     */
-    MAIL_SEND_SKILL_VERSION?: string;
-    /**
      * GCP project ID hosting Cloud Scheduler jobs (Issue #186
      * SCHEDULE_ACTION dispatch)。`cma-bot-mp-20260501` 既定。未設定だと
      * `chat-event-handler.ts` 側で SCHEDULE_ACTION marker dispatch を
