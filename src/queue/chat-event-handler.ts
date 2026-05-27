@@ -368,9 +368,14 @@ export async function handleChatEvent(
         }
         await clearHistoryFailure(env.MAKOTO_KV, threadName);
       } catch (err) {
-        const failure = await recordHistoryFailure(env.MAKOTO_KV, threadName);
+        const reason = err instanceof Error ? err.message : String(err);
+        const failure = await recordHistoryFailure(
+          env.MAKOTO_KV,
+          threadName,
+          reason,
+        );
         console.warn(
-          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${err instanceof Error ? err.message : String(err)}`,
+          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${reason}`,
         );
         if (failure.permanent) {
           await handleHistoryFetchPermanentFailure(

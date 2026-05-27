@@ -28,6 +28,7 @@ import {
   handleHistoryFetchPermanentFailure,
   ChatHistoryFetchError,
   HISTORY_FAILURE_PERMANENT_THRESHOLD,
+  KV_HISTORY_ERROR_PREFIX,
   CHAT_READONLY_SCOPE,
   type ThreadHistoryMessage,
 } from '../src/lib/chat-history';
@@ -430,17 +431,29 @@ describe('recordHistoryFailure — KV counter + permanent flag', () => {
 
   it('clearHistoryFailure resets both counter and perm flag', async () => {
     const kv = makeKv();
-    await recordHistoryFailure(kv, THREAD);
+    await recordHistoryFailure(kv, THREAD, 'first failure reason');
     await recordHistoryFailure(kv, THREAD);
     await recordHistoryFailure(kv, THREAD);
     expect(await isHistoryPermanentlyFailed(kv, THREAD)).toBe(true);
     expect(await getHistoryFailureCount(kv, THREAD)).toBe(
       HISTORY_FAILURE_PERMANENT_THRESHOLD,
     );
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(
+      'first failure reason',
+    );
 
     await clearHistoryFailure(kv, THREAD);
     expect(await isHistoryPermanentlyFailed(kv, THREAD)).toBe(false);
     expect(await getHistoryFailureCount(kv, THREAD)).toBe(0);
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(null);
+  });
+
+  it('recordHistoryFailure stores the latest failure reason with the counter', async () => {
+    const kv = makeKv();
+    await recordHistoryFailure(kv, THREAD, 'status=403 insufficient scopes');
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(
+      'status=403 insufficient scopes',
+    );
   });
 
   it('handleHistoryFetchPermanentFailure stamps the perm key', async () => {

@@ -51,6 +51,8 @@ export const HISTORY_FAILURE_PERMANENT_THRESHOLD = 3;
 export const KV_HISTORY_FAIL_PREFIX = 'history:fail';
 /** KV key prefix for per-thread permanent-failure flag (TTL 24h). */
 export const KV_HISTORY_PERM_PREFIX = 'history:perm';
+/** KV key prefix for the last per-thread failure reason (TTL 24h). */
+export const KV_HISTORY_ERROR_PREFIX = 'history:error';
 /** TTL for both counter + permanent flag KV keys. */
 export const HISTORY_FAILURE_KV_TTL_SEC = 24 * 60 * 60;
 /** Chat REST read-only scope (= Python `SCOPES_CHAT_READONLY`). */
@@ -448,6 +450,7 @@ export function formatThreadHistory(
  * KV layout:
  *   - `history:fail:<thread>` — counter (string-encoded integer), TTL 24h
  *   - `history:perm:<thread>` — "1" once threshold tripped, TTL 24h
+ *   - `history:error:<thread>` — last failure reason, TTL 24h
  *
  * NOTE: this is best-effort. KV is eventually consistent, and the
  * read-modify-write here can race when two events for the same thread
@@ -457,9 +460,17 @@ export function formatThreadHistory(
 export async function recordHistoryFailure(
   kv: KVNamespace,
   threadName: string,
+  reason?: string,
 ): Promise<{ count: number; permanent: boolean; firstPermanentTrip: boolean }> {
   const counterKey = `${KV_HISTORY_FAIL_PREFIX}:${threadName}`;
   const permKey = `${KV_HISTORY_PERM_PREFIX}:${threadName}`;
+  if (reason) {
+    await kv.put(
+      `${KV_HISTORY_ERROR_PREFIX}:${threadName}`,
+      reason.slice(0, 1000),
+      { expirationTtl: HISTORY_FAILURE_KV_TTL_SEC },
+    );
+  }
   const prevRaw = await kv.get(counterKey);
   const prev = prevRaw ? Number.parseInt(prevRaw, 10) : 0;
   const count = (Number.isFinite(prev) && prev > 0 ? prev : 0) + 1;
@@ -487,6 +498,7 @@ export async function clearHistoryFailure(
 ): Promise<void> {
   await kv.delete(`${KV_HISTORY_FAIL_PREFIX}:${threadName}`);
   await kv.delete(`${KV_HISTORY_PERM_PREFIX}:${threadName}`);
+  await kv.delete(`${KV_HISTORY_ERROR_PREFIX}:${threadName}`);
 }
 
 /** Read current counter (test / diagnostic helper). */
