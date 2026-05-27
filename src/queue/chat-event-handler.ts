@@ -1769,16 +1769,16 @@ function loadSlashSkillsData(env: Env): SkillsData {
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
 // Done (Issue #186 既知 #4): intent-detector 統合 (= bodyText intent prefix。
 //   Grill Me 正本に合わせ /mail でも同じ社員 agent / session を継続)。
-// TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
+// Done (#198): Cold continuation の SignalB 経由 thread-self-scan.
 // ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で
 //    history fetch 結果に未登録 chat_user_id が居るとき CHAT_POST 全 marker
 //    を `applyChatPostGateToText` で strip。speaker-resolver.ts pure 関数群
 //    + speaker-gate.ts wire-up 経路。external tool gate は actor 駆動軸で
 //    別途 #186 follow-up)。
-// TODO(#186 follow-up): CHAT_POST alias resolver port (= cma_gchat_send.resolve_space)
-// TODO(#186 follow-up): user_mapping default fallback (= 既知ユーザ以外の処理)
-// TODO(#186 follow-up): annotation-based mention detection (= _is_for_bot 完全 port)
-// TODO(#186 follow-up): _strip_mention の annotations ベース完全実装
+// Done (#198/#186): CHAT_POST alias resolver port (= `chat-alias-resolver.ts`).
+// Done (#198/#186): user_mapping default fallback (= `readUserMappingWithDefault`).
+// Done (#198/#186): annotation-based mention detection (= `isMentioningBot`).
+// Done (#198/#186): _strip_mention annotations-based port (= `stripMentions`).
 // NOTE(#186): user_message envelope の cap-recovery / intent / speaker prefix
 //             は既知 #11 で `src/lib/user-message-envelope.ts` に実装済 (= 配線
 //             は本 file の `intentResult` / `historyBlock` 経由)。残る完全化
