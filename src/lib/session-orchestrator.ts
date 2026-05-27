@@ -47,6 +47,12 @@ import {
   type SpeakerEnvelopeOption,
   type CapEnvelopeOption,
 } from './user-message-envelope';
+import {
+  recordPayloadAudit,
+  recordRuntimeEvent,
+  recordSessionBind,
+  sessionKeyHash,
+} from './observability';
 
 /** KV key prefix for thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
@@ -156,6 +162,10 @@ export interface OrchestrateChatTurnInput {
    * `userMapping.agent_id` path unchanged.
    */
   attachedSkills?: Array<Record<string, unknown>> | null;
+  /** Observability correlation id: `chat:msgname:<message.name>`. */
+  eventKey?: string;
+  /** Google Chat message resource name. */
+  messageId?: string;
 }
 
 export interface OrchestrateChatTurnResult {
@@ -370,6 +380,31 @@ export async function orchestrateChatTurn(
     );
   }
 
+  if (input.eventKey) {
+    await recordSessionBind(input.env, {
+      senderEmail: input.senderEmail,
+      spaceName: input.spaceName,
+      threadName: input.threadName,
+      sessionId,
+      eventKey: input.eventKey,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      isNewSession,
+    });
+    await recordRuntimeEvent(input.env, {
+      eventKey: input.eventKey,
+      sessionId,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      eventType: isNewSession ? 'cma_session_created' : 'cma_session_continued',
+      source: 'session-orchestrator',
+      detail: {
+        force_fresh_session: Boolean(input.forceFreshSession),
+        has_thread_session_key: sessionKey !== null,
+      },
+    });
+  }
+
   // ---- user message envelope ----
   // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
   // を `buildUserMessageEnvelope` 純関数で組み立てる (Python と byte 等価層は
@@ -403,6 +438,48 @@ export async function orchestrateChatTurn(
       ? userMessageText
       : [{ type: 'text', text: userMessageText }, ...extraBlocks];
 
+  if (input.eventKey) {
+    const session_key_hash = sessionKeyHash(
+      input.senderEmail,
+      input.spaceName,
+      input.threadName,
+    );
+    await recordRuntimeEvent(input.env, {
+      eventKey: input.eventKey,
+      sessionId,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      eventType: 'prompt_envelope_built',
+      source: 'session-orchestrator',
+      detail: {
+        body_chars: input.bodyText.length,
+        history_chars: input.historyBlock?.length ?? 0,
+        speaker_context_chars: input.speakerContextBlock?.length ?? 0,
+        roster_chars: input.rosterBlock?.length ?? 0,
+        extra_content_blocks: extraBlocks.length,
+        envelope_chars: userMessageText.length,
+        has_intent: Boolean(input.intent),
+      },
+    });
+    await recordPayloadAudit(input.env, {
+      sessionId,
+      eventKey: input.eventKey,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      sessionKeyHash: session_key_hash,
+      payload: {
+        user_message: userMessage,
+        envelope_stats: {
+          body_chars: input.bodyText.length,
+          history_chars: input.historyBlock?.length ?? 0,
+          speaker_context_chars: input.speakerContextBlock?.length ?? 0,
+          envelope_chars: userMessageText.length,
+          extra_content_blocks: extraBlocks.length,
+        },
+      },
+    });
+  }
+
   // ---- stream consume ----
   let streamResult: SendAndStreamResult;
   try {
@@ -412,7 +489,34 @@ export async function orchestrateChatTurn(
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
     });
+    if (input.eventKey) {
+      await recordRuntimeEvent(input.env, {
+        eventKey: input.eventKey,
+        sessionId,
+        messageId: input.messageId ?? null,
+        userSlug: input.userMapping.user_slug,
+        eventType: 'cma_events_send_completed',
+        source: 'session-orchestrator',
+        detail: {
+          assistant_chars: streamResult.assistantText.length,
+          terminal_event_type: streamResult.terminalEventType ?? null,
+          stop_reason: streamResult.stopReason ?? null,
+        },
+      });
+    }
   } catch (err) {
+    if (input.eventKey) {
+      await recordRuntimeEvent(input.env, {
+        eventKey: input.eventKey,
+        sessionId,
+        messageId: input.messageId ?? null,
+        userSlug: input.userMapping.user_slug,
+        eventType: 'cma_events_send_failed',
+        level: 'error',
+        source: 'session-orchestrator',
+        detail: { error: err instanceof Error ? err.message : String(err) },
+      });
+    }
     throw new OrchestratorFailure(
       'stream_failed',
       `sendAndStreamWithToolDispatch failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,

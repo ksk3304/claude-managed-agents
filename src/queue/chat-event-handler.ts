@@ -116,6 +116,7 @@ import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
+import { recordRuntimeEvent } from '../lib/observability';
 
 /**
  * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
@@ -179,6 +180,13 @@ export async function handleChatEvent(
   void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
 
   const { eventKey, claim, payload } = body;
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId: payload.message?.name ?? null,
+    eventType: 'chat_queue_consumer_started',
+    source: 'chat-event-handler',
+    detail: { claim_owner: claim.owner, claim_version: claim.version },
+  });
 
   // ---- 1. claim 維持確認 ----
   const stillOwner = await confirmOwner(env.DB, eventKey, claim.owner, claim.version);
@@ -356,6 +364,18 @@ export async function handleChatEvent(
           currentMessageName: message.name ?? '',
         });
         historyBlock = historyResult.text;
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'chat_history_fetch',
+          source: 'chat-event-handler',
+          detail: {
+            ok: true,
+            thread_hash_present: Boolean(threadName),
+            history_chars: historyBlock.length,
+            unresolved_count: historyResult.unresolvedCount,
+          },
+        });
         if (historyResult.unresolvedCount > 0) {
           hasUnresolvedSpeakers = true;
           console.warn(
@@ -370,6 +390,19 @@ export async function handleChatEvent(
         console.warn(
           `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${err instanceof Error ? err.message : String(err)}`,
         );
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'chat_history_fetch',
+          level: failure.permanent ? 'error' : 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            ok: false,
+            failure_count: failure.count,
+            permanent: failure.permanent,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
         if (failure.permanent) {
           await handleHistoryFetchPermanentFailure(
             env.MAKOTO_KV,
@@ -413,11 +446,34 @@ export async function handleChatEvent(
       if (contextBlock) {
         speakerContextBlock = contextBlock;
         if (rosterResult.kind === 'roster') {
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            eventType: 'space_roster_fetch',
+            source: 'chat-event-handler',
+            detail: {
+              ok: true,
+              member_count: rosterResult.members.size,
+              context_chars: contextBlock.length,
+            },
+          });
           console.log(
             `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
               `space=${spaceName} member_count=${rosterResult.members.size}`,
           );
         } else {
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            eventType: 'space_roster_fetch',
+            level: 'warn',
+            source: 'chat-event-handler',
+            detail: {
+              ok: false,
+              reason: rosterResult.reason,
+              context_chars: contextBlock.length,
+            },
+          });
           console.warn(
             `[chat-event] space_context injected without roster eventKey=${eventKey} ` +
               `space=${spaceName} roster_failure=${rosterResult.reason}`,
@@ -439,6 +495,14 @@ export async function handleChatEvent(
       console.warn(
         `[chat-event] space_context build fail eventKey=${eventKey} space=${spaceName}: ${err instanceof Error ? err.message : String(err)}`,
       );
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'space_roster_fetch',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { ok: false, error: err instanceof Error ? err.message : String(err) },
+      });
     }
   }
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
@@ -580,6 +644,8 @@ export async function handleChatEvent(
         // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
         // false) 起動時は KV thread session lookup/put を bypass。
         forceFreshSession,
+        eventKey,
+        messageId: message.name,
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
@@ -804,17 +870,56 @@ export async function handleChatEvent(
       },
     });
     if (chatReplyOutcome.outcome === 'already') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        source: 'chat-event-handler',
+        detail: { outcome: 'already' },
+      });
       console.log(
         `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
       );
     } else if (chatReplyOutcome.outcome === 'lease_alive') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { outcome: 'lease_alive' },
+      });
       console.warn(
         `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
       );
     } else if (chatReplyOutcome.outcome === 'lease_lost') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { outcome: 'lease_lost' },
+      });
       console.warn(
         `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
       );
+    } else if (chatReplyOutcome.outcome === 'sent') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        source: 'chat-event-handler',
+        detail: {
+          outcome: 'sent',
+          mode: placeholderName ? 'patch_or_post_fallback' : 'post',
+          final_text_chars: finalText.length,
+        },
+      });
     }
   } else {
     console.log(
