@@ -17,6 +17,11 @@ declare namespace Cloudflare {
     ANTHROPIC_API_KEY: string;
     ANTHROPIC_API_KEY_CMA?: string;
     ANTHROPIC_BASE_URL?: string;
+    /**
+     * Secret-gated diagnostic ingress for Issue #202 Cloudflare
+     * observability proof. Unset in normal operation; route returns 404.
+     */
+    MAKOTO_DEBUG_TOKEN?: string;
     ENVIRONMENT_ID: string;
     OAUTH_VAULT_KEY: string;
     /**

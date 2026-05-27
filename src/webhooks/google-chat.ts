@@ -68,7 +68,7 @@ export interface ChatEventPayload {
   eventTime?: string; // ISO 8601
   message?: {
     name: string; // 'spaces/AAA/messages/BBB' = 一意 ID (dedupe key 用)
-    sender: { name: string; displayName?: string; email?: string };
+    sender: { name: string; displayName?: string; email?: string; type?: string };
     text?: string;
     thread?: { name?: string };
     /**

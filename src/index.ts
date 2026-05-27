@@ -22,7 +22,7 @@ import {
 import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { handleGoogleChatWebhook } from "./webhooks/google-chat";
-import type { ChatQueueMessage } from "./webhooks/google-chat";
+import type { ChatEventPayload, ChatQueueMessage } from "./webhooks/google-chat";
 import { handleChatQueue } from "./queue/chat-event-handler";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { OAuthLease } from "./durable-objects/oauth-lease";
@@ -31,6 +31,7 @@ import {
   pruneOlderThan,
 } from "./storage";
 import { pruneExpiredDedupe } from "./lib/dedupe";
+import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import { buildAnthropicClient } from "./lib/session";
 
@@ -81,6 +82,13 @@ export default {
       request.method === "POST"
     ) {
       return handleGoogleChatWebhook(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/issue-202/chat-observe" &&
+      request.method === "POST"
+    ) {
+      return handleIssue202ChatObserve(request, env);
     }
 
     return new Response("not found", { status: 404 });
@@ -199,4 +207,111 @@ async function runDailyReportCron(env: Env): Promise<void> {
   } catch (error) {
     console.error("[cron] daily-report failed", error);
   }
+}
+
+interface Issue202DiagnosticBody {
+  runId?: unknown;
+  text?: unknown;
+  senderEmail?: unknown;
+  spaceName?: unknown;
+  threadName?: unknown;
+}
+
+async function handleIssue202ChatObserve(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const token = env.MAKOTO_DEBUG_TOKEN?.trim();
+  if (!token) {
+    return new Response("not found", { status: 404 });
+  }
+  if (request.headers.get("x-makoto-debug-token") !== token) {
+    return Response.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  let body: Issue202DiagnosticBody;
+  try {
+    body = (await request.json()) as Issue202DiagnosticBody;
+  } catch {
+    return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+
+  const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+  const text = typeof body.text === "string" ? body.text : "";
+  const senderEmail =
+    typeof body.senderEmail === "string" ? body.senderEmail.trim() : "";
+  const spaceName =
+    typeof body.spaceName === "string" ? body.spaceName.trim() : "";
+  const threadName =
+    typeof body.threadName === "string" && body.threadName.trim()
+      ? body.threadName.trim()
+      : `${spaceName}/threads/${runId}`;
+
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(runId)) {
+    return Response.json({ error: "invalid runId" }, { status: 400 });
+  }
+  if (!text.trim() || !senderEmail || !spaceName || !threadName) {
+    return Response.json(
+      { error: "text, senderEmail, spaceName, threadName required" },
+      { status: 400 },
+    );
+  }
+
+  const messageName = `${spaceName}/messages/${runId}`;
+  const eventKey = `chat:msgname:${messageName}`;
+  const owner = newClaimOwner(env.WORKER_INSTANCE_ID ?? "issue-202-debug");
+  const claim = await tryClaim(env.DB, eventKey, owner);
+  if (claim.state === "DONE_DUPLICATE" || claim.state === "LEASE_ALIVE") {
+    console.log(`[issue-202-debug] duplicate state=${claim.state} eventKey=${eventKey}`);
+    return Response.json({ ok: true, state: claim.state, eventKey });
+  }
+  if (claim.owner === undefined || claim.version === undefined) {
+    return Response.json({ error: "unexpected claim state" }, { status: 500 });
+  }
+
+  const payload: ChatEventPayload = {
+    type: "MESSAGE",
+    eventTime: new Date().toISOString(),
+    message: {
+      name: messageName,
+      sender: {
+        name: "users/issue-202-debug",
+        displayName: "Issue 202 Diagnostic",
+        email: senderEmail,
+        type: "HUMAN",
+      },
+      text,
+      thread: { name: threadName },
+    },
+    space: {
+      name: spaceName,
+      type: "DM",
+      displayName: "Issue 202 Diagnostic",
+    },
+    user: {
+      name: "users/issue-202-debug",
+      displayName: "Issue 202 Diagnostic",
+      email: senderEmail,
+    },
+  };
+
+  const queueMsg: ChatQueueMessage = {
+    eventKey,
+    receivedAtMs: Date.now(),
+    claim: { owner: claim.owner, version: claim.version },
+    payload,
+  };
+
+  try {
+    await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
+  } catch (err) {
+    await releaseClaim(env.DB, eventKey, claim.owner, claim.version);
+    console.error(
+      `[issue-202-debug] queue-send failed eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return Response.json({ error: "queue send failed" }, { status: 500 });
+  }
+
+  console.log(`[issue-202-debug] enqueued eventKey=${eventKey}`);
+  return Response.json({ ok: true, state: claim.state, eventKey, messageName });
 }
