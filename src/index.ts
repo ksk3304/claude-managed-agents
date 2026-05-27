@@ -38,6 +38,8 @@ import {
   pruneExpiredCmaObservability,
   recordRuntimeEvent,
 } from "./lib/cma-observability";
+import { getChatReadonlyAccessToken } from "./lib/chat-oauth";
+import { fetchThreadMessages } from "./lib/chat-history";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -93,6 +95,13 @@ export default {
       request.method === "POST"
     ) {
       return handleIssue202ChatObserve(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/issue-186/history-check" &&
+      request.method === "POST"
+    ) {
+      return handleIssue186HistoryCheck(request, env);
     }
 
     return new Response("not found", { status: 404 });
@@ -227,6 +236,130 @@ interface Issue202DiagnosticBody {
   senderEmail?: unknown;
   spaceName?: unknown;
   threadName?: unknown;
+}
+
+interface Issue186HistoryCheckBody {
+  runId?: unknown;
+  spaceName?: unknown;
+  threadName?: unknown;
+  pageSize?: unknown;
+}
+
+async function handleIssue186HistoryCheck(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const token = env.MAKOTO_DEBUG_TOKEN?.trim();
+  if (!token) {
+    return new Response("not found", { status: 404 });
+  }
+  if (request.headers.get("x-makoto-debug-token") !== token) {
+    return Response.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  let body: Issue186HistoryCheckBody;
+  try {
+    body = (await request.json()) as Issue186HistoryCheckBody;
+  } catch {
+    return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+
+  const runId =
+    typeof body.runId === "string" && body.runId.trim()
+      ? body.runId.trim()
+      : `history-check-${Date.now()}`;
+  const spaceName =
+    typeof body.spaceName === "string" ? body.spaceName.trim() : "";
+  const threadName =
+    typeof body.threadName === "string" ? body.threadName.trim() : "";
+  const pageSize =
+    typeof body.pageSize === "number" && Number.isFinite(body.pageSize)
+      ? Math.max(1, Math.min(10, Math.trunc(body.pageSize)))
+      : 3;
+  const eventKey = `issue186:history-check:${runId}`;
+
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(runId)) {
+    return Response.json({ error: "invalid runId" }, { status: 400 });
+  }
+  if (!spaceName.startsWith("spaces/") || !threadName.startsWith(`${spaceName}/threads/`)) {
+    return Response.json({ error: "invalid spaceName/threadName" }, { status: 400 });
+  }
+
+  const missing = missingHistoryOAuthSecrets(env);
+  if (missing.length > 0) {
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_check_failed",
+      level: "WARN",
+      source: "http-ingress",
+      detail: { reason: "oauth_secrets_missing", missing },
+    });
+    return Response.json(
+      { ok: false, error: "oauth_secrets_missing", missing },
+      { status: 500 },
+    );
+  }
+
+  try {
+    const accessToken = await getChatReadonlyAccessToken({
+      kv: env.MAKOTO_KV,
+      vaultKeyB64: env.OAUTH_VAULT_KEY!,
+      clientId: env.GCHAT_OAUTH_CLIENT_ID!,
+      clientSecret: env.GCHAT_OAUTH_CLIENT_SECRET!,
+      refreshTokenSeed: env.GCHAT_OAUTH_REFRESH_TOKEN_SEED!,
+    });
+    const messages = await fetchThreadMessages(
+      { accessToken: accessToken.access_token },
+      spaceName,
+      threadName,
+      { pageSize, maxPages: 1 },
+    );
+    const totalTextChars = messages.reduce((acc, msg) => acc + msg.text.length, 0);
+    const result = {
+      ok: true,
+      runId,
+      authSource: accessToken.from_cache ? "cache" : "refresh",
+      messageCount: messages.length,
+      totalTextChars,
+      firstCreateTime: messages[0]?.createTime ?? null,
+      lastCreateTime: messages.at(-1)?.createTime ?? null,
+    };
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_check_ok",
+      source: "http-ingress",
+      detail: result,
+    });
+    return Response.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_check_failed",
+      level: "WARN",
+      source: "http-ingress",
+      detail: { reason: message },
+    });
+    return Response.json({ ok: false, error: message }, { status: 502 });
+  }
+}
+
+function missingHistoryOAuthSecrets(env: Env): string[] {
+  const missing: string[] = [];
+  if (!env.GCHAT_OAUTH_REFRESH_TOKEN_SEED) missing.push("GCHAT_OAUTH_REFRESH_TOKEN_SEED");
+  if (!env.GCHAT_OAUTH_CLIENT_ID) missing.push("GCHAT_OAUTH_CLIENT_ID");
+  if (!env.GCHAT_OAUTH_CLIENT_SECRET) missing.push("GCHAT_OAUTH_CLIENT_SECRET");
+  if (!env.OAUTH_VAULT_KEY) missing.push("OAUTH_VAULT_KEY");
+  return missing;
 }
 
 async function handleIssue202ChatObserve(
