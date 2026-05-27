@@ -1006,17 +1006,37 @@ async function dispatchEmailMarkers(
         console.warn(
           `[chat-event] EMAIL_SEND fail eventKey=${eventKey} to=${redactPiiInText(m.to)} status=${err.status} transient=${err.transient}: ${redactPiiInText(err.message)}`,
         );
+        await recordEmailDispatchFailure(env, {
+          eventKey,
+          sessionId,
+          to: m.to,
+          subject: m.subject,
+          status: err.status,
+          transient: err.transient,
+          message: err.message,
+          body: err.body,
+        });
       } else {
+        const message = err instanceof Error ? err.message : String(err);
         console.warn(
-          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${redactPiiInText(m.to)}: ${redactPiiInText(err instanceof Error ? err.message : String(err))}`,
+          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${redactPiiInText(m.to)}: ${redactPiiInText(message)}`,
         );
+        await recordEmailDispatchFailure(env, {
+          eventKey,
+          sessionId,
+          to: m.to,
+          subject: m.subject,
+          status: 0,
+          transient: true,
+          message,
+        });
       }
       // 1 marker 失敗で全体落とさない (failure isolation)。
       summaries.push({
         status: 'failed',
         to: m.to,
         subject: m.subject,
-        reason: 'メール送信に失敗しました',
+        reason: formatEmailDispatchErrorReason(err),
       });
     }
   }
@@ -1068,10 +1088,77 @@ function scrubActionMarkerLeakForChat(
     text.includes('マーカー');
   if (!leaks) return { text, scrubbed: false, reason: '' };
   return {
-    text: '送信状況の確認に失敗しました。担当者が確認します。',
+    text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',
     scrubbed: true,
     reason: 'action_marker_terms',
   };
+}
+
+function formatEmailDispatchErrorReason(err: unknown): string {
+  if (err instanceof AgentMailError) {
+    if (err.status === 0) return 'AgentMail API への接続に失敗しました';
+    if (err.status === 401 || err.status === 403) {
+      return `AgentMail 認証エラー (${err.status})`;
+    }
+    if (err.status === 404) return 'AgentMail inbox が見つかりません (404)';
+    if (err.status === 429) return 'AgentMail API のレート制限です (429)';
+    if (err.status >= 500) return `AgentMail API 側エラー (${err.status})`;
+    return `AgentMail API エラー (${err.status})`;
+  }
+  return 'メール送信処理で例外が発生しました';
+}
+
+async function recordEmailDispatchFailure(
+  env: Env,
+  input: {
+    eventKey: string;
+    sessionId: string;
+    to: string;
+    subject: string;
+    status: number;
+    transient: boolean;
+    message: string;
+    body?: string;
+  },
+): Promise<void> {
+  try {
+    const detail = {
+      to: redactPiiInText(input.to),
+      subject_chars: input.subject.length,
+      status: input.status,
+      transient: input.transient,
+      message: redactPiiInText(input.message),
+      body_preview: input.body ? redactPiiInText(input.body).slice(0, 1000) : undefined,
+    };
+    const detailJson = JSON.stringify(detail);
+    await env.DB.prepare(
+      `INSERT INTO cma_worker_runtime_events
+         (id, created_at_ms, expire_at_ms, event_key, session_id, message_id,
+          user_slug, event_type, level, source, detail_json, detail_chars)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        Date.now(),
+        Date.now() + 30 * 24 * 60 * 60 * 1000,
+        input.eventKey,
+        input.sessionId,
+        null,
+        null,
+        'email_dispatch_failed',
+        'warn',
+        'chat-event-handler',
+        detailJson,
+        detailJson.length,
+      )
+      .run();
+  } catch (err) {
+    console.warn(
+      `[chat-event] failed to record EMAIL_SEND failure eventKey=${input.eventKey}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

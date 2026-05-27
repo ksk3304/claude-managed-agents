@@ -426,6 +426,43 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('Case 1b: AgentMail API failure → status-aware failure is shown', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送ります。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"返信本文"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response('unauthorized', { status: 401 }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('❌ メール送信失敗');
+      expect(chatApiMock.patches[0]!.text).toContain('理由: AgentMail 認証エラー (401)');
+      const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
+        ._tables.sent_messages;
+      expect(sent.size).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 2: shared space + bot mention あり → 同経路で committed', async () => {
     const env = buildEnv();
     // annotations-based 厳密 mention (= Python `_is_for_bot` 等価)。
@@ -678,7 +715,7 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe(
-      '送信状況の確認に失敗しました。担当者が確認します。',
+      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
     );
     expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
     expect(chatApiMock.patches[0]!.text).not.toContain('bot');
