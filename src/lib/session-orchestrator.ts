@@ -52,9 +52,9 @@ import {
   sessionKeyHash,
 } from './observability';
 
-/** KV key prefix for scope → session lookup. TTL 24h. */
+/** Historical broad scope prefix. Do not use for Google Chat reactive session lookup. */
 export const KV_CHAT_SCOPE_SESSION_PREFIX = 'chat_scope_session';
-/** Legacy key kept only as fallback while 24h KV entries age out. */
+/** KV key prefix for sender + space + thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
@@ -136,9 +136,8 @@ export interface OrchestrateChatTurnInput {
    */
   extraContentBlocks?: UserMessageContentBlock[];
   /**
-   * true のとき、scope KV の既存 session を読まず、作成した session も
-   * scope KV に保存しない。添付 turn など、入力内容がファイル単位で独立し、
-   * 既存会話 session に混ぜると誤読・混線の原因になる経路で使う。
+   * true のとき、thread KV の既存 session を読まず、作成した session も
+   * thread KV に保存しない。Google Chat 通常経路では使わない。
    */
   forceFreshSession?: boolean;
   /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
@@ -228,7 +227,7 @@ export class OrchestratorFailure extends Error {
  *
  * 流れ:
  *   1. `client` が null なら `OrchestratorFailure('no_anthropic_client')` を throw
- *   2. scope session key を組み立て KV を引く (key が null = 必ず新規)
+ *   2. thread session key を組み立て KV を引く (key が null = 必ず新規)
  *   3. KV hit なら既存 sessionId を再利用、miss なら sessions.create + KV put
  *   4. system prompt 起動ログを 1 回出力 (drift 検出用)
  *   5. user message envelope を組み立てて `sendAndStreamWithToolDispatch` で
@@ -276,19 +275,11 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
-  // 通常 turn は Grill Me 正本に合わせ、/mail 等の action intent でも同じ
-  // 社員 agent / 同じ scope session を継続する。添付 turn はファイル単位で
-  // 独立させるため、明示 opt-in で fresh session に逃がす。
+  // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
+  // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
+  // 古い CMA session を継続してしまうため、scope key への fallback はしない。
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
-    ? null
-    : chatScopeSessionKey(
-        input.userMapping.agent_id,
-        input.spaceType,
-        input.senderEmail,
-        input.spaceName,
-      );
-  const legacyThreadSessionKey = forceFreshSession
     ? null
     : chatThreadSessionKey(
         input.senderEmail,
@@ -304,31 +295,6 @@ export async function orchestrateChatTurn(
         `[chat-event] KV get failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
       );
       // KV 失敗は致命ではない — 新規 session で続行
-      sessionId = null;
-    }
-  }
-  if (sessionId === null && legacyThreadSessionKey !== null) {
-    try {
-      sessionId = await kv.get(legacyThreadSessionKey);
-      if (sessionId !== null && sessionKey !== null) {
-        try {
-          await kv.put(sessionKey, sessionId, {
-            expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
-          });
-        } catch (err) {
-          console.warn(
-            `[chat-event] KV put failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        console.log(
-          `[chat-event] legacy thread session migrated key=${legacyThreadSessionKey} ` +
-            `scope_key=${sessionKey}`,
-        );
-      }
-    } catch (err) {
-      console.warn(
-        `[chat-event] KV get failed key=${legacyThreadSessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-      );
       sessionId = null;
     }
   }
@@ -397,6 +363,8 @@ export async function orchestrateChatTurn(
       source: 'session-orchestrator',
       detail: {
         force_fresh_session: forceFreshSession,
+        session_key_kind: sessionKey === null ? 'none' : 'chat_thread',
+        thread_name_present: Boolean(input.threadName),
         has_thread_session_key: sessionKey !== null,
       },
     });

@@ -768,8 +768,9 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this space scope.
-    const sessionKey = 'chat_scope_session:agent_001:space:spaces/ROOM10';
+    // pre-populate KV with existing session for this sender + space + thread.
+    const sessionKey =
+      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
     await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
 
     const created: unknown[] = [];
@@ -790,13 +791,13 @@ describe('handleChatEvent', () => {
     expect(sends).toEqual(['sesn_existing']);
   });
 
-  it('Case 10b: legacy thread session KV hit → scope keyへ移行して継続', async () => {
+  it('Case 10b: broad scope KV hit は無視し、新しい Chat thread は新規 session', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
       spaceType: 'ROOM',
       spaceName: 'spaces/ROOM10',
       text: '@MAKOTOくん 続きの質問',
-      threadName: 'spaces/ROOM10/threads/T10',
+      threadName: 'spaces/ROOM10/threads/T11',
       annotations: [
         {
           type: 'USER_MENTION',
@@ -808,15 +809,13 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    const legacyKey =
-      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
     const scopeKey = 'chat_scope_session:agent_001:space:spaces/ROOM10';
-    await env.MAKOTO_KV.put(legacyKey, 'sesn_legacy');
+    await env.MAKOTO_KV.put(scopeKey, 'sesn_old_scope');
 
     const created: unknown[] = [];
     const sends: string[] = [];
     installFakeAnthropic({
-      sessionId: 'sesn_should_not_be_used',
+      sessionId: 'sesn_new_thread',
       createCapture: created,
       sendCaptureSessionIds: sends,
       events: [
@@ -827,20 +826,29 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    expect(created).toHaveLength(0);
-    expect(sends).toEqual(['sesn_legacy']);
-    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_legacy');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_new_thread']);
+    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_old_scope');
+    expect(
+      await env.MAKOTO_KV.get(
+        'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+      ),
+    ).toBe('sesn_new_thread');
   });
 
-  it('attachment turn forces a fresh session and does not overwrite DM scope session', async () => {
+  it('attachment turn follows Chat thread session and ignores broad DM scope session', async () => {
     const env = buildEnv({
       envOverrides: {
         CHAT_SA_KEY_JSON: undefined,
       } as Partial<Env>,
     });
     const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
+    const threadKey =
+      'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TATT';
     await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
+    await env.MAKOTO_KV.put(threadKey, 'sesn_thread_existing');
     const msg = buildQueueMsg({
+      threadName: 'spaces/AAA/threads/TATT',
       attachment: [
         {
           contentName: 'issue198-small-pdf-test.pdf',
@@ -867,18 +875,20 @@ describe('handleChatEvent', () => {
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
 
     expect(result.kind).toBe('committed');
-    expect(created).toHaveLength(1);
-    expect(sends).toEqual(['sesn_attachment_new']);
+    expect(created).toHaveLength(0);
+    expect(sends).toEqual(['sesn_thread_existing']);
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_existing');
+    expect(await env.MAKOTO_KV.get(threadKey)).toBe('sesn_thread_existing');
   });
 
-  it('same DM scope lock held → releases claim and retries without posting placeholder', async () => {
+  it('same Chat thread lock held → releases claim and retries without posting placeholder', async () => {
     const env = buildEnv();
-    const msg = buildQueueMsg({});
+    const msg = buildQueueMsg({ threadName: 'spaces/AAA/threads/TLOCK' });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
 
-    const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
+    const scopeKey =
+      'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TLOCK';
     const lock = getThreadLock(env, scopeKey);
     const held = await lock.acquire(scopeKey, 60_000);
     expect(held.acquired).toBe(true);
@@ -1331,6 +1341,15 @@ describe('handleChatEvent', () => {
     );
     // 元の部分テキスト「途中まで作りました…」は置換されているため含まれない。
     expect(chatApiMock.patches[0]!.text).not.toContain('途中まで作りました');
+    const runtimeEvents = (env.DB as unknown as { _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> } })
+      ._tables.cma_worker_runtime_events;
+    const capEvent = runtimeEvents.find((row) => row.event_type === 'cap_recovery_result');
+    expect(capEvent).toBeDefined();
+    expect(JSON.parse(String(capEvent!.detail_json))).toMatchObject({
+      outcome: 'recovered',
+      original_stop_reason: 'tool_call_cap',
+      recovery_text_chars: 18,
+    });
   });
 
   it('cap-recovery: env CMA_REACTIVE_CAP_RECOVERY_ENABLED=0 で cap 超過 → recovery 起動せず部分テキストのまま', async () => {

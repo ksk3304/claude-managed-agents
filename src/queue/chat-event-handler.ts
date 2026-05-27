@@ -13,7 +13,7 @@
  *   4. mention strip (簡略: 先頭 `@<displayName> ` のみ)
  *   5. user_mapping resolve (= `readUserMapping`)
  *   6. session orchestrate (= `session-orchestrator.ts`)
- *      - scope session KV lookup or sessions.create
+ *      - thread session KV lookup or sessions.create
  *      - `sendAndStreamWithToolDispatch` で stream consume
  *   7. assistantText parse:
  *      - EMAIL_SEND markers → AgentMail send + redaction + sent_messages row
@@ -98,7 +98,7 @@ import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
-  chatScopeSessionKey,
+  chatThreadSessionKey,
   orchestrateChatTurn,
   OrchestratorFailure,
 } from '../lib/session-orchestrator';
@@ -223,7 +223,6 @@ export async function handleChatEvent(
   const threadName = message.thread?.name ?? null;
   const rawText = message.text ?? '';
   const annotations = message.annotations ?? [];
-  const hasChatAttachments = (message.attachment?.length ?? 0) > 0;
 
   // ---- 3. bot 宛判定 (annotations-based, Python `_is_for_bot` 等価) ----
   // 実判定は annotations の USER_MENTION (= `userMention.user.type === 'BOT'`
@@ -334,7 +333,7 @@ export async function handleChatEvent(
   }
 
   const chatScopeKey =
-    chatScopeSessionKey(userMapping.agent_id, spaceType, senderEmail, spaceName) ??
+    chatThreadSessionKey(senderEmail, spaceName, threadName) ??
     `chat_event_scope:${eventKey}`;
   const chatScopeLock = getThreadLock(env, chatScopeKey);
   const chatScopeLockResult = await chatScopeLock.acquire(
@@ -542,9 +541,8 @@ export async function handleChatEvent(
     }
   }
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
-  // Grill Me 正本に合わせ、intent 判定は context hint とログに限定する。
-  // /mail でも fresh session や mail専用 agent へ逃がさず、同じ社員 agent /
-  // 同じ scope session を継続する。
+  // intent 判定は context hint とログに限定する。/mail でも mail専用 agent
+  // へ逃がさず、Google Chat thread session を継続する。
   let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
   if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
@@ -634,7 +632,6 @@ export async function handleChatEvent(
         personaSpec: PERSONA_SPEC,
         toolsSpec: TOOLS_SPEC,
         extraContentBlocks,
-        forceFreshSession: hasChatAttachments,
         ...(historyBlock ? { historyBlock } : {}),
         ...(speakerContextBlock ? { speakerContextBlock } : {}),
         ...(intent
@@ -740,6 +737,23 @@ export async function handleChatEvent(
             `rec_degraded=${degraded} ` +
             `rec_error=${recoveryResult.error || 'n/a'}`,
         );
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'cap_recovery_result',
+          level: recoveryResult.outcome === 'recovered' ? 'info' : 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            outcome: recoveryResult.outcome,
+            original_stop_reason: pythonStopReason,
+            recovery_stop_reason: recoveryResult.stopReason || null,
+            recovery_text_chars: recoveryResult.text.length,
+            recovery_tool_names: recoveryResult.toolNames,
+            degraded,
+            error: recoveryResult.error || null,
+          },
+        });
         if (recoveryResult.outcome === 'recovered' && recoveryResult.text) {
           // 収集済み部分テキストを recovered 本文で置換。
           // Python `collected[:] = [_rec["text"]]` + `_recovery_suppressed_cap_notice`

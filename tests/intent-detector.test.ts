@@ -352,7 +352,7 @@ describe('Integration: chat-event-handler intent wiring', () => {
     expect(intent!.isActionSkill).toBe(true);
 
     // Grill Me 正本: /mail でも fresh session に逃がさず、同じ社員 agent /
-    // 同じ scope session で確認往復の文脈を保つ。
+    // 同じ Chat thread session で確認往復の文脈を保つ。
     const shouldContinueSession = true;
     expect(shouldContinueSession).toBe(true);
 
