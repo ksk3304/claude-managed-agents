@@ -463,6 +463,44 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('Case 1c: EMAIL_SEND preview text renders escaped newlines as real newlines', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '以下の内容で送ります。\n\n宛先: alice@example.com\n件名: Re\n本文: 1行目\\n2行目\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"1行目\\n2行目"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response(JSON.stringify({ message_id: 'msg_preview' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('本文: 1行目\n2行目');
+      expect(chatApiMock.patches[0]!.text).not.toContain('1行目\\n2行目');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 2: shared space + bot mention あり → 同経路で committed', async () => {
     const env = buildEnv();
     // annotations-based 厳密 mention (= Python `_is_for_bot` 等価)。

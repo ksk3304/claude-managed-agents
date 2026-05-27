@@ -757,8 +757,12 @@ export async function handleChatEvent(
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
-  const markerLeakScrubbed = scrubActionMarkerLeakForChat(
+  const displayText = normalizeEmailPreviewEscapedNewlines(
     scheduleResult.cleanedText,
+    emailParsed.markers.length,
+  );
+  const markerLeakScrubbed = scrubActionMarkerLeakForChat(
+    displayText,
     emailParsed.markers.length,
   );
   if (markerLeakScrubbed.scrubbed) {
@@ -1092,6 +1096,14 @@ function scrubActionMarkerLeakForChat(
     scrubbed: true,
     reason: 'action_marker_terms',
   };
+}
+
+function normalizeEmailPreviewEscapedNewlines(
+  text: string,
+  parsedEmailMarkerCount: number,
+): string {
+  if (parsedEmailMarkerCount === 0) return text;
+  return text.replace(/\\n/g, '\n');
 }
 
 function formatEmailDispatchErrorReason(err: unknown): string {
