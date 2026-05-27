@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   auditEnabled,
+  pruneExpiredCmaObservability,
   recordSessionBind,
   recordRuntimeEvent,
   redactForAudit,
@@ -136,6 +137,36 @@ describe('cma-observability', () => {
     expect(rows[0]!.detail_json).toContain('[REDACTED_EMAIL]');
     expect(rows[0]!.detail_json).toContain('[REDACTED_TOKEN]');
     expect(rows[0]!.detail_json).not.toContain('user@example.com');
+    log.mockRestore();
+  });
+
+  it('prunes expired payload audit and runtime event rows', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const db = makeMakotoDb();
+    await savePayloadAudit({
+      db,
+      enabledFlag: '1',
+      ttlDays: 1,
+      sessionId: 'sesn_payload',
+      eventKey: 'chat:event:payload',
+      payload: { text: 'hello' },
+    });
+    await recordRuntimeEvent({
+      db,
+      ttlDays: 1,
+      eventKey: 'chat:event:runtime',
+      eventType: 'runtime_event',
+    });
+    for (const row of db._tables.cma_session_payload_audit.values()) {
+      row.expire_at_ms = 1_000;
+    }
+    for (const row of db._tables.cma_worker_runtime_events.values()) {
+      row.expire_at_ms = 1_000;
+    }
+    const result = await pruneExpiredCmaObservability(db, 2_000);
+    expect(result).toEqual({ payloadAudit: 1, runtimeEvents: 2 });
+    expect(db._tables.cma_session_payload_audit.size).toBe(0);
+    expect(db._tables.cma_worker_runtime_events.size).toBe(0);
     log.mockRestore();
   });
 });

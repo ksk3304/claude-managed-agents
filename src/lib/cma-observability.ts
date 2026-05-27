@@ -61,6 +61,11 @@ export interface RuntimeEventInput {
   detail?: unknown;
 }
 
+export interface CmaObservabilityPruneResult {
+  payloadAudit: number;
+  runtimeEvents: number;
+}
+
 export function auditEnabled(raw: string | null | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase());
 }
@@ -282,6 +287,24 @@ export async function recordRuntimeEvent(input: RuntimeEventInput): Promise<bool
     );
     return false;
   }
+}
+
+export async function pruneExpiredCmaObservability(
+  db: D1Database,
+  now = Date.now(),
+): Promise<CmaObservabilityPruneResult> {
+  const payload = await db
+    .prepare(`DELETE FROM ${PAYLOAD_AUDIT_TABLE} WHERE expire_at_ms <= ?1`)
+    .bind(now)
+    .run();
+  const runtime = await db
+    .prepare(`DELETE FROM ${RUNTIME_EVENTS_TABLE} WHERE expire_at_ms <= ?1`)
+    .bind(now)
+    .run();
+  return {
+    payloadAudit: payload.meta?.changes ?? 0,
+    runtimeEvents: runtime.meta?.changes ?? 0,
+  };
 }
 
 function redactText(text: string): string {

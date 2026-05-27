@@ -34,7 +34,10 @@ import { pruneExpiredDedupe } from "./lib/dedupe";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import { buildAnthropicClient } from "./lib/session";
-import { recordRuntimeEvent } from "./lib/cma-observability";
+import {
+  pruneExpiredCmaObservability,
+  recordRuntimeEvent,
+} from "./lib/cma-observability";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -133,6 +136,14 @@ export default {
           );
         } catch (error) {
           console.error("[cron] agentmail prune failed", error);
+        }
+        try {
+          const observabilityPruned = await pruneExpiredCmaObservability(env.DB);
+          console.log(
+            `[cron] cma-observability-prune payload_audit=${observabilityPruned.payloadAudit} runtime_events=${observabilityPruned.runtimeEvents}`,
+          );
+        } catch (error) {
+          console.error("[cron] cma observability prune failed", error);
         }
       })(),
     );

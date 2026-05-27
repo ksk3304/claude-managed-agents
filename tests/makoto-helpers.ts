@@ -294,6 +294,17 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       });
       return { results: [], meta: { changes: 1 } };
     }
+    if (/^DELETE FROM cma_session_payload_audit WHERE expire_at_ms <= \?1$/i.test(trimmed)) {
+      const [cutoff] = params as [number];
+      let changes = 0;
+      for (const [id, row] of tables.cma_session_payload_audit) {
+        if (Number(row.expire_at_ms) <= Number(cutoff)) {
+          tables.cma_session_payload_audit.delete(id);
+          changes++;
+        }
+      }
+      return { results: [], meta: { changes } };
+    }
     if (/^INSERT INTO cma_worker_runtime_events /i.test(trimmed)) {
       const [
         id,
@@ -337,6 +348,17 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         detail_chars,
       });
       return { results: [], meta: { changes: 1 } };
+    }
+    if (/^DELETE FROM cma_worker_runtime_events WHERE expire_at_ms <= \?1$/i.test(trimmed)) {
+      const [cutoff] = params as [number];
+      let changes = 0;
+      for (const [id, row] of tables.cma_worker_runtime_events) {
+        if (Number(row.expire_at_ms) <= Number(cutoff)) {
+          tables.cma_worker_runtime_events.delete(id);
+          changes++;
+        }
+      }
+      return { results: [], meta: { changes } };
     }
 
     // ----- sent_messages (with rfc822_msgid extension) -----
