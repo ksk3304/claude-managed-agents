@@ -22,7 +22,7 @@ import {
 import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { handleGoogleChatWebhook } from "./webhooks/google-chat";
-import type { ChatQueueMessage } from "./webhooks/google-chat";
+import type { ChatEventPayload, ChatQueueMessage } from "./webhooks/google-chat";
 import { handleChatQueue } from "./queue/chat-event-handler";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { OAuthLease } from "./durable-objects/oauth-lease";
@@ -33,6 +33,12 @@ import {
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import { buildAnthropicClient } from "./lib/session";
+import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
+import {
+  recordChatWebhookPayload,
+  recordRuntimeEvent,
+  pruneObservability,
+} from "./lib/observability";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -83,6 +89,16 @@ export default {
       return handleGoogleChatWebhook(request, env);
     }
 
+    // Issue #206 observability smoke endpoint. This deliberately bypasses
+    // Google Chat OIDC and exists only for operator-triggered smoke tests.
+    // No secret = 404, so production keeps the route inert by default.
+    if (
+      url.pathname === "/webhooks/issue-206/chat-observe" &&
+      request.method === "POST"
+    ) {
+      return handleIssue206ChatObserve(request, env);
+    }
+
     return new Response("not found", { status: 404 });
   },
 
@@ -119,8 +135,15 @@ export default {
         try {
           const dedupePruned = await pruneExpiredDedupe(env.DB);
           const seenPruned = await pruneExpiredAgentMailWebhookSeen(env.DB);
+          const observabilityPruned = await pruneObservability(env);
           console.log(
             `[cron] agentmail-prune dedupe=${dedupePruned} webhook_seen=${seenPruned}`,
+          );
+          console.log(
+            `[cron] observability-prune webhook_payloads=${observabilityPruned.webhookPayloads} ` +
+              `runtime_events=${observabilityPruned.runtimeEvents} ` +
+              `session_binds=${observabilityPruned.sessionBinds} ` +
+              `payload_audit=${observabilityPruned.payloadAudit}`,
           );
         } catch (error) {
           console.error("[cron] agentmail prune failed", error);
@@ -199,4 +222,93 @@ async function runDailyReportCron(env: Env): Promise<void> {
   } catch (error) {
     console.error("[cron] daily-report failed", error);
   }
+}
+
+interface Issue206DebugBody {
+  runId?: string;
+  text?: string;
+  senderEmail?: string;
+  senderName?: string;
+  spaceName?: string;
+  threadName?: string;
+  messageName?: string;
+}
+
+async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Response> {
+  const expected = (env.MAKOTO_DEBUG_TOKEN ?? "").trim();
+  if (!expected) return new Response("not found", { status: 404 });
+  const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
+  if (got !== expected) return new Response("not found", { status: 404 });
+
+  let body: Issue206DebugBody;
+  try {
+    body = (await request.json()) as Issue206DebugBody;
+  } catch {
+    return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  const runId = safeDebugId(body.runId || `issue206-${Date.now()}`);
+  const spaceName = body.spaceName || "spaces/issue206-smoke";
+  const threadName = body.threadName || `${spaceName}/threads/${runId}`;
+  const messageName = body.messageName || `${spaceName}/messages/${runId}`;
+  const senderEmail = body.senderEmail || "issue206-smoke@example.com";
+  const event: ChatEventPayload = {
+    type: "MESSAGE",
+    eventTime: new Date().toISOString(),
+    space: { name: spaceName, type: "DM", displayName: "Issue 206 smoke" },
+    user: { name: body.senderName || "users/issue206", email: senderEmail },
+    message: {
+      name: messageName,
+      sender: {
+        name: body.senderName || "users/issue206",
+        displayName: "Issue 206 Smoke",
+        email: senderEmail,
+      },
+      text: body.text || "#206 observability smoke",
+      thread: { name: threadName },
+      annotations: [],
+      attachment: [],
+    },
+  };
+  const eventKey = `chat:msgname:${messageName}`;
+  const owner = newClaimOwner("issue206-debug");
+  const claim = await tryClaim(env.DB, eventKey, owner);
+  if (claim.state === "DONE_DUPLICATE" || claim.state === "LEASE_ALIVE") {
+    return Response.json({ ok: true, duplicate: true, eventKey, claimState: claim.state });
+  }
+  if (claim.owner === undefined || claim.version === undefined) {
+    return Response.json({ ok: false, error: "unexpected claim state" }, { status: 500 });
+  }
+  await recordChatWebhookPayload(env, eventKey, event);
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId: messageName,
+    eventType: "debug_chat_observe_enqueued",
+    source: "issue-206-debug-endpoint",
+    detail: { run_id: runId, text_chars: event.message?.text?.length ?? 0 },
+  });
+  const queueMsg: ChatQueueMessage = {
+    eventKey,
+    receivedAtMs: Date.now(),
+    claim: { owner: claim.owner, version: claim.version },
+    payload: event,
+  };
+  try {
+    await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
+  } catch (err) {
+    await releaseClaim(env.DB, eventKey, claim.owner, claim.version);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: messageName,
+      eventType: "debug_chat_observe_enqueue_failed",
+      level: "error",
+      source: "issue-206-debug-endpoint",
+      detail: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return Response.json({ ok: false, eventKey, error: "queue send failed" }, { status: 500 });
+  }
+  return Response.json({ ok: true, eventKey, sessionLookup: { spaceName, threadName, senderEmail } });
+}
+
+function safeDebugId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.:-]/g, "-").slice(0, 80) || "issue206-smoke";
 }

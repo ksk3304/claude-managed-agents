@@ -34,6 +34,10 @@ interface MakotoTables {
   email_threads: Map<string, FakeRow>;
   sessions: Map<string, FakeRow>;
   agent_emails: Map<string, FakeRow>;
+  cma_chat_webhook_payloads: FakeRow[];
+  cma_worker_runtime_events: FakeRow[];
+  cma_session_binds: FakeRow[];
+  cma_session_payload_audit: FakeRow[];
 }
 
 export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
@@ -45,6 +49,10 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
     email_threads: new Map(),
     sessions: new Map(),
     agent_emails: new Map(),
+    cma_chat_webhook_payloads: [],
+    cma_worker_runtime_events: [],
+    cma_session_binds: [],
+    cma_session_payload_audit: [],
   };
 
   function exec(
@@ -169,6 +177,140 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         }
       }
       return { results: [], meta: { changes } };
+    }
+
+    // ----- Issue #206 observability -----
+    if (/^INSERT INTO cma_chat_webhook_payloads/i.test(trimmed)) {
+      const [
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        message_id,
+        space_name_hash,
+        thread_name_hash,
+        sender_name_hash,
+        sender_type,
+        event_type,
+        space_type,
+        text_chars,
+        attachment_count,
+        annotation_count,
+        redacted_preview,
+      ] = params;
+      tables.cma_chat_webhook_payloads.push({
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        message_id,
+        space_name_hash,
+        thread_name_hash,
+        sender_name_hash,
+        sender_type,
+        event_type,
+        space_type,
+        text_chars,
+        attachment_count,
+        annotation_count,
+        redacted_preview,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cma_worker_runtime_events/i.test(trimmed)) {
+      const [
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        session_id,
+        message_id,
+        user_slug,
+        event_type,
+        level,
+        source,
+        detail_json,
+        detail_chars,
+      ] = params;
+      tables.cma_worker_runtime_events.push({
+        created_at_ms,
+        expire_at_ms,
+        event_key,
+        session_id,
+        message_id,
+        user_slug,
+        event_type,
+        level,
+        source,
+        detail_json,
+        detail_chars,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cma_session_binds/i.test(trimmed)) {
+      const [
+        created_at_ms,
+        expire_at_ms,
+        session_key_hash,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        thread_name_hash,
+        is_new_session,
+      ] = params;
+      tables.cma_session_binds.push({
+        created_at_ms,
+        expire_at_ms,
+        session_key_hash,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        thread_name_hash,
+        is_new_session,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cma_session_payload_audit/i.test(trimmed)) {
+      const [
+        created_at_ms,
+        expire_at_ms,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        session_key_hash,
+        payload_json,
+        payload_chars,
+      ] = params;
+      tables.cma_session_payload_audit.push({
+        created_at_ms,
+        expire_at_ms,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        session_key_hash,
+        payload_json,
+        payload_chars,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    const obsDelete = trimmed.match(
+      /^DELETE FROM (cma_chat_webhook_payloads|cma_worker_runtime_events|cma_session_binds|cma_session_payload_audit) WHERE expire_at_ms < \?$/i,
+    );
+    if (obsDelete) {
+      const table = obsDelete[1] as keyof Pick<
+        MakotoTables,
+        | 'cma_chat_webhook_payloads'
+        | 'cma_worker_runtime_events'
+        | 'cma_session_binds'
+        | 'cma_session_payload_audit'
+      >;
+      const [cutoff] = params as [number];
+      const before = tables[table].length;
+      tables[table] = tables[table].filter(
+        (row) => Number(row.expire_at_ms) >= Number(cutoff),
+      ) as MakotoTables[typeof table];
+      return { results: [], meta: { changes: before - tables[table].length } };
     }
 
     // ----- oauth_audit -----
