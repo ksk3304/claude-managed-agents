@@ -30,7 +30,13 @@ import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
-import { makeFetchMock, makeKv, makeMakotoDb } from './makoto-helpers';
+import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
+import {
+  makeFetchMock,
+  makeKv,
+  makeMakotoDb,
+  TEST_VAULT_KEY_B64,
+} from './makoto-helpers';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -357,6 +363,7 @@ async function putMapping(env: Env, email: string, opts: { withSessionLog?: bool
 }
 
 beforeEach(() => {
+  _resetChatOAuthCacheForTests();
   chatApiMock.posts.length = 0;
   chatApiMock.patches.length = 0;
   chatApiMock.deletes.length = 0;
@@ -466,6 +473,88 @@ describe('handleChatEvent', () => {
     );
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
+  });
+
+  it('Case 2b: shared thread history uses User OAuth token instead of service account', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCHAT_OAUTH_REFRESH_TOKEN_SEED: 'seed-refresh-token',
+        GCHAT_OAUTH_CLIENT_ID: 'chat-client-id.apps.googleusercontent.com',
+        GCHAT_OAUTH_CLIENT_SECRET: 'chat-client-secret',
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      },
+    });
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM2',
+      text: '@MAKOTOくん 続きお願い',
+      threadName: 'spaces/ROOM2/threads/T2',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_2b',
+      events: [
+        { type: 'agent.message.text', text: '履歴を踏まえた回答です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const calls: Array<{ url: string; auth?: string; body?: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      calls.push({
+        url,
+        auth: (init.headers as Record<string, string> | undefined)?.Authorization,
+        body: typeof init.body === 'string' ? init.body : undefined,
+      });
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({
+            access_token: 'user-oauth-access-token',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/spaces/ROOM2/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                name: 'spaces/ROOM2/messages/M0',
+                text: '前の発言',
+                sender: { name: 'users/456', type: 'HUMAN' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      const tokenCall = calls.find((c) => c.url === 'https://oauth2.googleapis.com/token');
+      expect(tokenCall?.body).toContain('grant_type=refresh_token');
+      const historyCall = calls.find((c) =>
+        c.url.startsWith('https://chat.googleapis.com/v1/spaces/ROOM2/messages'),
+      );
+      expect(historyCall?.auth).toBe('Bearer user-oauth-access-token');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('Case 3: shared space + bot mention なし → skip + commit', async () => {
