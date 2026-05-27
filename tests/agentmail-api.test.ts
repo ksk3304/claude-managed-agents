@@ -20,9 +20,9 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('AgentMailClient.sendMessage', () => {
-  it('POSTs to /v0/inboxes/{inbox}/messages with the right body', async () => {
+  it('POSTs to /v0/inboxes/{inbox}/messages/send with the right body', async () => {
     const fetchMock = makeFetchMock(async (url, init) => {
-      expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/messages`);
+      expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/messages/send`);
       expect(init.method).toBe('POST');
       expect((init.headers as Record<string, string>)['authorization']).toBe(
         `Bearer ${API_KEY}`,
