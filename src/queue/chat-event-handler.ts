@@ -373,6 +373,22 @@ export async function handleChatEvent(
           currentMessageName: message.name ?? '',
         });
         historyBlock = historyResult.text;
+        await recordRuntimeEvent({
+          db: env.DB,
+          ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+          maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+          eventKey,
+          messageId: message.name ?? null,
+          userSlug: userMapping.user_slug,
+          eventType: 'chat_event_history_fetch_ok',
+          source: 'queue-consumer',
+          detail: {
+            fetched_messages: history.length,
+            injected_chars: historyBlock.length,
+            injected: historyBlock.length > 0,
+            unresolved_speakers: historyResult.unresolvedCount,
+          },
+        });
         if (historyResult.unresolvedCount > 0) {
           hasUnresolvedSpeakers = true;
           console.warn(
@@ -392,6 +408,22 @@ export async function handleChatEvent(
         console.warn(
           `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${reason}`,
         );
+        await recordRuntimeEvent({
+          db: env.DB,
+          ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+          maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+          eventKey,
+          messageId: message.name ?? null,
+          userSlug: userMapping.user_slug,
+          eventType: 'chat_event_history_fetch_failed',
+          level: 'WARN',
+          source: 'queue-consumer',
+          detail: {
+            reason,
+            failure_count: failure.count,
+            permanent: failure.permanent,
+          },
+        });
         if (failure.permanent) {
           await handleHistoryFetchPermanentFailure(
             env.MAKOTO_KV,
