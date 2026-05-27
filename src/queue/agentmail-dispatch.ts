@@ -85,6 +85,7 @@ import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
 import { executeWithCommit } from '../lib/three-stage-precheck';
+import { savePayloadAudit } from '../lib/cma-observability';
 import type { AgentMailMessage, EmailSendMarker } from '../types/agentmail';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import type {
@@ -247,6 +248,18 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           callerSessionId: sessionId!,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
+      auditUserMessagePayload: (payload) =>
+        savePayloadAudit({
+          db: env.DB,
+          enabledFlag: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+          ttlDays: env.CMA_AUDIT_TTL_DAYS,
+          maxPayloadChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+          sessionId: sessionId!,
+          eventKey,
+          messageId: rfc822MsgId,
+          userSlug,
+          payload,
+        }).then(() => undefined),
     });
   } catch (err) {
     console.error(
@@ -376,6 +389,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'agentmail_auto_reply',
         );
       }
     } catch (err) {

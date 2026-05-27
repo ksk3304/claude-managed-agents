@@ -13,7 +13,7 @@
  *   4. mention strip (簡略: 先頭 `@<displayName> ` のみ)
  *   5. user_mapping resolve (= `readUserMapping`)
  *   6. session orchestrate (= `session-orchestrator.ts`)
- *      - thread session KV lookup or sessions.create
+ *      - scope session KV lookup or sessions.create
  *      - `sendAndStreamWithToolDispatch` で stream consume
  *   7. assistantText parse:
  *      - EMAIL_SEND markers → AgentMail send + redaction + sent_messages row
@@ -45,7 +45,6 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { buildMailSendSkills } from '../lib/attached-skills';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
@@ -66,7 +65,9 @@ import {
   clearHistoryFailure,
   handleHistoryFetchPermanentFailure,
   isHistoryPermanentlyFailed,
+  type ChatHistoryDeps,
 } from '../lib/chat-history';
+import { getChatReadonlyAccessToken } from '../lib/chat-oauth';
 import {
   fetchSpaceMemberRoster,
   buildSpaceContextBlock,
@@ -99,7 +100,7 @@ import {
   orchestrateChatTurn,
   OrchestratorFailure,
 } from '../lib/session-orchestrator';
-import { recordRuntimeEvent } from '../lib/cma-observability';
+import { recordRuntimeEvent, savePayloadAudit } from '../lib/cma-observability';
 import {
   appendSessionLogMemory,
   isSharedSpace,
@@ -356,14 +357,15 @@ export async function handleChatEvent(
   let historyBlock = '';
   const shouldFetchHistory =
     threadName !== null &&
-    Boolean(env.CHAT_SA_KEY_JSON) &&
+    canFetchThreadHistory(env) &&
     (!isDm || isMailSendApprovalText(bodyText));
   if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
       try {
+        const historyDeps = await resolveThreadHistoryDeps(env);
         const history = await fetchThreadMessages(
-          { saKeyJson: env.CHAT_SA_KEY_JSON! },
+          historyDeps,
           spaceName,
           threadName,
         );
@@ -381,9 +383,14 @@ export async function handleChatEvent(
         }
         await clearHistoryFailure(env.MAKOTO_KV, threadName);
       } catch (err) {
-        const failure = await recordHistoryFailure(env.MAKOTO_KV, threadName);
+        const reason = err instanceof Error ? err.message : String(err);
+        const failure = await recordHistoryFailure(
+          env.MAKOTO_KV,
+          threadName,
+          reason,
+        );
         console.warn(
-          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${err instanceof Error ? err.message : String(err)}`,
+          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${reason}`,
         );
         if (failure.permanent) {
           await handleHistoryFetchPermanentFailure(
@@ -457,18 +464,9 @@ export async function handleChatEvent(
     }
   }
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
-  // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
-  // intent-detector に通して以下を決定:
-  //   - `isActionSkill=true` なら orchestrator に `forceFreshSession=true` を
-  //     渡し既存 thread session 継続を破棄 (Python l.4002-4013 等価)
-  //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
-  //   - intent 種別を user message envelope の <context> に prefix 注入
-  //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
-  // 危険語句 / 過剰 dispatch 防止:
-  //   - intent 判定はあくまで「session 経路 + context prefix 注入」までで、
-  //     ここで /mail や /schedule の skill 自体を invoke することはしない
-  //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
-  //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
+  // Grill Me 正本に合わせ、intent 判定は context hint とログに限定する。
+  // /mail でも fresh session や mail専用 agent へ逃がさず、同じ社員 agent /
+  // 同じ scope session を継続する。
   let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
   if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
@@ -476,7 +474,6 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
-  const forceFreshSession = intent?.isActionSkill === true;
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -485,12 +482,6 @@ export async function handleChatEvent(
     } else if (intent.source === 'schedule_intent') {
       console.log(
         `[chat-event] schedule intent detected eventKey=${eventKey} command=${intent.command}`,
-      );
-    }
-    if (forceFreshSession) {
-      console.log(
-        `[chat-event] continuation discarded for action skill eventKey=${eventKey} ` +
-          `command=${intent.command} source=${intent.source}`,
       );
     }
   }
@@ -536,14 +527,6 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
-  const attachedSkills =
-    intent?.command === '/mail' ? buildMailSendSkills(env) : [];
-  if (intent?.command === '/mail' && attachedSkills.length === 0) {
-    console.warn(
-      `[chat-event] mail intent without MAIL_SEND_SKILL_ID eventKey=${eventKey}`,
-    );
-  }
-
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -584,7 +567,6 @@ export async function handleChatEvent(
               },
             }
           : {}),
-        ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
         observability: {
           eventKey,
           messageId: message.name ?? null,
@@ -596,9 +578,6 @@ export async function handleChatEvent(
             boundMessageId: '',
             callerSessionId: sessionIdRef.current,
           }),
-        // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
-        // false) 起動時は KV thread session lookup/put を bypass。
-        forceFreshSession,
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
@@ -665,6 +644,18 @@ export async function handleChatEvent(
             userMessage: recoveryPrompt,
             toolDispatcher,
             maxToolCalls,
+            auditUserMessagePayload: (payload) =>
+              savePayloadAudit({
+                db: env.DB,
+                enabledFlag: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+                ttlDays: env.CMA_AUDIT_TTL_DAYS,
+                maxPayloadChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+                sessionId: sid,
+                eventKey,
+                messageId: message.name ?? null,
+                userSlug: userMapping.user_slug,
+                payload,
+              }).then(() => undefined),
           });
           return {
             text: res.assistantText,
@@ -998,6 +989,7 @@ async function dispatchEmailMarkers(
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'chat_user_requested',
         );
       }
       console.log(
@@ -1496,6 +1488,58 @@ async function safeDeletePlaceholder(
   }
 }
 
+function canFetchThreadHistory(env: Env): boolean {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length > 0 && env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      `[chat-event] history user OAuth incomplete; service-account fallback available missing=${missing.join(',')}`,
+    );
+  }
+  return Boolean(
+    missing.length === 0 ||
+      env.CHAT_SA_KEY_JSON,
+  );
+}
+
+async function resolveThreadHistoryDeps(env: Env): Promise<ChatHistoryDeps> {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length === 0) {
+    const vaultKeyB64 = env.OAUTH_VAULT_KEY!;
+    const clientId = env.GCHAT_OAUTH_CLIENT_ID!;
+    const clientSecret = env.GCHAT_OAUTH_CLIENT_SECRET!;
+    const refreshTokenSeed = env.GCHAT_OAUTH_REFRESH_TOKEN_SEED!;
+    const token = await getChatReadonlyAccessToken({
+      kv: env.MAKOTO_KV,
+      vaultKeyB64,
+      clientId,
+      clientSecret,
+      refreshTokenSeed,
+    });
+    console.log(
+      `[chat-event] history oauth token resolved source=${token.from_cache ? 'cache' : 'refresh'}`,
+    );
+    return { accessToken: token.access_token };
+  }
+
+  if (env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      `[chat-event] history fetch using service-account fallback; user OAuth secrets incomplete missing=${missing.join(',')}`,
+    );
+    return { saKeyJson: env.CHAT_SA_KEY_JSON };
+  }
+
+  throw new Error('thread history fetch is not configured');
+}
+
+function missingChatHistoryOAuthSecrets(env: Env): string[] {
+  const missing: string[] = [];
+  if (!env.GCHAT_OAUTH_REFRESH_TOKEN_SEED) missing.push('GCHAT_OAUTH_REFRESH_TOKEN_SEED');
+  if (!env.GCHAT_OAUTH_CLIENT_ID) missing.push('GCHAT_OAUTH_CLIENT_ID');
+  if (!env.GCHAT_OAUTH_CLIENT_SECRET) missing.push('GCHAT_OAUTH_CLIENT_SECRET');
+  if (!env.OAUTH_VAULT_KEY) missing.push('OAUTH_VAULT_KEY');
+  return missing;
+}
+
 async function safeCommit(
   env: Env,
   eventKey: string,
@@ -1653,9 +1697,8 @@ function loadSlashSkillsData(env: Env): SkillsData {
 //                       永続層が必要、Issue #186 follow-up)。Phase 2 では
 //                       status のみ port 済 (= `cost-guard-command.ts`)。
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
-// Done (Issue #186 既知 #4): intent-detector 統合 (= forceFreshSession +
-//   bodyText intent prefix。完全な /mail /schedule skill dispatch 自体は
-//   `_resolve_skill_run` 全体 port の follow-up に温存)。
+// Done (Issue #186 既知 #4): intent-detector 統合 (= bodyText intent prefix。
+//   Grill Me 正本に合わせ /mail でも同じ社員 agent / session を継続)。
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
 // ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で
 //    history fetch 結果に未登録 chat_user_id が居るとき CHAT_POST 全 marker

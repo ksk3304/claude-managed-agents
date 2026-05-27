@@ -128,21 +128,6 @@ declare namespace Cloudflare {
      */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
     /**
-     * Anthropic custom Skill for outbound email composition. When present, the
-     * Google Chat `/mail` / natural-language mail intent path uses a managed
-     * agent with this skill attached, so the behavior is visible in Claude
-     * Console instead of living only in prompt hints.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_ID`.
-     */
-    MAIL_SEND_SKILL_ID?: string;
-    /**
-     * Optional pinned version for `MAIL_SEND_SKILL_ID`. Omit to use latest.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_VERSION`.
-     */
-    MAIL_SEND_SKILL_VERSION?: string;
-    /**
      * GCP project ID hosting Cloud Scheduler jobs (Issue #186
      * SCHEDULE_ACTION dispatch)。`cma-bot-mp-20260501` 既定。未設定だと
      * `chat-event-handler.ts` 側で SCHEDULE_ACTION marker dispatch を
@@ -179,5 +164,14 @@ declare namespace Cloudflare {
      * scheduled 経路の recovery には影響しない (reactive 専用)。
      */
     CMA_REACTIVE_CAP_RECOVERY_ENABLED?: string;
+    /**
+     * Explicit opt-in for short-lived `user.message` payload audit in
+     * Cloudflare KV. Default off. Enable only while observing an incident.
+     */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Optional TTL in days for Cloudflare payload audit KV rows. */
+    CMA_AUDIT_TTL_DAYS?: string;
+    /** Optional max chars per string in Cloudflare payload audit records. */
+    CMA_AUDIT_MAX_TEXT_CHARS?: string;
   }
 }

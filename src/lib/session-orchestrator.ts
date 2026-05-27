@@ -23,8 +23,6 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { getOrCreateResources, type AgentCacheBindings } from './agent-cache';
-import { hasAttachedSkills } from './attached-skills';
 import type { UserMappingValue } from './memory-attach';
 import {
   buildAnthropicClient,
@@ -52,7 +50,9 @@ import {
   savePayloadAudit,
 } from './cma-observability';
 
-/** KV key prefix for thread → session lookup. TTL 24h. */
+/** KV key prefix for scope → session lookup. TTL 24h. */
+export const KV_CHAT_SCOPE_SESSION_PREFIX = 'chat_scope_session';
+/** Legacy key kept only as fallback while 24h KV entries age out. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
@@ -75,6 +75,32 @@ export function chatThreadSessionKey(
   const thread = (threadName || '').trim();
   if (!email || !space || !thread) return null;
   return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}`;
+}
+
+/**
+ * Grill Me 正本の session key。社員 agent を owner とし、DM / space scope
+ * 単位で継続する。DM の user_id は現入力では email までしか来ないため、
+ * senderEmail を scope_id として使う。
+ */
+export function chatScopeSessionKey(
+  agentId: string,
+  spaceType: string,
+  senderEmail: string,
+  spaceName: string,
+): string | null {
+  const agent = (agentId || '').trim();
+  const normalizedSpaceType = (spaceType || '').trim().toUpperCase();
+  const email = (senderEmail || '').trim().toLowerCase();
+  const space = (spaceName || '').trim();
+  if (!agent) return null;
+
+  if (normalizedSpaceType === 'DM') {
+    if (!email) return null;
+    return `${KV_CHAT_SCOPE_SESSION_PREFIX}:${agent}:dm:${email}`;
+  }
+
+  if (!space) return null;
+  return `${KV_CHAT_SCOPE_SESSION_PREFIX}:${agent}:space:${space}`;
 }
 
 /**
@@ -111,20 +137,6 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
-  /**
-   * Action skill (= attach_memory=false) 起動時に true で渡す (Issue #186
-   * 既知 #4 intent-detector 統合)。
-   *
-   * true のとき:
-   *   - KV thread session lookup を skip (= 既存 session を再利用しない)
-   *   - sessions.create で生成した新 sessionId を KV put しない
-   *     (= 次ターン以降も ephemeral 経路を踏ませる)
-   *
-   * 効果: Cloud Run `cma_gchat_bot.py:_handle_event:l.4002-4013` 等価。
-   * 「スレッド 2 通目以降の "メールして" が前セッションの memory + bash
-   * 前提で暴走する」(incident 2026-05-08 同根) を防ぐ。
-   */
-  forceFreshSession?: boolean;
   /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
@@ -219,7 +231,7 @@ export class OrchestratorFailure extends Error {
  *
  * 流れ:
  *   1. `client` が null なら `OrchestratorFailure('no_anthropic_client')` を throw
- *   2. thread session key を組み立て KV を引く (key が null = 必ず新規)
+ *   2. scope session key を組み立て KV を引く (key が null = 必ず新規)
  *   3. KV hit なら既存 sessionId を再利用、miss なら sessions.create + KV put
  *   4. system prompt 起動ログを 1 回出力 (drift 検出用)
  *   5. user message envelope を組み立てて `sendAndStreamWithToolDispatch` で
@@ -267,17 +279,22 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
-  // `forceFreshSession=true` のときは KV lookup を skip (= 既存 session を
-  // 再利用しない、Issue #186 既知 #4 intent-detector 統合)。Cloud Run
-  // `_handle_event:l.4002-4013` 等価で「スレッド 2 通目以降の メールして」
-  // が前セッションの memory + bash 前提で暴走する」を防ぐ。
-  const sessionKey = chatThreadSessionKey(
+  // Grill Me 正本に合わせ、/mail 等の action intent でも同じ社員 agent /
+  // 同じ scope session を継続する。ここで fresh session に逃がすと確認往復の
+  // 宛先・件名・本文を失うため、KV lookup/put は常に通常 turn と同じ扱い。
+  const sessionKey = chatScopeSessionKey(
+    input.userMapping.agent_id,
+    input.spaceType,
+    input.senderEmail,
+    input.spaceName,
+  );
+  const legacyThreadSessionKey = chatThreadSessionKey(
     input.senderEmail,
     input.spaceName,
     input.threadName,
   );
   let sessionId: string | null = null;
-  if (sessionKey !== null && !input.forceFreshSession) {
+  if (sessionKey !== null) {
     try {
       sessionId = await kv.get(sessionKey);
     } catch (err) {
@@ -288,59 +305,38 @@ export async function orchestrateChatTurn(
       sessionId = null;
     }
   }
+  if (sessionId === null && legacyThreadSessionKey !== null) {
+    try {
+      sessionId = await kv.get(legacyThreadSessionKey);
+      if (sessionId !== null && sessionKey !== null) {
+        try {
+          await kv.put(sessionKey, sessionId, {
+            expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
+          });
+        } catch (err) {
+          console.warn(
+            `[chat-event] KV put failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        console.log(
+          `[chat-event] legacy thread session migrated key=${legacyThreadSessionKey} ` +
+            `scope_key=${sessionKey}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[chat-event] KV get failed key=${legacyThreadSessionKey}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      sessionId = null;
+    }
+  }
 
   let isNewSession = false;
   if (sessionId === null) {
     const resources: MemoryStoreResourceParam[] =
       input.userMapping.memory_attachments.map(toResourceParam);
-    let agentId = input.userMapping.agent_id;
-    let environmentId = input.env.ENVIRONMENT_ID;
-    const attachedSkills = input.attachedSkills ?? null;
-
-    if (hasAttachedSkills(attachedSkills)) {
-      try {
-        const skillResources = await getOrCreateResources(
-          {
-            DB: input.env.DB as unknown as AgentCacheBindings['DB'],
-            MAKOTO_KV: input.env.MAKOTO_KV as unknown as AgentCacheBindings['MAKOTO_KV'],
-          },
-          async (createOpts) => {
-            const agent = await client.beta.agents.create({
-              name: createOpts.agentName,
-              model: createOpts.model,
-              system: createOpts.system,
-              tools: createOpts.tools as unknown as Anthropic.Beta.Agents.AgentCreateParams['tools'],
-              skills: createOpts.skills as unknown as Anthropic.Beta.Agents.AgentCreateParams['skills'],
-            });
-            const environment = await client.beta.environments.create({
-              name: createOpts.environmentName,
-            });
-            return { agent_id: agent.id, environment_id: environment.id };
-          },
-          {
-            agentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            environmentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            system: systemPromptInfo.systemPrompt,
-            skills: attachedSkills,
-            userSlug: input.userMapping.user_slug,
-          },
-        );
-        agentId = skillResources.agent_id;
-        environmentId = skillResources.environment_id;
-        console.log(
-          `[chat-event] attached-skill agent resolved agent=${agentId} ` +
-            `env=${environmentId} source=${skillResources.source} user=${input.userMapping.user_slug}`,
-        );
-      } catch (err) {
-        throw new OrchestratorFailure(
-          'sessions_create_failed',
-          `attached skill agent create failed for user=${input.userMapping.user_slug}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          err,
-        );
-      }
-    }
+    const agentId = input.userMapping.agent_id;
+    const environmentId = input.env.ENVIRONMENT_ID;
 
     try {
       sessionId = await createSessionWithResources(client, {
@@ -358,13 +354,9 @@ export async function orchestrateChatTurn(
     isNewSession = true;
     console.log(
       `[chat-event] created session=${sessionId} agent=${agentId} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}` +
-        (input.forceFreshSession ? ' ephemeral=true' : ''),
+        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
     );
-    // `forceFreshSession=true` のときは KV put も skip (= 次ターン以降も
-    // 毎回 ephemeral 経路を踏ませる)。Cloud Run `_handle_event:l.4010-4013`
-    // 「session_key = None で thread_sessions に保存しない」と等価。
-    if (sessionKey !== null && !input.forceFreshSession) {
+    if (sessionKey !== null) {
       try {
         await kv.put(sessionKey, sessionId, {
           expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,

@@ -281,6 +281,8 @@ export interface SendAndStreamWithToolDispatchInput {
    */
   userMessage: string | UserMessageContentBlock[];
   toolDispatcher: ToolDispatcher;
+  /** Optional observability hook called immediately before events.send(user.message). */
+  auditUserMessagePayload?: UserMessagePayloadAuditHook;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
   /**
@@ -315,8 +317,6 @@ export interface SendAndStreamWithToolDispatchInput {
    * returns partial results instead of throwing.
    */
   sessionWatchdogSec?: number;
-  /** Optional observability hook called immediately before events.send(user.message). */
-  auditUserMessagePayload?: UserMessagePayloadAuditHook;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;

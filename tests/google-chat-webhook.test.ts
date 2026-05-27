@@ -241,8 +241,9 @@ describe('google-chat webhook handler', () => {
     globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
     const env = envWith();
     const jwt = await signJwt(fixture);
-    // Flip the first character of the signature segment. The last base64url
-    // character can sit in padding bits for some signature lengths.
+    // Flip the first character of the signature segment. The final base64url
+    // character can contain padding bits, so changing it may not change the
+    // decoded signature bytes for every random fixture.
     const parts = jwt.split('.');
     parts[2] =
       (parts[2]!.startsWith('A') ? 'B' : 'A') + parts[2]!.slice(1);
