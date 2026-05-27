@@ -39,7 +39,11 @@ import {
   recordRuntimeEvent,
 } from "./lib/cma-observability";
 import { getChatReadonlyAccessToken } from "./lib/chat-oauth";
-import { fetchThreadMessages } from "./lib/chat-history";
+import {
+  fetchThreadMessages,
+  formatThreadHistoryWithMeta,
+} from "./lib/chat-history";
+import { buildUserMessageEnvelope } from "./lib/user-message-envelope";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -102,6 +106,13 @@ export default {
       request.method === "POST"
     ) {
       return handleIssue186HistoryCheck(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/issue-186/history-envelope-check" &&
+      request.method === "POST"
+    ) {
+      return handleIssue186HistoryEnvelopeCheck(request, env);
     }
 
     return new Response("not found", { status: 404 });
@@ -245,6 +256,13 @@ interface Issue186HistoryCheckBody {
   pageSize?: unknown;
 }
 
+interface Issue186HistoryEnvelopeCheckBody extends Issue186HistoryCheckBody {
+  messageName?: unknown;
+  bodyText?: unknown;
+  senderEmail?: unknown;
+  spaceType?: unknown;
+}
+
 async function handleIssue186HistoryCheck(
   request: Request,
   env: Env,
@@ -360,6 +378,135 @@ function missingHistoryOAuthSecrets(env: Env): string[] {
   if (!env.GCHAT_OAUTH_CLIENT_SECRET) missing.push("GCHAT_OAUTH_CLIENT_SECRET");
   if (!env.OAUTH_VAULT_KEY) missing.push("OAUTH_VAULT_KEY");
   return missing;
+}
+
+async function handleIssue186HistoryEnvelopeCheck(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const token = env.MAKOTO_DEBUG_TOKEN?.trim();
+  if (!token) {
+    return new Response("not found", { status: 404 });
+  }
+  if (request.headers.get("x-makoto-debug-token") !== token) {
+    return Response.json({ error: "forbidden" }, { status: 403 });
+  }
+
+  let body: Issue186HistoryEnvelopeCheckBody;
+  try {
+    body = (await request.json()) as Issue186HistoryEnvelopeCheckBody;
+  } catch {
+    return Response.json({ error: "invalid JSON" }, { status: 400 });
+  }
+
+  const runId =
+    typeof body.runId === "string" && body.runId.trim()
+      ? body.runId.trim()
+      : `history-envelope-check-${Date.now()}`;
+  const spaceName =
+    typeof body.spaceName === "string" ? body.spaceName.trim() : "";
+  const threadName =
+    typeof body.threadName === "string" ? body.threadName.trim() : "";
+  const messageName =
+    typeof body.messageName === "string" ? body.messageName.trim() : "";
+  const pageSize =
+    typeof body.pageSize === "number" && Number.isFinite(body.pageSize)
+      ? Math.max(1, Math.min(10, Math.trunc(body.pageSize)))
+      : 10;
+  const bodyText =
+    typeof body.bodyText === "string" && body.bodyText.trim()
+      ? body.bodyText
+      : "直前の文脈を踏まえて短く返して";
+  const senderEmail =
+    typeof body.senderEmail === "string" ? body.senderEmail.trim() : "";
+  const spaceType =
+    typeof body.spaceType === "string" && body.spaceType.trim()
+      ? body.spaceType.trim()
+      : "ROOM";
+  const eventKey = `issue186:history-envelope-check:${runId}`;
+
+  if (!/^[A-Za-z0-9._:-]{1,80}$/.test(runId)) {
+    return Response.json({ error: "invalid runId" }, { status: 400 });
+  }
+  if (!spaceName.startsWith("spaces/") || !threadName.startsWith(`${spaceName}/threads/`)) {
+    return Response.json({ error: "invalid spaceName/threadName" }, { status: 400 });
+  }
+
+  const missing = missingHistoryOAuthSecrets(env);
+  if (missing.length > 0) {
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_envelope_check_failed",
+      level: "WARN",
+      source: "http-ingress",
+      detail: { reason: "oauth_secrets_missing", missing },
+    });
+    return Response.json(
+      { ok: false, error: "oauth_secrets_missing", missing },
+      { status: 500 },
+    );
+  }
+
+  try {
+    const accessToken = await getChatReadonlyAccessToken({
+      kv: env.MAKOTO_KV,
+      vaultKeyB64: env.OAUTH_VAULT_KEY!,
+      clientId: env.GCHAT_OAUTH_CLIENT_ID!,
+      clientSecret: env.GCHAT_OAUTH_CLIENT_SECRET!,
+      refreshTokenSeed: env.GCHAT_OAUTH_REFRESH_TOKEN_SEED!,
+    });
+    const messages = await fetchThreadMessages(
+      { accessToken: accessToken.access_token },
+      spaceName,
+      threadName,
+      { pageSize, maxPages: 1 },
+    );
+    const historyResult = formatThreadHistoryWithMeta(messages, {
+      currentMessageName: messageName,
+    });
+    const envelope = buildUserMessageEnvelope(bodyText, {
+      speaker: { spaceType, senderEmail },
+      ...(historyResult.text ? { history: historyResult.text } : {}),
+    });
+    const hasMentionHeader = envelope.includes("## 今回のメンション");
+    const result = {
+      ok: true,
+      runId,
+      authSource: accessToken.from_cache ? "cache" : "refresh",
+      fetchedMessages: messages.length,
+      historyChars: historyResult.text.length,
+      injected: historyResult.text.length > 0,
+      envelopeChars: envelope.length,
+      hasMentionHeader,
+      unresolvedSpeakers: historyResult.unresolvedCount,
+    };
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_envelope_check_ok",
+      source: "http-ingress",
+      detail: result,
+    });
+    return Response.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await recordRuntimeEvent({
+      db: env.DB,
+      ttlDays: env.CMA_RUNTIME_EVENT_TTL_DAYS,
+      maxDetailChars: env.CMA_RUNTIME_EVENT_MAX_DETAIL_CHARS,
+      eventKey,
+      eventType: "issue_186_history_envelope_check_failed",
+      level: "WARN",
+      source: "http-ingress",
+      detail: { reason: message },
+    });
+    return Response.json({ ok: false, error: message }, { status: 502 });
+  }
 }
 
 async function handleIssue202ChatObserve(
