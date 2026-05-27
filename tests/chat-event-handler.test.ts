@@ -294,6 +294,7 @@ function buildQueueMsg(overrides: {
     length?: number;
     userMention?: { user?: { name?: string; type?: string } };
   }>;
+  attachment?: ChatQueueMessage['payload']['message']['attachment'];
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
@@ -317,6 +318,7 @@ function buildQueueMsg(overrides: {
           ? { thread: { name: overrides.threadName } }
           : {}),
         ...(overrides.annotations ? { annotations: overrides.annotations } : {}),
+        ...(overrides.attachment ? { attachment: overrides.attachment } : {}),
       },
       space: {
         name: spaceName,
@@ -828,6 +830,46 @@ describe('handleChatEvent', () => {
     expect(created).toHaveLength(0);
     expect(sends).toEqual(['sesn_legacy']);
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_legacy');
+  });
+
+  it('attachment turn forces a fresh session and does not overwrite DM scope session', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        CHAT_SA_KEY_JSON: undefined,
+      } as Partial<Env>,
+    });
+    const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
+    await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
+    const msg = buildQueueMsg({
+      attachment: [
+        {
+          contentName: 'issue198-small-pdf-test.pdf',
+          contentType: 'application/pdf',
+          attachmentDataRef: { resourceName: 'spaces/AAA/messages/M1/attachments/A1' },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_attachment_new',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '添付を読みました。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_attachment_new']);
+    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_existing');
   });
 
   it('same DM scope lock held → releases claim and retries without posting placeholder', async () => {

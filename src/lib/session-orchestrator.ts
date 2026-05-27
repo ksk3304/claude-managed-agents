@@ -135,6 +135,12 @@ export interface OrchestrateChatTurnInput {
    * または未指定なら従来通り text-only。
    */
   extraContentBlocks?: UserMessageContentBlock[];
+  /**
+   * true のとき、scope KV の既存 session を読まず、作成した session も
+   * scope KV に保存しない。添付 turn など、入力内容がファイル単位で独立し、
+   * 既存会話 session に混ぜると誤読・混線の原因になる経路で使う。
+   */
+  forceFreshSession?: boolean;
   /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
@@ -270,20 +276,25 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
-  // Grill Me 正本に合わせ、/mail 等の action intent でも同じ社員 agent /
-  // 同じ scope session を継続する。ここで fresh session に逃がすと確認往復の
-  // 宛先・件名・本文を失うため、KV lookup/put は常に通常 turn と同じ扱い。
-  const sessionKey = chatScopeSessionKey(
-    input.userMapping.agent_id,
-    input.spaceType,
-    input.senderEmail,
-    input.spaceName,
-  );
-  const legacyThreadSessionKey = chatThreadSessionKey(
-    input.senderEmail,
-    input.spaceName,
-    input.threadName,
-  );
+  // 通常 turn は Grill Me 正本に合わせ、/mail 等の action intent でも同じ
+  // 社員 agent / 同じ scope session を継続する。添付 turn はファイル単位で
+  // 独立させるため、明示 opt-in で fresh session に逃がす。
+  const forceFreshSession = input.forceFreshSession === true;
+  const sessionKey = forceFreshSession
+    ? null
+    : chatScopeSessionKey(
+        input.userMapping.agent_id,
+        input.spaceType,
+        input.senderEmail,
+        input.spaceName,
+      );
+  const legacyThreadSessionKey = forceFreshSession
+    ? null
+    : chatThreadSessionKey(
+        input.senderEmail,
+        input.spaceName,
+        input.threadName,
+      );
   let sessionId: string | null = null;
   if (sessionKey !== null) {
     try {
@@ -385,7 +396,7 @@ export async function orchestrateChatTurn(
       eventType: isNewSession ? 'cma_session_created' : 'cma_session_continued',
       source: 'session-orchestrator',
       detail: {
-        force_fresh_session: false,
+        force_fresh_session: forceFreshSession,
         has_thread_session_key: sessionKey !== null,
       },
     });

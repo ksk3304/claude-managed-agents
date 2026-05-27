@@ -223,6 +223,7 @@ export async function handleChatEvent(
   const threadName = message.thread?.name ?? null;
   const rawText = message.text ?? '';
   const annotations = message.annotations ?? [];
+  const hasChatAttachments = (message.attachment?.length ?? 0) > 0;
 
   // ---- 3. bot 宛判定 (annotations-based, Python `_is_for_bot` 等価) ----
   // 実判定は annotations の USER_MENTION (= `userMention.user.type === 'BOT'`
@@ -633,6 +634,7 @@ export async function handleChatEvent(
         personaSpec: PERSONA_SPEC,
         toolsSpec: TOOLS_SPEC,
         extraContentBlocks,
+        forceFreshSession: hasChatAttachments,
         ...(historyBlock ? { historyBlock } : {}),
         ...(speakerContextBlock ? { speakerContextBlock } : {}),
         ...(intent
