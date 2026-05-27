@@ -412,6 +412,10 @@ describe('handleChatEvent', () => {
       // 最終 reply は PATCH 経由で placeholder を書き換える。
       expect(chatApiMock.patches).toHaveLength(1);
       expect(chatApiMock.patches[0]!.text).toContain('了解しました');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
+      expect(chatApiMock.patches[0]!.text).toContain('宛先: alice@example.com');
+      expect(chatApiMock.patches[0]!.text).toContain('件名: Re');
+      expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
       expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
       // sent_messages 行
       const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
@@ -651,6 +655,33 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
+  });
+
+  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: '前のメッセージですでに `EMAIL_SEND` マーカーを出しています。bot 側で処理中です。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe(
+      '送信状況の確認に失敗しました。担当者が確認します。',
+    );
+    expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
+    expect(chatApiMock.patches[0]!.text).not.toContain('bot');
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {

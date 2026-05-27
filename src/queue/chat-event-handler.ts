@@ -704,7 +704,7 @@ export async function handleChatEvent(
       `[chat-event] EMAIL_SEND parse failure eventKey=${eventKey} reason=${f.reason} raw=${f.raw.slice(0, 200)}`,
     );
   }
-  await dispatchEmailMarkers(
+  const emailDispatchSummaries = await dispatchEmailMarkers(
     env,
     eventKey,
     emailParsed.markers,
@@ -757,7 +757,17 @@ export async function handleChatEvent(
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
-  const scrubbed = scrubInternalStateForChat(scheduleResult.cleanedText, `chat:${sessionId}`);
+  const markerLeakScrubbed = scrubActionMarkerLeakForChat(
+    scheduleResult.cleanedText,
+    emailParsed.markers.length,
+  );
+  if (markerLeakScrubbed.scrubbed) {
+    console.warn(
+      `[chat-event] action-marker leak scrubbed eventKey=${eventKey} ` +
+        `reason=${markerLeakScrubbed.reason}`,
+    );
+  }
+  const scrubbed = scrubInternalStateForChat(markerLeakScrubbed.text, `chat:${sessionId}`);
   if (scrubbed.hits.length > 0) {
     console.warn(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
@@ -766,9 +776,10 @@ export async function handleChatEvent(
   // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
-  const finalText = attachmentNotice
-    ? `${scrubbed.text}\n\n${attachmentNotice}`.trim()
-    : scrubbed.text;
+  const emailDispatchText = formatEmailDispatchSummaries(emailDispatchSummaries);
+  const finalTextParts = [scrubbed.text, emailDispatchText, attachmentNotice]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
+  const finalText = finalTextParts.join('\n\n').trim();
   if (finalText.trim().length > 0) {
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
@@ -859,21 +870,32 @@ async function dispatchEmailMarkers(
   sessionId: string,
   agentId: string,
   claim: { owner: string; version: number },
-): Promise<void> {
-  if (markers.length === 0) return;
+): Promise<EmailDispatchSummary[]> {
+  if (markers.length === 0) return [];
+  const summaries: EmailDispatchSummary[] = [];
   const apiKey = env.AGENTMAIL_API_KEY;
   const inboxId = env.AGENTMAIL_DEFAULT_INBOX_ID;
   if (!apiKey) {
     console.warn(
       `[chat-event] EMAIL_SEND skipped eventKey=${eventKey}: AGENTMAIL_API_KEY missing (${markers.length} marker(s))`,
     );
-    return;
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: 'メール送信設定が不足しています',
+    }));
   }
   if (!inboxId) {
     console.warn(
       `[chat-event] EMAIL_SEND skipped eventKey=${eventKey}: AGENTMAIL_DEFAULT_INBOX_ID missing (${markers.length} marker(s))`,
     );
-    return;
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: 'メール送信設定が不足しています',
+    }));
   }
   const opts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
   const client = new AgentMailClient(apiKey, opts);
@@ -923,12 +945,19 @@ async function dispatchEmailMarkers(
         console.log(
           `[chat-event] EMAIL_SEND already sent eventKey=${eventKey} to=${redactPiiInText(m.to)} — skipping duplicate`,
         );
+        summaries.push({ status: 'already', to: m.to, subject: m.subject });
         continue;
       }
       if (emOutcome.outcome === 'lease_alive') {
         console.warn(
           `[chat-event] EMAIL_SEND in-flight by another worker eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '別処理が送信中です',
+        });
         continue;
       }
       if (emOutcome.outcome === 'lease_lost') {
@@ -936,12 +965,24 @@ async function dispatchEmailMarkers(
         console.warn(
           `[chat-event] EMAIL_SEND lease lost eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '送信確認が完了できませんでした',
+        });
         continue;
       }
       if (emOutcome.outcome === 'precheck_failed') {
         console.warn(
           `[chat-event] EMAIL_SEND precheck failed eventKey=${eventKey} to=${redactPiiInText(m.to)} reason=${emOutcome.reason}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '送信前確認に失敗しました',
+        });
         continue;
       }
       // outcome === 'sent'
@@ -959,6 +1000,7 @@ async function dispatchEmailMarkers(
       console.log(
         `[chat-event] EMAIL_SEND ok eventKey=${eventKey} to=${redactPiiInText(m.to)} subject_chars=${m.subject.length}`,
       );
+      summaries.push({ status: 'sent', to: m.to, subject: m.subject });
     } catch (err) {
       if (err instanceof AgentMailError) {
         console.warn(
@@ -970,8 +1012,66 @@ async function dispatchEmailMarkers(
         );
       }
       // 1 marker 失敗で全体落とさない (failure isolation)。
+      summaries.push({
+        status: 'failed',
+        to: m.to,
+        subject: m.subject,
+        reason: 'メール送信に失敗しました',
+      });
     }
   }
+  return summaries;
+}
+
+interface EmailDispatchSummary {
+  status: 'sent' | 'already' | 'failed';
+  to: string;
+  subject: string;
+  reason?: string;
+}
+
+function formatEmailDispatchSummaries(summaries: EmailDispatchSummary[]): string {
+  if (summaries.length === 0) return '';
+  return summaries
+    .map((summary) => {
+      const header =
+        summary.status === 'sent'
+          ? '✅ メール送信完了'
+          : summary.status === 'already'
+            ? '✅ メール送信済み'
+            : '❌ メール送信失敗';
+      const lines = [
+        header,
+        `宛先: ${summary.to}`,
+        `件名: ${summary.subject}`,
+      ];
+      if (summary.status === 'failed' && summary.reason) {
+        lines.push(`理由: ${summary.reason}`);
+      }
+      return lines.join('\n');
+    })
+    .join('\n\n');
+}
+
+function scrubActionMarkerLeakForChat(
+  text: string,
+  parsedEmailMarkerCount: number,
+): { text: string; scrubbed: boolean; reason: string } {
+  if (parsedEmailMarkerCount > 0) {
+    return { text, scrubbed: false, reason: '' };
+  }
+  const normalized = text.toLowerCase();
+  const leaks =
+    normalized.includes('email_send') ||
+    text.includes('bot 側') ||
+    text.includes('bot側') ||
+    text.includes('マーカー');
+  if (!leaks) return { text, scrubbed: false, reason: '' };
+  return {
+    text: '送信状況の確認に失敗しました。担当者が確認します。',
+    scrubbed: true,
+    reason: 'action_marker_terms',
+  };
 }
 
 // ---------------------------------------------------------------------------
