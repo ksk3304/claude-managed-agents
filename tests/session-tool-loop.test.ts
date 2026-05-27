@@ -79,6 +79,30 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.terminalEventType).toBe('session.status_idle');
   });
 
+  it('calls payload audit hook before sending initial user.message', async () => {
+    const calls: string[] = [];
+    const client = makeFakeClient({
+      events: [{ type: 'session.status_idle' }],
+      onSend: () => calls.push('send'),
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_1',
+      userMessage: 'hi',
+      toolDispatcher: dispatcher,
+      auditUserMessagePayload: async (payload) => {
+        calls.push('audit');
+        expect(payload.events).toEqual([
+          {
+            type: 'user.message',
+            content: [{ type: 'text', text: 'hi' }],
+          },
+        ]);
+      },
+    });
+    expect(calls).toEqual(['audit', 'send']);
+  });
+
   it('dispatches agent.custom_tool_use and posts a user.custom_tool_result', async () => {
     const sent: unknown[] = [];
     const client = makeFakeClient({

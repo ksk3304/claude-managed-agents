@@ -570,6 +570,10 @@ export async function handleChatEvent(
             }
           : {}),
         ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
+        observability: {
+          eventKey,
+          messageId: message.name ?? null,
+        },
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,

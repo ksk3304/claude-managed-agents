@@ -30,6 +30,8 @@ interface MakotoTables {
   dedupe: Map<string, FakeRow>;
   oauth_audit: FakeRow[];
   agentmail_webhook_seen: Map<string, FakeRow>;
+  cma_session_binds: Map<string, FakeRow>;
+  cma_session_payload_audit: Map<string, FakeRow>;
   sent_messages: Map<string, FakeRow>;
   email_threads: Map<string, FakeRow>;
   sessions: Map<string, FakeRow>;
@@ -41,6 +43,8 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
     dedupe: new Map(),
     oauth_audit: [],
     agentmail_webhook_seen: new Map(),
+    cma_session_binds: new Map(),
+    cma_session_payload_audit: new Map(),
     sent_messages: new Map(),
     email_threads: new Map(),
     sessions: new Map(),
@@ -209,6 +213,84 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         }
       }
       return { results: [], meta: { changes } };
+    }
+
+    // ----- cma observability (#202) -----
+    if (/^INSERT INTO cma_session_binds /i.test(trimmed)) {
+      const [
+        id,
+        created_at_ms,
+        session_key_hash,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        space_name_hash,
+        thread_name_hash,
+        is_new_session,
+      ] = params as [
+        string,
+        number,
+        string | null,
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        number,
+      ];
+      tables.cma_session_binds.set(id, {
+        id,
+        created_at_ms,
+        session_key_hash,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        space_name_hash,
+        thread_name_hash,
+        is_new_session,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cma_session_payload_audit /i.test(trimmed)) {
+      const [
+        id,
+        created_at_ms,
+        expire_at_ms,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        session_key_hash,
+        payload_json,
+        payload_chars,
+      ] = params as [
+        string,
+        number,
+        number,
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        number,
+      ];
+      tables.cma_session_payload_audit.set(id, {
+        id,
+        created_at_ms,
+        expire_at_ms,
+        session_id,
+        event_key,
+        message_id,
+        user_slug,
+        session_key_hash,
+        payload_json,
+        payload_chars,
+      });
+      return { results: [], meta: { changes: 1 } };
     }
 
     // ----- sent_messages (with rfc822_msgid extension) -----

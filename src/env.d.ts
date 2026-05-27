@@ -21,6 +21,16 @@ declare namespace Cloudflare {
     // when unset; see `resolveAnthropicBaseURL` in src/anthropic.ts.
     ANTHROPIC_BASE_URL?: string;
 
+    /**
+     * Issue #202 Cloudflare observability: when explicitly set to
+     * 1/true/yes/on, the Worker stores redacted Anthropic user.message
+     * payloads in D1 `cma_session_payload_audit` for short-term incident
+     * debugging. Leave unset in normal operation.
+     */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    CMA_AUDIT_TTL_DAYS?: string;
+    CMA_AUDIT_MAX_TEXT_CHARS?: string;
+
     // Browser Rendering REST credentials. Either both are present (REST
     // path, faster, supports /markdown natively) or both are absent and
     // we fall back to the BROWSER binding via @cloudflare/puppeteer.

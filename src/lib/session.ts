@@ -91,6 +91,7 @@ export async function createSessionWithResources(
  * Issue: ksk3304/makoto-prime#186 既知 #1 + O (image / PDF / Office 添付).
  */
 export type UserMessageContentBlock = Record<string, unknown> & { type: string };
+export type UserMessagePayloadAuditHook = (payload: Record<string, unknown>) => Promise<void>;
 
 export interface SendAndStreamInput {
   sessionId: string;
@@ -102,6 +103,8 @@ export interface SendAndStreamInput {
   userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional observability hook called immediately before events.send(user.message). */
+  auditUserMessagePayload?: UserMessagePayloadAuditHook;
 }
 
 export interface SendAndStreamResult {
@@ -161,7 +164,7 @@ export async function sendAndStream(
   // document) rather than a raw string; we wrap into a single text
   // block here. Verified against
   // @anthropic-ai/sdk BetaManagedAgentsTextBlock shape.
-  await client.beta.sessions.events.send(input.sessionId, {
+  const userMessagePayload = {
     events: [
       {
         type: 'user.message',
@@ -169,7 +172,14 @@ export async function sendAndStream(
       },
     ],
     betas: [ANTHROPIC_BETA],
-  } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+  };
+  if (input.auditUserMessagePayload) {
+    await input.auditUserMessagePayload(userMessagePayload);
+  }
+  await client.beta.sessions.events.send(
+    input.sessionId,
+    userMessagePayload as unknown as Parameters<typeof client.beta.sessions.events.send>[1],
+  );
 
   // Now drain. We type the iterator loosely because the SDK's event
   // union covers many shapes the bridge does not need to model
@@ -305,6 +315,8 @@ export interface SendAndStreamWithToolDispatchInput {
    * returns partial results instead of throwing.
    */
   sessionWatchdogSec?: number;
+  /** Optional observability hook called immediately before events.send(user.message). */
+  auditUserMessagePayload?: UserMessagePayloadAuditHook;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;
@@ -347,7 +359,7 @@ export async function sendAndStreamWithToolDispatch(
   // `sendAndStream`: wrap a string into a single text block, otherwise
   // pass the typed content array straight through (= image / document
   // attachments are pre-built by the caller, see attachment-processing.ts).
-  await client.beta.sessions.events.send(input.sessionId, {
+  const userMessagePayload = {
     events: [
       {
         type: 'user.message',
@@ -355,7 +367,14 @@ export async function sendAndStreamWithToolDispatch(
       },
     ],
     betas: [ANTHROPIC_BETA],
-  } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+  };
+  if (input.auditUserMessagePayload) {
+    await input.auditUserMessagePayload(userMessagePayload);
+  }
+  await client.beta.sessions.events.send(
+    input.sessionId,
+    userMessagePayload as unknown as Parameters<typeof client.beta.sessions.events.send>[1],
+  );
 
   const stream = await client.beta.sessions.events.stream(input.sessionId, {
     betas: [ANTHROPIC_BETA],

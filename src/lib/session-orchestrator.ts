@@ -47,6 +47,10 @@ import {
   type SpeakerEnvelopeOption,
   type CapEnvelopeOption,
 } from './user-message-envelope';
+import {
+  recordSessionBind,
+  savePayloadAudit,
+} from './cma-observability';
 
 /** KV key prefix for thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
@@ -156,6 +160,15 @@ export interface OrchestrateChatTurnInput {
    * `userMapping.agent_id` path unchanged.
    */
   attachedSkills?: Array<Record<string, unknown>> | null;
+  /**
+   * Issue #202 observability context. Stored without raw email / thread
+   * values so Mac mini can resolve thread -> session and read temporary
+   * user.message payload audits from D1.
+   */
+  observability?: {
+    eventKey: string;
+    messageId?: string | null;
+  };
 }
 
 export interface OrchestrateChatTurnResult {
@@ -369,6 +382,20 @@ export async function orchestrateChatTurn(
         `user=${input.userMapping.user_slug} space=${input.spaceName}`,
     );
   }
+  let sessionKeyHashForAudit: string | null = null;
+  if (input.observability) {
+    sessionKeyHashForAudit = await recordSessionBind({
+      db: input.env.DB,
+      senderEmail: input.senderEmail,
+      spaceName: input.spaceName,
+      threadName: input.threadName,
+      sessionId,
+      eventKey: input.observability.eventKey,
+      messageId: input.observability.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      isNewSession,
+    });
+  }
 
   // ---- user message envelope ----
   // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
@@ -411,6 +438,23 @@ export async function orchestrateChatTurn(
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+      ...(input.observability
+        ? {
+            auditUserMessagePayload: (payload) =>
+              savePayloadAudit({
+                db: input.env.DB,
+                enabledFlag: input.env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+                ttlDays: input.env.CMA_AUDIT_TTL_DAYS,
+                maxPayloadChars: input.env.CMA_AUDIT_MAX_TEXT_CHARS,
+                sessionId,
+                eventKey: input.observability!.eventKey,
+                messageId: input.observability!.messageId ?? null,
+                userSlug: input.userMapping.user_slug,
+                sessionKeyHash: sessionKeyHashForAudit,
+                payload,
+              }).then(() => undefined),
+          }
+        : {}),
     });
   } catch (err) {
     throw new OrchestratorFailure(
