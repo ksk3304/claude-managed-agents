@@ -132,6 +132,36 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('fetchThreadMessages — happy path', () => {
+  it('uses a provided user OAuth access token without service-account exchange', async () => {
+    const fetchMock = makeFetchMock(async (url, init) => {
+      if (url === TOKEN_URL) {
+        throw new Error('service-account token exchange should not run');
+      }
+      expect(init.headers).toEqual({
+        Authorization: 'Bearer user-oauth-token',
+        Accept: 'application/json',
+      });
+      return jsonResponse(200, {
+        messages: [
+          {
+            name: 'spaces/AAA/messages/M1',
+            text: 'ユーザーOAuthで読める',
+            sender: { name: 'users/100', type: 'HUMAN' },
+          },
+        ],
+      });
+    });
+
+    const messages = await fetchThreadMessages(
+      { accessToken: 'user-oauth-token', fetchImpl: fetchMock },
+      SPACE,
+      THREAD,
+    );
+
+    expect(fetchMock.calls.length).toBe(1);
+    expect(messages.map((m) => m.text)).toEqual(['ユーザーOAuthで読める']);
+  });
+
   it('returns chronologically-ordered messages with text + sender info', async () => {
     const fetchMock = routeFetch((page) => {
       // desc page from the API: newest first.

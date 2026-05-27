@@ -34,7 +34,6 @@
 
 import { assertBridgeEgressAllowed } from './egress-guard';
 import { getChatAccessToken, CHAT_BOT_SCOPE } from './chat-api';
-import type { ChatApiDeps } from './chat-api';
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
 
@@ -77,6 +76,24 @@ export interface ThreadHistoryMessage {
   text: string;
   /** Raw `createTime` ISO8601 (informational; may be empty when API omits it). */
   createTime: string;
+}
+
+export interface ChatHistoryDeps {
+  /**
+   * Preferred production path: user OAuth access token with
+   * `chat.messages.readonly`. Service-account JWT tokens cannot read
+   * Chat message history in all Workspace configurations.
+   */
+  accessToken?: string;
+  /**
+   * Legacy/test fallback. Kept so unit tests and emergency rollback can
+   * still exercise the old service-account exchange path.
+   */
+  saKeyJson?: string;
+  /** Override `fetch` for tests. */
+  fetchImpl?: typeof fetch;
+  /** Override scopes for the legacy service-account fallback. */
+  scopes?: readonly string[];
 }
 
 export interface FetchThreadMessagesOptions {
@@ -127,7 +144,7 @@ export class ChatHistoryFetchError extends Error {
  * the permanent-failure path (= `recordHistoryFailure`).
  */
 export async function fetchThreadMessages(
-  deps: ChatApiDeps,
+  deps: ChatHistoryDeps,
   spaceName: string,
   threadName: string,
   options: FetchThreadMessagesOptions = {},
@@ -172,7 +189,7 @@ export async function fetchThreadMessages(
       // Always re-mint token here — Anthropic SDK does its own caching;
       // here we lean on `getChatAccessToken`'s module-level cache so
       // 2nd/3rd attempts within a page don't redundantly exchange JWTs.
-      const token = await getChatAccessToken(deps, scopes);
+      const token = await getHistoryAccessToken(deps, scopes);
       let response: Response;
       try {
         response = await fetchImpl(url, {
@@ -291,6 +308,27 @@ export async function fetchThreadMessages(
       `total_text_chars=${totalChars} pages=${pageCount} truncated=${truncated}`,
   );
   return messages;
+}
+
+async function getHistoryAccessToken(
+  deps: ChatHistoryDeps,
+  scopes: readonly string[],
+): Promise<string> {
+  if (deps.accessToken) return deps.accessToken;
+  if (!deps.saKeyJson) {
+    throw new ChatHistoryFetchError(
+      'fetchThreadMessages requires accessToken or saKeyJson',
+      0,
+    );
+  }
+  return getChatAccessToken(
+    {
+      saKeyJson: deps.saKeyJson,
+      fetchImpl: deps.fetchImpl,
+      scopes: deps.scopes,
+    },
+    scopes,
+  );
 }
 
 export interface FormatThreadHistoryOptions {

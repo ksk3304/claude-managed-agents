@@ -65,7 +65,9 @@ import {
   clearHistoryFailure,
   handleHistoryFetchPermanentFailure,
   isHistoryPermanentlyFailed,
+  type ChatHistoryDeps,
 } from '../lib/chat-history';
+import { getChatReadonlyAccessToken } from '../lib/chat-oauth';
 import {
   fetchSpaceMemberRoster,
   buildSpaceContextBlock,
@@ -340,14 +342,15 @@ export async function handleChatEvent(
   let historyBlock = '';
   const shouldFetchHistory =
     threadName !== null &&
-    Boolean(env.CHAT_SA_KEY_JSON) &&
+    canFetchThreadHistory(env) &&
     (!isDm || isMailSendApprovalText(bodyText));
   if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
       try {
+        const historyDeps = await resolveThreadHistoryDeps(env);
         const history = await fetchThreadMessages(
-          { saKeyJson: env.CHAT_SA_KEY_JSON! },
+          historyDeps,
           spaceName,
           threadName,
         );
@@ -1430,6 +1433,46 @@ async function safeDeletePlaceholder(
       `[chat-event] placeholder DELETE fail eventKey=${eventKey} message=${messageName}: ${reason}`,
     );
   }
+}
+
+function canFetchThreadHistory(env: Env): boolean {
+  return Boolean(
+    (env.GCHAT_OAUTH_REFRESH_TOKEN_SEED &&
+      env.GCHAT_OAUTH_CLIENT_ID &&
+      env.GCHAT_OAUTH_CLIENT_SECRET &&
+      env.OAUTH_VAULT_KEY) ||
+      env.CHAT_SA_KEY_JSON,
+  );
+}
+
+async function resolveThreadHistoryDeps(env: Env): Promise<ChatHistoryDeps> {
+  if (
+    env.GCHAT_OAUTH_REFRESH_TOKEN_SEED &&
+    env.GCHAT_OAUTH_CLIENT_ID &&
+    env.GCHAT_OAUTH_CLIENT_SECRET &&
+    env.OAUTH_VAULT_KEY
+  ) {
+    const token = await getChatReadonlyAccessToken({
+      kv: env.MAKOTO_KV,
+      vaultKeyB64: env.OAUTH_VAULT_KEY,
+      clientId: env.GCHAT_OAUTH_CLIENT_ID,
+      clientSecret: env.GCHAT_OAUTH_CLIENT_SECRET,
+      refreshTokenSeed: env.GCHAT_OAUTH_REFRESH_TOKEN_SEED,
+    });
+    console.log(
+      `[chat-event] history oauth token resolved source=${token.from_cache ? 'cache' : 'refresh'}`,
+    );
+    return { accessToken: token.access_token };
+  }
+
+  if (env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      '[chat-event] history fetch using service-account fallback; user OAuth secrets incomplete',
+    );
+    return { saKeyJson: env.CHAT_SA_KEY_JSON };
+  }
+
+  throw new Error('thread history fetch is not configured');
 }
 
 async function safeCommit(
