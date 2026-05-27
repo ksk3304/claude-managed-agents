@@ -32,11 +32,13 @@ import { handleChatEvent } from '../src/queue/chat-event-handler';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
 import {
+  makeFakeThreadLockNamespace,
   makeFetchMock,
   makeKv,
   makeMakotoDb,
   TEST_VAULT_KEY_B64,
 } from './makoto-helpers';
+import { getThreadLock } from '../src/durable-objects/thread-lock';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -274,6 +276,7 @@ function buildEnv(opts: BuildEnvOpts = {}): Env {
     AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_main',
     CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
     MAKOTO_BOT_DISPLAY_NAME: 'MAKOTOくん',
+    MAKOTO_THREAD_LOCK: makeFakeThreadLockNamespace(),
     ...opts.envOverrides,
   } as unknown as Env;
 }
@@ -825,6 +828,37 @@ describe('handleChatEvent', () => {
     expect(created).toHaveLength(0);
     expect(sends).toEqual(['sesn_legacy']);
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_legacy');
+  });
+
+  it('same DM scope lock held → releases claim and retries without posting placeholder', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
+    const lock = getThreadLock(env, scopeKey);
+    const held = await lock.acquire(scopeKey, 60_000);
+    expect(held.acquired).toBe(true);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_be_used',
+      events: [{ type: 'agent.message.text', text: 'should not run' }],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('chat_scope_lock_held');
+    }
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(0);
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const row = dedupe.get(msg.eventKey);
+    expect(row?.claim_state).toBe('NEW');
+    expect(Number(row?.lease_expires_at_ms)).toBe(0);
   });
 
   it('Case 11: confirmOwner 失敗 (successor TAKEOVER) → skip', async () => {

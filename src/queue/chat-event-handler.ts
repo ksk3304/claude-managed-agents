@@ -81,6 +81,7 @@ import {
   handleCostGuardCommand,
 } from '../lib/cost-guard-command';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
+import { getThreadLock } from '../durable-objects/thread-lock';
 import {
   resolveCapRecoveryConfig,
   runCapRecovery,
@@ -97,6 +98,7 @@ import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
+  chatScopeSessionKey,
   orchestrateChatTurn,
   OrchestratorFailure,
 } from '../lib/session-orchestrator';
@@ -117,7 +119,7 @@ import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
-import { recordRuntimeEvent } from '../lib/observability';
+import { recordRuntimeEvent, stableHash } from '../lib/observability';
 
 /**
  * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
@@ -130,6 +132,7 @@ import { recordRuntimeEvent } from '../lib/observability';
  * 失敗時に `deleteChatMessage` で残骸 cleanup する (#186 UX 致命傷)。
  */
 const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
+const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -329,6 +332,31 @@ export async function handleChatEvent(
     }
   }
 
+  const chatScopeKey =
+    chatScopeSessionKey(userMapping.agent_id, spaceType, senderEmail, spaceName) ??
+    `chat_event_scope:${eventKey}`;
+  const chatScopeLock = getThreadLock(env, chatScopeKey);
+  const chatScopeLockResult = await chatScopeLock.acquire(
+    chatScopeKey,
+    CHAT_SCOPE_LOCK_TTL_MS,
+  );
+  if (!chatScopeLockResult.acquired) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'chat_scope_lock_held',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        scope_key_hash: stableHash(chatScopeKey),
+        retry_after_ms: chatScopeLockResult.retry_after_ms ?? null,
+      },
+    });
+    await safeRelease(env, eventKey, claim);
+    return { kind: 'release_and_retry', reason: 'chat_scope_lock_held' };
+  }
+
+  try {
   // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
   // shared space + thread reply、または DM の mail confirmation reply 時のみ
   // thread の過去 message を fetch して
@@ -945,6 +973,16 @@ export async function handleChatEvent(
   // ---- 9. commit ----
   await safeCommit(env, eventKey, claim);
   return { kind: 'committed' };
+  } finally {
+    try {
+      await chatScopeLock.release(chatScopeKey);
+    } catch (err) {
+      console.warn(
+        `[chat-event] chat scope lock release failed eventKey=${eventKey}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
