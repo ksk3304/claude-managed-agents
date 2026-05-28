@@ -118,8 +118,16 @@ declare namespace Cloudflare {
      * される (= deploy 漏れで accidentally メール送信が止まる方を選ぶ)。
      *
      * Provisioned via `wrangler secret put AGENTMAIL_DEFAULT_INBOX_ID`.
-     */
+    */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
+    /**
+     * Anthropic custom Skill for outbound email composition. Deprecated for
+     * session routing: existing employee agents must already carry required
+     * skills, and #208 no longer creates mail-specific agents/environments.
+     */
+    MAIL_SEND_SKILL_ID?: string;
+    /** Optional pinned version for MAIL_SEND_SKILL_ID. */
+    MAIL_SEND_SKILL_VERSION?: string;
     /**
      * GCP project ID hosting Cloud Scheduler jobs (Issue #186
      * SCHEDULE_ACTION dispatch)。`cma-bot-mp-20260501` 既定。未設定だと

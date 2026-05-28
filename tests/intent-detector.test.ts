@@ -338,7 +338,7 @@ describe('detectAllIntents', () => {
 // ---------------------------------------------------------------------------
 
 describe('Integration: chat-event-handler intent wiring', () => {
-  it('case A: explicit /mail slash command → same session + intent prefix annotated', () => {
+  it('case A: explicit /mail slash command → forceFreshSession=false + intent prefix annotated', () => {
     // 1 reactive turn の bodyText 相当 (mention strip 済 + history 未 prepend)
     const bodyText = '/mail to:bob@example.com 件名 hello 本文 wip';
 
@@ -351,10 +351,11 @@ describe('Integration: chat-event-handler intent wiring', () => {
     expect(intent!.source).toBe('slash_command');
     expect(intent!.isActionSkill).toBe(true);
 
-    // Grill Me 正本: /mail でも fresh session に逃がさず、同じ社員 agent /
-    // 同じ Chat thread session で確認往復の文脈を保つ。
-    const shouldContinueSession = true;
-    expect(shouldContinueSession).toBe(true);
+    // chat-event-handler の forceFreshSession 決定式と等価
+    // (= orchestrator が KV lookup/put を bypass する条件)
+    const forceFreshSession =
+      intent!.isActionSkill === true && intent!.command !== '/mail';
+    expect(forceFreshSession).toBe(false);
 
     // bodyText の注釈 prefix (= context 質向上、l.4001-4031 stderr ログ相当を
     // bodyText 内に顕在化させて agent が即把握できるようにする)
@@ -362,7 +363,7 @@ describe('Integration: chat-event-handler intent wiring', () => {
     expect(prefix).toBe('[intent: action_skill /mail]');
   });
 
-  it('case B: implicit mail intent (no slash) → same session + implicit hint', () => {
+  it('case B: implicit mail intent (no slash) → forceFreshSession=false + implicit hint', () => {
     // Python l.4025-4027 等価: 「foo@example.com に資料を送って」は
     // _detect_mail_intent HIT → 擬似 command='/mail' に escalate
     const bodyText = 'foo@example.com に資料を送って';
@@ -374,8 +375,10 @@ describe('Integration: chat-event-handler intent wiring', () => {
     expect(intent!.source).toBe('mail_intent');
     expect(intent!.isActionSkill).toBe(true);
 
-    const shouldContinueSession = true;
-    expect(shouldContinueSession).toBe(true);
+    // mail skill は既存社員 agent / session に統合するため fresh 化しない。
+    const forceFreshSession =
+      intent!.isActionSkill === true && intent!.command !== '/mail';
+    expect(forceFreshSession).toBe(false);
 
     // 暗黙 intent は明示 slash と区別された hint を出す (= source 由来の差)
     const prefix = buildIntentPrefix(intent);

@@ -541,8 +541,19 @@ export async function handleChatEvent(
     }
   }
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
-  // intent 判定は context hint とログに限定する。/mail でも mail専用 agent
-  // へ逃がさず、Google Chat thread session を継続する。
+  // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
+  // intent-detector に通して以下を決定:
+  //   - `/mail` 以外の `isActionSkill=true` は orchestrator に
+  //     `forceFreshSession=true` を渡し既存 thread session 継続を破棄
+  //     (mail skill は既存社員 agent / session に統合する)
+  //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
+  //   - intent 種別を user message envelope の <context> に prefix 注入
+  //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
+  // 危険語句 / 過剰 dispatch 防止:
+  //   - intent 判定はあくまで「session 経路 + context prefix 注入」までで、
+  //     ここで /mail や /schedule の skill 自体を invoke することはしない
+  //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
+  //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
   let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
   if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
@@ -550,6 +561,8 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
+  const forceFreshSession =
+    intent?.isActionSkill === true && intent.command !== '/mail';
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -652,6 +665,9 @@ export async function handleChatEvent(
           }),
         eventKey,
         messageId: message.name,
+        // Issue #208: mail skill は既存社員 agent / session へ統合するため
+        // forceFreshSession しない。その他 action skill は従来通り bypass。
+        forceFreshSession,
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;

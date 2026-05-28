@@ -23,6 +23,7 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
+import { hasAttachedSkills } from './attached-skills';
 import type { UserMappingValue } from './memory-attach';
 import {
   buildAnthropicClient,
@@ -180,6 +181,12 @@ export interface OrchestrateChatTurnInput {
   eventKey?: string;
   /** Google Chat message resource name. */
   messageId?: string;
+  /**
+   * Deprecated compatibility field. Attached skills must already live on the
+   * employee agent (`userMapping.agent_id`); this orchestrator no longer creates
+   * per-skill agents/environments.
+   */
+  attachedSkills?: Array<Record<string, unknown>> | null;
 }
 
 export interface OrchestrateChatTurnResult {
@@ -328,6 +335,13 @@ export async function orchestrateChatTurn(
       input.userMapping.memory_attachments.map(toResourceParam);
     const agentId = input.userMapping.agent_id;
     const environmentId = input.env.ENVIRONMENT_ID;
+    const attachedSkills = input.attachedSkills ?? null;
+    if (hasAttachedSkills(attachedSkills)) {
+      console.warn(
+        `[chat-event] attachedSkills ignored user=${input.userMapping.user_slug}; ` +
+          'using mapped employee agent/session',
+      );
+    }
 
     try {
       sessionId = await createSessionWithResources(client, {
@@ -338,14 +352,17 @@ export async function orchestrateChatTurn(
     } catch (err) {
       throw new OrchestratorFailure(
         'sessions_create_failed',
-        `sessions.create failed for agent=${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+        `sessions.create failed for agent=${input.userMapping.agent_id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
         err,
       );
     }
     isNewSession = true;
     console.log(
       `[chat-event] created session=${sessionId} agent=${agentId} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
+        `user=${input.userMapping.user_slug} space=${input.spaceName}` +
+        (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
     if (sessionKey !== null) {
       try {
