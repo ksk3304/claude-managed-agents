@@ -45,7 +45,10 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
+import {
+  buildAllAttachmentBlocks,
+  type ChatAttachment,
+} from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
   ChatApiError,
@@ -84,6 +87,7 @@ import { extractFinalMarkerText } from '../lib/final-marker';
 import {
   evaluateSessionCostAfterTurn,
   handlePendingSessionApproval,
+  projectSessionCostForPdfPreflight,
   resolveSessionCostGuardConfig,
 } from '../lib/cost-guard';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
@@ -180,6 +184,15 @@ export type ChatEventOutcome =
   | { kind: 'committed' }
   | { kind: 'skipped'; reason: string }
   | { kind: 'release_and_retry'; reason: string };
+
+const PDF_PREFLIGHT_PENDING_TTL_SEC = 6 * 60 * 60;
+
+interface PendingPdfPreflightApproval {
+  attachments: ChatAttachment[];
+  requestText: string;
+  approvedThroughUsd: number;
+  createdAtMs: number;
+}
 
 /**
  * Queue consumer entry point。`src/index.ts` の `queue` handler から
@@ -371,7 +384,45 @@ export async function handleChatEvent(
     return { kind: 'release_and_retry', reason: 'chat_scope_lock_held' };
   }
 
+  let attachmentForProcessing = message.attachment ?? null;
+  let pdfApprovedThroughUsdFloor: number | null = null;
+  let pdfPreflightApprovalConsumed = false;
+
   try {
+    const pdfApprovalDecision = parsePdfPreflightApprovalDecision(bodyText);
+    const pendingPdfPreflight = threadSessionKey
+      ? await readPendingPdfPreflightApproval(env.MAKOTO_KV, threadSessionKey)
+      : null;
+    if (pendingPdfPreflight && pdfApprovalDecision === 'no') {
+      if (threadSessionKey) {
+        await deletePendingPdfPreflightApproval(env.MAKOTO_KV, threadSessionKey);
+      }
+      await safePost(env, spaceName, '了解です。PDF全文読取は中止しました。', threadName, eventKey);
+      await safeCommit(env, eventKey, claim);
+      return { kind: 'committed' };
+    }
+    if (pendingPdfPreflight && pdfApprovalDecision === 'yes') {
+      attachmentForProcessing = attachmentForProcessing && attachmentForProcessing.length > 0
+        ? attachmentForProcessing
+        : pendingPdfPreflight.attachments;
+      bodyText = pendingPdfPreflight.requestText || bodyText;
+      pdfApprovedThroughUsdFloor = pendingPdfPreflight.approvedThroughUsd;
+      pdfPreflightApprovalConsumed = true;
+      if (threadSessionKey) {
+        await deletePendingPdfPreflightApproval(env.MAKOTO_KV, threadSessionKey);
+      }
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'pdf_preflight_approval_consumed',
+        source: 'chat-event-handler',
+        detail: {
+          attachment_count: attachmentForProcessing?.length ?? 0,
+          approved_through_usd: pdfApprovedThroughUsdFloor,
+        },
+      });
+    }
+
     const pendingCostApproval = await handlePendingSessionApproval(
       {
         kv: env.MAKOTO_KV,
@@ -625,14 +676,142 @@ export async function handleChatEvent(
     extraBlocks: [],
     notice: null,
     uploadedFileIds: [],
+    pdfPreflight: null,
+    deterministicReply: null,
     cleanup: async () => undefined,
   };
-  if (env.CHAT_SA_KEY_JSON && message.attachment && message.attachment.length > 0) {
+  let pdfPreflightChecked = false;
+  if (env.CHAT_SA_KEY_JSON && attachmentForProcessing && attachmentForProcessing.length > 0) {
+    const pdfAttachmentPresent = hasPdfAttachment(attachmentForProcessing);
     try {
+      const sessionCostConfig = resolveSessionCostGuardConfig(env);
       attachmentBlocks = await buildAllAttachmentBlocks(
         { saKeyJson: env.CHAT_SA_KEY_JSON, anthropic: client },
-        { attachment: message.attachment },
+        { attachment: attachmentForProcessing },
+        {
+          pdfPreflight: {
+            model: sessionCostConfig.fallbackModel,
+            sessionHardCapUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
+          },
+        },
       );
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'attachment_build_result',
+        source: 'chat-event-handler',
+        detail: {
+          attachment_count: attachmentForProcessing.length,
+          has_pdf_attachment: pdfAttachmentPresent,
+          pdf_preflight_present: Boolean(attachmentBlocks.pdfPreflight),
+          deterministic_reply_present: Boolean(attachmentBlocks.deterministicReply),
+          extra_blocks: attachmentBlocks.extraBlocks.length,
+        },
+      });
+      if (
+        pdfAttachmentPresent &&
+        !attachmentBlocks.pdfPreflight &&
+        !attachmentBlocks.deterministicReply
+      ) {
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'pdf_preflight_missing_fail_closed',
+          level: 'error',
+          source: 'chat-event-handler',
+          detail: {
+            attachment_count: attachmentForProcessing.length,
+            extra_blocks: attachmentBlocks.extraBlocks.length,
+          },
+        });
+        await postPdfPreflightFailClosed(
+          env,
+          {
+            spaceName,
+            threadName,
+            eventKey,
+            threadSessionKey,
+            attachments: attachmentForProcessing,
+            requestText: bodyText,
+            approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
+          },
+        );
+        await safeCommit(env, eventKey, claim);
+        return { kind: 'committed' };
+      }
+      if (attachmentBlocks.pdfPreflight) {
+        const pdfCostProjection = attachmentBlocks.pdfPreflight.result === 'allow'
+          ? await projectSessionCostForPdfPreflight(
+              {
+                kv: env.MAKOTO_KV,
+                config: sessionCostConfig,
+              },
+              {
+                threadSessionKey,
+                totalPages: attachmentBlocks.pdfPreflight.totalPages,
+                estimatedTokensLow: attachmentBlocks.pdfPreflight.estimatedTokensLow,
+                estimatedTokensHigh: attachmentBlocks.pdfPreflight.estimatedTokensHigh,
+                estimatedCostLowUsd: attachmentBlocks.pdfPreflight.estimatedCostLowUsd,
+                estimatedCostHighUsd: attachmentBlocks.pdfPreflight.estimatedCostHighUsd,
+              },
+            )
+          : null;
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'pdf_preflight_result',
+          source: 'chat-event-handler',
+          detail: {
+            pdf_preflight_result: attachmentBlocks.pdfPreflight.result,
+            pdf_page_count: attachmentBlocks.pdfPreflight.totalPages,
+            pdf_total_bytes: attachmentBlocks.pdfPreflight.totalBytes,
+            pdf_tier: attachmentBlocks.pdfPreflight.tier,
+            estimated_tokens_low: attachmentBlocks.pdfPreflight.estimatedTokensLow,
+            estimated_tokens_high: attachmentBlocks.pdfPreflight.estimatedTokensHigh,
+            estimated_cost_low_usd: attachmentBlocks.pdfPreflight.estimatedCostLowUsd,
+            estimated_cost_high_usd: attachmentBlocks.pdfPreflight.estimatedCostHighUsd,
+            current_session_cost_usd: pdfCostProjection?.currentSessionUsd ?? null,
+            projected_cost_low_usd: pdfCostProjection?.projectedLowUsd ?? null,
+            projected_cost_high_usd: pdfCostProjection?.projectedHighUsd ?? null,
+            next_threshold_usd: pdfCostProjection?.nextThresholdUsd ?? null,
+            crossed_threshold_usd: pdfCostProjection?.crossedThresholdUsd ?? null,
+            reasons: attachmentBlocks.pdfPreflight.reasons,
+          },
+        });
+        pdfPreflightChecked = true;
+        if (typeof pdfCostProjection?.crossedThresholdUsd === 'number') {
+          pdfApprovedThroughUsdFloor = Math.max(
+            pdfApprovedThroughUsdFloor ?? 0,
+            pdfCostProjection.crossedThresholdUsd,
+          );
+        }
+        if (
+          pdfCostProjection?.promptText &&
+          !pdfPreflightApprovalConsumed &&
+          !isFullPdfReadOverride(bodyText)
+        ) {
+          if (threadSessionKey && pdfCostProjection.crossedThresholdUsd !== null) {
+            await writePendingPdfPreflightApproval(
+              env.MAKOTO_KV,
+              threadSessionKey,
+              {
+                attachments: attachmentForProcessing,
+                requestText: bodyText,
+                approvedThroughUsd: pdfCostProjection.crossedThresholdUsd,
+                createdAtMs: Date.now(),
+              },
+            );
+          }
+          await safePost(env, spaceName, pdfCostProjection.promptText, threadName, eventKey);
+          await safeCommit(env, eventKey, claim);
+          return { kind: 'committed' };
+        }
+      }
+      if (attachmentBlocks.deterministicReply) {
+        await safePost(env, spaceName, attachmentBlocks.deterministicReply, threadName, eventKey);
+        await safeCommit(env, eventKey, claim);
+        return { kind: 'committed' };
+      }
       if (attachmentBlocks.extraBlocks.length > 0) {
         console.log(
           `[chat-event] attachments wired eventKey=${eventKey} ` +
@@ -645,7 +824,70 @@ export async function handleChatEvent(
         `[chat-event] attachment build failed eventKey=${eventKey}: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'attachment_build_failed',
+        level: 'error',
+        source: 'chat-event-handler',
+        detail: {
+          has_pdf_attachment: pdfAttachmentPresent,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      if (pdfAttachmentPresent) {
+        const sessionCostConfig = resolveSessionCostGuardConfig(env);
+        await postPdfPreflightFailClosed(
+          env,
+          {
+            spaceName,
+            threadName,
+            eventKey,
+            threadSessionKey,
+            attachments: attachmentForProcessing,
+            requestText: bodyText,
+            approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
+          },
+        );
+        await safeCommit(env, eventKey, claim);
+        return { kind: 'committed' };
+      }
     }
+  }
+  if (
+    env.CHAT_SA_KEY_JSON &&
+    attachmentForProcessing &&
+    hasPdfAttachment(attachmentForProcessing) &&
+    !pdfPreflightChecked &&
+    !pdfPreflightApprovalConsumed
+  ) {
+    const sessionCostConfig = resolveSessionCostGuardConfig(env);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'pdf_preflight_unchecked_fail_closed',
+      level: 'error',
+      source: 'chat-event-handler',
+      detail: {
+        attachment_count: attachmentForProcessing.length,
+        extra_blocks: attachmentBlocks.extraBlocks.length,
+        pdf_preflight_present: Boolean(attachmentBlocks.pdfPreflight),
+      },
+    });
+    await postPdfPreflightFailClosed(
+      env,
+      {
+        spaceName,
+        threadName,
+        eventKey,
+        threadSessionKey,
+        attachments: attachmentForProcessing,
+        requestText: bodyText,
+        approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
+      },
+    );
+    await safeCommit(env, eventKey, claim);
+    return { kind: 'committed' };
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
@@ -825,6 +1067,7 @@ export async function handleChatEvent(
             threadSessionKey,
             sessionId,
             snapshot: usageSnapshot,
+            approvedThroughUsdFloor: pdfApprovedThroughUsdFloor,
           },
         );
         if (costPrompt) {
@@ -2066,6 +2309,135 @@ export async function handleChatQueue(
 function loadSlashSkillsData(env: Env): SkillsData {
   void env;
   return SLASH_SKILLS_DATA;
+}
+
+function isFullPdfReadOverride(text: string): boolean {
+  const normalised = text.trim().toLowerCase().replace(/[\s。、．.！!？?]+/g, '');
+  return (
+    normalised === 'はい' ||
+    normalised === 'yes' ||
+    normalised === 'y' ||
+    normalised.startsWith('全文で進め') ||
+    normalised.startsWith('全文で読') ||
+    normalised.startsWith('全文解析') ||
+    normalised.startsWith('全部読')
+  );
+}
+
+function hasPdfAttachment(attachments: ChatAttachment[] | null | undefined): boolean {
+  return (attachments ?? []).some((att) =>
+    (att.contentType || '').toLowerCase() === 'application/pdf',
+  );
+}
+
+function parsePdfPreflightApprovalDecision(text: string): 'yes' | 'no' | null {
+  const normalised = text.trim().toLowerCase().replace(/[\s。、．.！!？?]+/g, '');
+  if (!normalised) return null;
+  if (
+    normalised === 'はい' ||
+    normalised === 'yes' ||
+    normalised === 'y' ||
+    normalised.startsWith('全文で進め') ||
+    normalised.startsWith('全文で読') ||
+    normalised.startsWith('全部読')
+  ) {
+    return 'yes';
+  }
+  if (
+    normalised === 'いいえ' ||
+    normalised === 'no' ||
+    normalised === 'n' ||
+    normalised.startsWith('やめ') ||
+    normalised.startsWith('止め') ||
+    normalised.startsWith('中止')
+  ) {
+    return 'no';
+  }
+  return null;
+}
+
+async function postPdfPreflightFailClosed(
+  env: Env,
+  input: {
+    spaceName: string;
+    threadName: string | null;
+    eventKey: string;
+    threadSessionKey: string | null;
+    attachments: ChatAttachment[];
+    requestText: string;
+    approvedThroughUsd: number;
+  },
+): Promise<void> {
+  if (input.threadSessionKey) {
+    await writePendingPdfPreflightApproval(
+      env.MAKOTO_KV,
+      input.threadSessionKey,
+      {
+        attachments: input.attachments,
+        requestText: input.requestText,
+        approvedThroughUsd: input.approvedThroughUsd,
+        createdAtMs: Date.now(),
+      },
+    );
+  }
+  await safePost(
+    env,
+    input.spaceName,
+    [
+      'PDF事前確認',
+      'PDFの事前見積もりを取得できませんでした。',
+      '',
+      '読む場合は「はい」、やめる場合は「いいえ」と返信してください。',
+    ].join('\n'),
+    input.threadName,
+    input.eventKey,
+  );
+}
+
+function pendingPdfPreflightApprovalKey(threadSessionKey: string): string {
+  return `cost_guard:pdf_preflight_pending:${threadSessionKey}`;
+}
+
+async function readPendingPdfPreflightApproval(
+  kv: KVNamespace,
+  threadSessionKey: string,
+): Promise<PendingPdfPreflightApproval | null> {
+  try {
+    const raw = await kv.get(pendingPdfPreflightApprovalKey(threadSessionKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingPdfPreflightApproval>;
+    if (!Array.isArray(parsed.attachments) || parsed.attachments.length === 0) return null;
+    return {
+      attachments: parsed.attachments as ChatAttachment[],
+      requestText: typeof parsed.requestText === 'string' ? parsed.requestText : '',
+      approvedThroughUsd: typeof parsed.approvedThroughUsd === 'number'
+        && Number.isFinite(parsed.approvedThroughUsd)
+        ? parsed.approvedThroughUsd
+        : 0,
+      createdAtMs: typeof parsed.createdAtMs === 'number' ? parsed.createdAtMs : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writePendingPdfPreflightApproval(
+  kv: KVNamespace,
+  threadSessionKey: string,
+  pending: PendingPdfPreflightApproval,
+): Promise<void> {
+  await kv.put(
+    pendingPdfPreflightApprovalKey(threadSessionKey),
+    JSON.stringify(pending),
+    { expirationTtl: PDF_PREFLIGHT_PENDING_TTL_SEC },
+  );
+}
+
+async function deletePendingPdfPreflightApproval(
+  kv: KVNamespace,
+  threadSessionKey: string,
+): Promise<void> {
+  await kv.delete(pendingPdfPreflightApprovalKey(threadSessionKey));
 }
 
 // ---------------------------------------------------------------------------

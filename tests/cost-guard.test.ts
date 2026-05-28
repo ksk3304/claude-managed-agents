@@ -20,6 +20,7 @@ import {
   wrapChatSender,
   evaluateSessionCostAfterTurn,
   handlePendingSessionApproval,
+  projectSessionCostForPdfPreflight,
   usdFromUsage,
   DEFAULT_LIMITS,
   _internals,
@@ -465,6 +466,73 @@ describe('per-session staged approval', () => {
     });
     expect(next?.thresholdUsd).toBe(12);
     expect(next?.promptText).toContain('$16 到達時');
+  });
+
+  it('projects PDF cost against the current session threshold before sending it to the LLM', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_pdf');
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_pdf',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_580_000, output_tokens: 0 },
+      },
+    });
+
+    const projection = await projectSessionCostForPdfPreflight(deps, {
+      threadSessionKey,
+      totalPages: 12,
+      estimatedTokensLow: 74_300,
+      estimatedTokensHigh: 98_600,
+      estimatedCostLowUsd: 0.3715,
+      estimatedCostHighUsd: 0.493,
+    });
+
+    expect(projection?.currentSessionUsd).toBeCloseTo(7.9, 6);
+    expect(projection?.crossedThresholdUsd).toBe(8);
+    expect(projection?.projectedHighUsd).toBeCloseTo(8.393, 6);
+    expect(projection?.promptText).toContain('PDF事前確認');
+    expect(projection?.promptText).toContain('次の確認ライン: $8');
+  });
+
+  it('does not project a PDF prompt when the read stays below the next threshold', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_pdf_low');
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_pdf_low',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_000_000, output_tokens: 0 },
+      },
+    });
+
+    const projection = await projectSessionCostForPdfPreflight(deps, {
+      threadSessionKey,
+      totalPages: 2,
+      estimatedTokensLow: 54_050,
+      estimatedTokensHigh: 58_100,
+      estimatedCostLowUsd: 0.27025,
+      estimatedCostHighUsd: 0.2905,
+    });
+
+    expect(projection?.currentSessionUsd).toBeCloseTo(5, 6);
+    expect(projection?.crossedThresholdUsd).toBeNull();
+    expect(projection?.nextThresholdUsd).toBe(8);
+    expect(projection?.promptText).toBeNull();
   });
 
   it('does not make one yes unlimited; jumps approve the highest crossed stage only', async () => {

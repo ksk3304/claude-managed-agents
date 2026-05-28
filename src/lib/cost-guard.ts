@@ -130,6 +130,26 @@ export interface SessionCostPromptResult {
   nextThresholdUsd: number;
 }
 
+export interface PdfSessionCostProjectionInput {
+  threadSessionKey: string | null;
+  estimatedCostLowUsd: number | null;
+  estimatedCostHighUsd: number | null;
+  totalPages: number | null;
+  estimatedTokensLow: number | null;
+  estimatedTokensHigh: number | null;
+}
+
+export interface PdfSessionCostProjectionResult {
+  sessionId: string | null;
+  currentSessionUsd: number;
+  approvedThroughUsd: number;
+  nextThresholdUsd: number;
+  crossedThresholdUsd: number | null;
+  projectedLowUsd: number | null;
+  projectedHighUsd: number | null;
+  promptText: string | null;
+}
+
 export type PendingSessionApprovalResult =
   | { kind: 'none' }
   | { kind: 'reply'; text: string; closeSession: boolean };
@@ -413,6 +433,7 @@ export async function evaluateSessionCostAfterTurn(
     threadSessionKey: string | null;
     sessionId: string;
     snapshot: SessionUsageSnapshot;
+    approvedThroughUsdFloor?: number | null;
   },
 ): Promise<SessionCostPromptResult | null> {
   if (!input.threadSessionKey) return null;
@@ -431,7 +452,10 @@ export async function evaluateSessionCostAfterTurn(
     );
   }
 
-  const approvedThroughUsd = prev?.approvedThroughUsd ?? 0;
+  const approvedThroughUsd = Math.max(
+    prev?.approvedThroughUsd ?? 0,
+    input.approvedThroughUsdFloor ?? 0,
+  );
   const thresholdUsd = crossedThreshold(sessionUsd, approvedThroughUsd, config);
   const nextState: SessionCostState = {
     sessionId: input.sessionId,
@@ -461,6 +485,50 @@ export async function evaluateSessionCostAfterTurn(
     sessionUsd,
     thresholdUsd,
     nextThresholdUsd,
+  };
+}
+
+export async function projectSessionCostForPdfPreflight(
+  deps: SessionCostGuardDeps,
+  input: PdfSessionCostProjectionInput,
+): Promise<PdfSessionCostProjectionResult | null> {
+  if (!input.threadSessionKey || input.estimatedCostHighUsd === null) return null;
+  const config = resolveConfig(deps);
+  let sessionId: string | null = null;
+  try {
+    sessionId = await deps.kv.get(input.threadSessionKey);
+  } catch {
+    sessionId = null;
+  }
+  const state = sessionId ? await readSessionState(deps.kv, sessionId) : null;
+  const currentSessionUsd = state?.lastSeenUsd ?? 0;
+  const approvedThroughUsd = state?.approvedThroughUsd ?? 0;
+  const projectedLowUsd = input.estimatedCostLowUsd === null
+    ? null
+    : currentSessionUsd + input.estimatedCostLowUsd;
+  const projectedHighUsd = currentSessionUsd + input.estimatedCostHighUsd;
+  const crossedThresholdUsd = crossedThreshold(
+    projectedHighUsd,
+    approvedThroughUsd,
+    config,
+  );
+  const nextThresholdUsd = crossedThresholdUsd === null
+    ? nextThresholdToWatch(approvedThroughUsd, config)
+    : crossedThresholdUsd;
+  const result: PdfSessionCostProjectionResult = {
+    sessionId,
+    currentSessionUsd,
+    approvedThroughUsd,
+    nextThresholdUsd,
+    crossedThresholdUsd,
+    projectedLowUsd,
+    projectedHighUsd,
+    promptText: null,
+  };
+  if (crossedThresholdUsd === null) return result;
+  return {
+    ...result,
+    promptText: buildPdfSessionCostPrompt(input, result),
   };
 }
 
@@ -771,6 +839,37 @@ function nextThresholdAfter(
   return thresholdUsd + config.stepUsd;
 }
 
+function nextThresholdToWatch(
+  approvedThroughUsd: number,
+  config: SessionCostGuardConfig,
+): number {
+  for (const t of config.thresholdsUsd) {
+    if (t > approvedThroughUsd) return t;
+  }
+  const last = config.thresholdsUsd[config.thresholdsUsd.length - 1] ?? 0;
+  return Math.max(last, approvedThroughUsd) + config.stepUsd;
+}
+
+function buildPdfSessionCostPrompt(
+  input: PdfSessionCostProjectionInput,
+  projection: PdfSessionCostProjectionResult,
+): string {
+  return [
+    'PDF事前確認',
+    'このPDFをこのまま読むと、この会話 session のCost Guard確認ラインに到達する可能性があります。',
+    '',
+    `- PDF: ${input.totalPages ?? '不明'}ページ`,
+    `- 入力token概算: ${formatTokenRange(input.estimatedTokensLow, input.estimatedTokensHigh)}`,
+    `- PDF読取コスト概算: ${formatUsdNullable(input.estimatedCostLowUsd)}-${formatUsdNullable(input.estimatedCostHighUsd)}`,
+    `- 現在session累計: $${formatUsd(projection.currentSessionUsd)}`,
+    `- 読取後見込み: ${formatUsdNullable(projection.projectedLowUsd)}-${formatUsdNullable(projection.projectedHighUsd)}`,
+    `- 次の確認ライン: $${formatUsd(projection.crossedThresholdUsd ?? projection.nextThresholdUsd)}`,
+    '',
+    '読む場合は「はい」、やめる場合は「いいえ」と返信してください。',
+    '範囲を絞る場合は、ページ範囲・章・知りたい観点を返信してください。',
+  ].join('\n');
+}
+
 function buildSessionApprovalPrompt(
   pending: PendingSessionApproval,
   config: SessionCostGuardConfig,
@@ -792,6 +891,8 @@ function parseApprovalDecision(text: string): 'yes' | 'no' | null {
     normalised.startsWith('はい') ||
     normalised.startsWith('yes') ||
     normalised === 'y' ||
+    normalised.startsWith('全文で進め') ||
+    normalised.startsWith('全文で読') ||
     normalised.startsWith('続け') ||
     normalised.startsWith('続行')
   ) {
@@ -870,6 +971,16 @@ function finiteNumber(raw: unknown): number | null {
 
 function formatUsd(value: number): string {
   return value.toFixed(Number.isInteger(value) ? 0 : 2);
+}
+
+function formatUsdNullable(value: number | null): string {
+  if (value === null) return '不明';
+  return `$${formatUsd(value)}`;
+}
+
+function formatTokenRange(low: number | null, high: number | null): string {
+  if (low === null || high === null) return '不明';
+  return `${low.toLocaleString('ja-JP')}-${high.toLocaleString('ja-JP')}`;
 }
 
 function ym(d: Date): string {

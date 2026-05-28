@@ -174,6 +174,8 @@ interface FakeAnthOpts {
   createThrow?: Error;
   // Track which sessionId was used for events.send (continuation vs new)
   sendCaptureSessionIds?: string[];
+  retrieveUsage?: Record<string, unknown>;
+  retrieveModel?: string;
   // Capture memory store list/retrieve/create/update calls for session-log
   memoryListReturns?: AsyncIterable<Record<string, unknown>>;
   memoryRetrieveContent?: string;
@@ -216,6 +218,12 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
           opts.createCapture?.push(args);
           if (opts.createThrow) throw opts.createThrow;
           return { id: opts.sessionId ?? 'sesn_new' };
+        },
+        async retrieve(_sessionId: string) {
+          return {
+            usage: opts.retrieveUsage ?? null,
+            model: opts.retrieveModel ?? 'claude-opus-4-7',
+          };
         },
         events: {
           async send(sessionId: string, _payload: unknown): Promise<void> {
@@ -262,6 +270,66 @@ function installFakeAnthropic(opts: FakeAnthOpts | null): void {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const TEST_PRIVATE_KEY_PEM = `-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDMg3c8BYnUyuKy
+/sE+hpSWDkzGpCSp4jkU7PEzl7z0ik36HN8m8wAv7OAjepJzMbi+hIOI+KYS7u8u
+kKzH9R6qat3XtumMJJ/7C4azj9vvqlt0+hpfm/udtmqSvXq4szThcE5AlbD4sU1O
+Up7qlgnaUsflxlyJ4Y+/ZKacFkNTJqYoxfM7rMwxgBc5zqrCCZp76Pypj+JIQ4O3
+ZIewxBMVuyd5LDxrsNamXl7ENTga+1bBFQxdE6Zum6/oTLomhx94lwcgmTJX2GLx
+q3HpxEpAaM29Og4sekRzYn/LYShN89mlwMai1kKtUwUZZnIDO0IW05rhtkxxUMsp
+l9mAbJZvAgMBAAECggEABqKODL5CDkt8XVt5TRw0PkYKfmtQd5gYsZgaUmOUd5T0
+TXszgvthQMZjlmMUoae16BOhtm2ytzlVoy7oaOuH6il7ajmYWO0BqU7JBcXscb/j
+v02Z63FcRKECOVTr+7zWQcLqyjRqptB09jSLmVRZNeJEcyzwHAnbjjvat+rbYxtc
+1juUqCPR568edUDfkMuZDBzJ3fRUhlYZDRwckeNpDiu83a6Gbyk8/lnn2HjUccvG
+zcs2tOQTbVjZQB+7aeKqlvXR3nItIH03SFFR94M1nvsmmBlgoaDxIDsFrZQDion8
+ad8SC6PFGHR1ZACc2iLD2IKoRvKUEnQsobtTxXSKqQKBgQDsbCD+g7kgP0ZhMStB
+tYkhZBtLOP0Yxf6xkEqbWF7dypjn2aiSo/pFZkzvxyYDDY9vOlERAgxlIQQeDvVL
+zmAiRqKH/P0dTTlQpfBa7D2UMXGLc3tEsDAnh6wr0Q8dAK8eVFPKLvmXKOdzo96s
+3uI2hQkSchVbAyGxzJpUAxiBqwKBgQDdcuhe4AM45qn1FHIv/mtNFafv9aqwh4QC
+ez46IBjzs06Tipbju0dkoV2Tl/XWH7hcLRBBwSHA5ysirCsni6ahfkoG8f+WDpn+
+b/i/9ZtIr5YY1uifj4JMXNlHpgcRLuM8Qyjx0d7YU//yZmIgLCwET+sjtObSh/4i
+EU9oKV7CTQKBgHBY5cjsgYGAcAppmhusj5CtiIbTevpVxDVO0xVFBjexOb4bYY7l
+m111QqRC555VyE5b0QAbEBbSfKloBErUtDw1grDKmOFevBjF8hTS5GRSpplU9EPs
+0cVHJJrhyqPGmnD4M6UFc5fQWURLn9pYQ/kSeQAp9Fn+f/mEt+WqXu/nAoGANPxm
+jzTocHf4mJSA0ez9PZ995FOSuNRkCLf2ZrABaGYx2emiOvE3nuNhYYxNnSNP2HZL
+2n/clKx7TLuHQ9oNT7zI96p1rjDmNdQS39NjiVvB/UWGuY777UuWDaezLzBZ3LRx
+GpNNz9MhfZ1zwyDuk0WQDKYfSKaTbxFXP6QOcU0CgYBDS4hD1GHV+zMoJ/syRbeY
+nm5ZxWUfP2OnCKT+sj+54DLHS53KwbquJRSNJBB4t/6IODAoStHfPpTLt18IfeQo
+cmhs1W5d46A9bnEMLf/uZ/thauX8b771QGYLTDQMkgTlfTLsbnKcb4/XQ4iR4n/A
+jFFa+31v/gSYzRUQMeyhUg==
+-----END PRIVATE KEY-----`;
+
+function fixtureSaKeyJson(): string {
+  return JSON.stringify({
+    type: 'service_account',
+    project_id: 'cma-bot-mp-20260501',
+    private_key_id: 'fixture-kid',
+    private_key: TEST_PRIVATE_KEY_PEM,
+    client_email: 'cma-chat-bot@cma-bot-mp-20260501.iam.gserviceaccount.com',
+  });
+}
+
+function makeMinimalPdf(pageCount: number): Uint8Array {
+  const pages = Array.from({ length: pageCount }, (_, i) => `${3 + i} 0 R`).join(' ');
+  const pageObjects = Array.from(
+    { length: pageCount },
+    (_, i) =>
+      `${3 + i} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] ` +
+      `/Contents ${3 + pageCount} 0 R >> endobj`,
+  ).join('\n');
+  const body =
+    `%PDF-1.4\n` +
+    `1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n` +
+    `2 0 obj << /Type /Pages /Count ${pageCount} /Kids [${pages}] >> endobj\n` +
+    `${pageObjects}\n` +
+    `${3 + pageCount} 0 obj << /Length 57 >> stream\n` +
+    `BT /F1 12 Tf 36 100 Td (Issue 214 PDF preflight small PASS) Tj ET\n` +
+    `endstream endobj\n` +
+    `xref\n0 ${4 + pageCount}\n0000000000 65535 f \n` +
+    `trailer << /Root 1 0 R /Size ${4 + pageCount} >>\n%%EOF\n`;
+  return new TextEncoder().encode(body);
+}
 
 interface BuildEnvOpts {
   envOverrides?: Partial<Env>;
@@ -386,6 +454,175 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('handleChatEvent', () => {
+  it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        CHAT_SA_KEY_JSON: fixtureSaKeyJson(),
+        COST_GUARD_SESSION_THRESHOLDS_USD: '0.1,8,12,16',
+      },
+    });
+    const msg = buildQueueMsg({
+      text: 'このPDFを短く説明してください。',
+      threadName: 'spaces/AAA/threads/T1',
+      attachment: [
+        {
+          contentType: 'application/pdf',
+          contentName: 'issue214-small.pdf',
+          source: 'UPLOADED_CONTENT',
+          attachmentDataRef: { resourceName: 'spaces/AAA/messages/M1/attachments/A1' },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const createCapture: unknown[] = [];
+    const sendCaptureSessionIds: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_be_created',
+      createCapture,
+      sendCaptureSessionIds,
+      events: [{ type: 'session.status_idle' }],
+    });
+
+    const fakePdf = makeMinimalPdf(1);
+    const origFetch = globalThis.fetch;
+    const fetchMock = makeFetchMock(async (url) => {
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({ access_token: 'test-token', expires_in: 3600, token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/media/')) {
+        return new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'content-type': 'application/pdf',
+            'content-length': String(fakePdf.byteLength),
+          },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.posts).toHaveLength(1);
+      expect(chatApiMock.posts[0]!.text).toContain('PDF事前確認');
+      expect(chatApiMock.posts[0]!.text).toContain('Cost Guard確認ライン');
+      expect(chatApiMock.posts[0]!.text).toContain('読む場合は「はい」');
+      expect(chatApiMock.posts[0]!.text).not.toContain('全文で進めて');
+      expect(createCapture).toEqual([]);
+      expect(sendCaptureSessionIds).toEqual([]);
+      expect(chatApiMock.patches).toEqual([]);
+      const runtimeEvents = (env.DB as unknown as {
+        _tables: { cma_worker_runtime_events: Array<{ event_type?: string }> };
+      })._tables.cma_worker_runtime_events.map((row) => row.event_type);
+      expect(runtimeEvents).toContain('pdf_preflight_result');
+      expect(runtimeEvents).not.toContain('prompt_envelope_built');
+      expect(runtimeEvents).not.toContain('cma_session_created');
+      expect(fetchMock.calls.map((c) => c.url)).toEqual([
+        'https://oauth2.googleapis.com/token',
+        'https://chat.googleapis.com/v1/media/spaces/AAA/messages/M1/attachments/A1?alt=media',
+      ]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('PDF preflight approval reuses the pending attachment without requiring reattachment', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        CHAT_SA_KEY_JSON: fixtureSaKeyJson(),
+        COST_GUARD_SESSION_THRESHOLDS_USD: '0.1,0.2,8,12,16',
+      },
+    });
+    const first = buildQueueMsg({
+      text: 'このPDFを短く説明してください。',
+      threadName: 'spaces/AAA/threads/T1',
+      attachment: [
+        {
+          contentType: 'application/pdf',
+          contentName: 'issue214-small.pdf',
+          source: 'UPLOADED_CONTENT',
+          attachmentDataRef: { resourceName: 'spaces/AAA/messages/M1/attachments/A1' },
+        },
+      ],
+    });
+    const second = buildQueueMsg({
+      text: 'はい',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    second.eventKey = 'chat:msgname:spaces/AAA/messages/M2';
+    second.payload.message.name = 'spaces/AAA/messages/M2';
+    await preClaim(env, first.eventKey, first.claim.owner);
+    await preClaim(env, second.eventKey, second.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const createCapture: unknown[] = [];
+    const sendCaptureSessionIds: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_pdf_approved',
+      createCapture,
+      sendCaptureSessionIds,
+      retrieveUsage: { input_tokens: 52_000, output_tokens: 0 },
+      retrieveModel: 'claude-opus-4-7',
+      events: [
+        { type: 'agent.message.text', text: 'PDF summary ok' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const fakePdf = makeMinimalPdf(1);
+    const origFetch = globalThis.fetch;
+    const fetchMock = makeFetchMock(async (url) => {
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({ access_token: 'test-token', expires_in: 3600, token_type: 'Bearer' }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/media/')) {
+        return new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'content-type': 'application/pdf',
+            'content-length': String(fakePdf.byteLength),
+          },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const firstResult = await handleChatEvent(env, {} as ExecutionContext, first);
+      expect(firstResult.kind).toBe('committed');
+      expect(chatApiMock.posts[0]!.text).toContain('PDF事前確認');
+      expect(chatApiMock.posts[0]!.text).toContain('読む場合は「はい」');
+      expect(createCapture).toEqual([]);
+
+      const secondResult = await handleChatEvent(env, {} as ExecutionContext, second);
+      expect(secondResult.kind).toBe('committed');
+      expect(createCapture).toHaveLength(1);
+      expect(sendCaptureSessionIds).toEqual(['sesn_pdf_approved']);
+      expect(chatApiMock.patches.at(-1)!.text).toContain('PDF summary ok');
+      expect(chatApiMock.patches.at(-1)!.text).not.toContain('Cost Guard 確認');
+      const runtimeEvents = (env.DB as unknown as {
+        _tables: { cma_worker_runtime_events: Array<{ event_type?: string }> };
+      })._tables.cma_worker_runtime_events.map((row) => row.event_type);
+      expect(runtimeEvents).toContain('pdf_preflight_approval_consumed');
+      expect(runtimeEvents).toContain('prompt_envelope_built');
+      expect(fetchMock.calls.filter((c) => c.url.startsWith('https://chat.googleapis.com/v1/media/')))
+        .toHaveLength(2);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 1: DM + EMAIL_SEND marker → AgentMail send + sent_messages + current space 投稿 + commit', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
