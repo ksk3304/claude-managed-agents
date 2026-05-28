@@ -205,9 +205,16 @@ async function runDailyReportCron(env: Env): Promise<void> {
   const model = env.DAILY_REPORT_MODEL || "claude-haiku-4-5";
   const dateLabel = env.DAILY_REPORT_DATE || defaultDateLabel(new Date());
   const dryRun = env.DAILY_REPORT_DRY_RUN === "1";
+  const eventKey = `daily_report:${dateLabel}:${Date.now()}`;
   console.log(
     `[cron] daily-report start date=${dateLabel} model=${model} dry_run=${dryRun}`,
   );
+  await recordRuntimeEvent(env, {
+    eventKey,
+    eventType: "daily_report_start",
+    source: "cron.daily-report",
+    detail: { dateLabel, model, dryRun },
+  });
   try {
     const result = await generateDailyReports({
       kv: env.MAKOTO_KV,
@@ -220,8 +227,26 @@ async function runDailyReportCron(env: Env): Promise<void> {
     console.log(
       `[cron] daily-report done date=${dateLabel} routes=${JSON.stringify(result)}`,
     );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      eventType: "daily_report_done",
+      source: "cron.daily-report",
+      detail: { dateLabel, model, dryRun, result },
+    });
   } catch (error) {
     console.error("[cron] daily-report failed", error);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      eventType: "daily_report_failed",
+      level: "error",
+      source: "cron.daily-report",
+      detail: {
+        dateLabel,
+        model,
+        dryRun,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
 }
 

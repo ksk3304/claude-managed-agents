@@ -175,6 +175,10 @@ export interface SendAndStreamResult {
    *     external `timeoutMs` AbortError thrown by `Promise.race`).
    */
   stopReason?: string;
+  /** Number of tool-use events observed while draining the stream. */
+  toolUseCount: number;
+  /** Tool names observed in tool-use events, de-duplicated in encounter order. */
+  toolUseNames: string[];
 }
 
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
@@ -229,10 +233,17 @@ export async function sendAndStream(
 
   let assistantText = '';
   let terminalEventType: string | undefined;
+  let toolUseCount = 0;
+  const toolUseNames: string[] = [];
 
   const drain = (async () => {
     for await (const ev of stream as unknown as AsyncIterable<Record<string, unknown>>) {
       const evType = typeof ev.type === 'string' ? ev.type : '';
+      if (isToolUseEventType(evType)) {
+        toolUseCount += 1;
+        const name = toolNameFromSessionEvent(ev);
+        if (name && !toolUseNames.includes(name)) toolUseNames.push(name);
+      }
       // Accumulate text-bearing events. The Managed Agents stream often
       // emits final assistant text as `agent.message` with `content[]`
       // blocks rather than top-level `text` / `delta`.
@@ -257,6 +268,8 @@ export async function sendAndStream(
     assistantText,
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
+    toolUseCount,
+    toolUseNames,
   };
 }
 
@@ -295,6 +308,21 @@ function textFromSessionEvent(ev: Record<string, unknown>): string | undefined {
     }
   }
   return pickString(ev, 'text') ?? pickString(ev, 'delta');
+}
+
+function isToolUseEventType(evType: string): boolean {
+  return evType === 'agent.tool_use' || evType === 'agent.custom_tool_use';
+}
+
+function toolNameFromSessionEvent(ev: Record<string, unknown>): string | undefined {
+  const direct = pickString(ev, 'name');
+  if (direct) return direct;
+  const toolUse = ev.tool_use;
+  if (toolUse && typeof toolUse === 'object') {
+    const name = pickString(toolUse as Record<string, unknown>, 'name');
+    if (name) return name;
+  }
+  return undefined;
 }
 
 function userMessageContentText(content: unknown): string {
@@ -452,6 +480,7 @@ export async function sendAndStreamWithToolDispatch(
   let terminalEventType: string | undefined;
   let stopReason: string | undefined;
   let toolCalls = 0;
+  const toolUseNames: string[] = [];
   let requiresActionIters = 0;
   const pendingCustomToolUses = new Map<
     string,
@@ -546,6 +575,8 @@ export async function sendAndStreamWithToolDispatch(
       // motivating case for this guard.
       if (evType === 'agent.tool_use') {
         builtinToolCalls += 1;
+        const name = toolNameFromSessionEvent(ev);
+        if (name && !toolUseNames.includes(name)) toolUseNames.push(name);
         if (builtinToolCalls > maxBuiltinToolCalls) {
           console.warn(
             `[session] tool_call_cap reached (count=${builtinToolCalls}, max=${maxBuiltinToolCalls}); sending interrupt`,
@@ -578,6 +609,7 @@ export async function sendAndStreamWithToolDispatch(
         }
         const toolUseId = pickString(ev, 'id') ?? '';
         const toolName = pickString(ev, 'name') ?? 'unknown';
+        if (toolName && !toolUseNames.includes(toolName)) toolUseNames.push(toolName);
         const toolInput = (ev as { input?: unknown }).input;
         if (toolUseId) {
           pendingCustomToolUses.set(toolUseId, { name: toolName, input: toolInput });
@@ -719,6 +751,8 @@ export async function sendAndStreamWithToolDispatch(
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
     stopReason,
+    toolUseCount: builtinToolCalls + toolCalls,
+    toolUseNames,
   };
 }
 

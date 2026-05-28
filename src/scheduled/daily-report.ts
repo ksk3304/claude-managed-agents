@@ -146,6 +146,7 @@ export function dailyReportPrompt(
     `${dateLabel} の ${route.title} を作成してください。\n` +
     '入力ログだけを根拠にし、推測で補完しないでください。\n' +
     '個人DMと共有スペースの内容を混在させないでください。\n' +
+    'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
     '形式:\n' +
     '# YYYY-MM-DD 日報\n' +
     '## 主な話題\n' +
@@ -316,6 +317,23 @@ export interface ReportStorePair {
   agentId: string;
 }
 
+export interface SummarizeLogsResult {
+  report: string;
+  sessionId?: string;
+  toolUseCount: number;
+  toolUseNames: string[];
+}
+
+class DailyReportSessionError extends Error {
+  readonly sessionId?: string;
+
+  constructor(message: string, sessionId?: string) {
+    super(message);
+    this.name = 'DailyReportSessionError';
+    this.sessionId = sessionId;
+  }
+}
+
 function agentIdForEntry(email: string, entry: UserMappingValue): string {
   const raw = (entry as { agent_id?: unknown }).agent_id;
   if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim();
@@ -339,25 +357,42 @@ export async function summarizeLogs(
   _model: string,
   agentId: string,
   environmentId: string,
-): Promise<string> {
+): Promise<SummarizeLogsResult> {
   if (logs.length === 0) {
-    return `# ${dateLabel} ${route.title}\n\n新着セッションなし。\n`;
+    return {
+      report: `# ${dateLabel} ${route.title}\n\n新着セッションなし。\n`,
+      toolUseCount: 0,
+      toolUseNames: [],
+    };
   }
   if (!agentId) {
     throw new Error('daily-report agent_id missing');
   }
   const userPrompt = dailyReportPrompt(route, dateLabel, logs);
-  const sessionId = await createSessionWithResources(client, {
+  let sessionId: string | undefined;
+  sessionId = await createSessionWithResources(client, {
     agentId,
     environmentId,
     resources: [],
   });
-  const streamed = await sendAndStream(client, {
-    sessionId,
-    userMessage: userPrompt,
-  });
-  // Python: `"".join(chunks).strip() + "\n"` (l.175).
-  return streamed.assistantText.trim() + '\n';
+  try {
+    const streamed = await sendAndStream(client, {
+      sessionId,
+      userMessage: userPrompt,
+    });
+    // Python: `"".join(chunks).strip() + "\n"` (l.175).
+    return {
+      report: streamed.assistantText.trim() + '\n',
+      sessionId,
+      toolUseCount: streamed.toolUseCount,
+      toolUseNames: streamed.toolUseNames,
+    };
+  } catch (error) {
+    throw new DailyReportSessionError(
+      error instanceof Error ? error.message : String(error),
+      sessionId,
+    );
+  }
 }
 
 // ============================================================================
@@ -456,6 +491,9 @@ export interface DailyReportRouteResult {
   chars: number;
   agent_id?: string;
   environment_id?: string;
+  session_id?: string;
+  tool_use_count?: number;
+  tool_use_names?: string[];
   /** error 文字列 (route 単位 failure isolation で集約). 成功時は無し. */
   error?: string;
 }
@@ -498,7 +536,7 @@ export async function generateDailyReports(
       const key = route.kind === 'shared' ? 'shared' : `dm:${pair.label}`;
       try {
         const logs = await listDateSessionLogs(client, pair.sourceStoreId, dateLabel);
-        const report = await summarizeLogs(
+        const summary = await summarizeLogs(
           client,
           route,
           dateLabel,
@@ -509,18 +547,23 @@ export async function generateDailyReports(
         );
         let outputPath = `/${dateLabel}.md`;
         if (!dryRun) {
-          outputPath = await writeReport(client, pair.targetStoreId, dateLabel, report);
+          outputPath = await writeReport(client, pair.targetStoreId, dateLabel, summary.report);
         }
         result[key] = {
           source_store_id: pair.sourceStoreId,
           target_store_id: pair.targetStoreId,
           log_count: logs.length,
           output_path: outputPath,
-          chars: report.length,
+          chars: summary.report.length,
           agent_id: pair.agentId,
           environment_id: environmentId,
+          session_id: summary.sessionId,
+          tool_use_count: summary.toolUseCount,
+          tool_use_names: summary.toolUseNames,
         };
       } catch (error) {
+        const sessionId =
+          error instanceof DailyReportSessionError ? error.sessionId : undefined;
         // 1 user の session / list / write 失敗で他 user を巻き込まない.
         result[key] = {
           source_store_id: pair.sourceStoreId,
@@ -530,6 +573,9 @@ export async function generateDailyReports(
           chars: 0,
           agent_id: pair.agentId,
           environment_id: environmentId,
+          session_id: sessionId,
+          tool_use_count: 0,
+          tool_use_names: [],
           error: error instanceof Error ? error.message : String(error),
         };
       }

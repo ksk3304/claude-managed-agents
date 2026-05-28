@@ -98,6 +98,7 @@ describe('dailyReportPrompt', () => {
       '2026-05-25 の 共有スペース日報 を作成してください。\n' +
       '入力ログだけを根拠にし、推測で補完しないでください。\n' +
       '個人DMと共有スペースの内容を混在させないでください。\n' +
+      'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
       '形式:\n' +
       '# YYYY-MM-DD 日報\n' +
       '## 主な話題\n' +
@@ -296,6 +297,7 @@ function makeMockClient(
   options: {
     summarizeText?: (capture: CapturedCall) => string;
     throwOnMessages?: Set<string>;
+    emitToolUse?: boolean;
   } = {},
 ) {
   const stores = new Map<string, Map<string, MemoryItem>>();
@@ -410,10 +412,13 @@ function makeMockClient(
         const cap = sessionCaptures.get(sessionId)!;
         captured.push(cap);
         const text = options.summarizeText ? options.summarizeText(cap) : '# 要約\n\nダミー要約本文';
-        return Promise.resolve(asyncEvents([
+        const events: Array<Record<string, unknown>> = [];
+        if (options.emitToolUse) events.push({ type: 'agent.tool_use', name: 'bash' });
+        events.push(
           { type: 'agent.text_delta', delta: text },
           { type: 'session.status_idle' },
-        ]));
+        );
+        return Promise.resolve(asyncEvents(events));
       },
     },
   };
@@ -465,6 +470,10 @@ describe('generateDailyReports', () => {
     expect(result['dm:alice'].log_count).toBe(1);
     expect(result['dm:bob'].log_count).toBe(1);
     expect(result['shared'].log_count).toBe(1);
+    expect(result['dm:alice'].session_id).toBeDefined();
+    expect(result['dm:bob'].session_id).toBeDefined();
+    expect(result['shared'].session_id).toBeDefined();
+    expect(result['dm:alice'].tool_use_count).toBe(0);
     expect(mock.calls.sessions).toBe(3);
     expect(mock.calls.create).toBe(3); // 3 reports written.
   });
@@ -517,6 +526,31 @@ describe('generateDailyReports', () => {
     expect(written?.content).toBe('# 2026-05-25 日報\n\n## 主な話題\n- 進捗共有\n');
   });
 
+  it('reports managed session id and observed tool use in route result', async () => {
+    const kv = makeKv();
+    await seedMapping(kv);
+    const mock = makeMockClient(
+      {
+        [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
+      },
+      { emitToolUse: true },
+    );
+
+    const result = await generateDailyReports({
+      kv,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: mock.client as any,
+      dateLabel: '2026-05-25',
+      model: 'claude-haiku-4-5',
+      environmentId: 'env_test',
+      dryRun: false,
+    });
+
+    expect(result['dm:alice'].session_id).toMatch(/^ses_/);
+    expect(result['dm:alice'].tool_use_count).toBe(1);
+    expect(result['dm:alice'].tool_use_names).toEqual(['bash']);
+  });
+
   it('updates an existing /<date>.md memory in-place', async () => {
     const kv = makeKv();
     await seedMapping(kv);
@@ -564,9 +598,10 @@ describe('generateDailyReports', () => {
     expect(sharedCapture!.agent_id).toBe('agent_a');
     expect(sharedCapture!.environment_id).toBe('env_test');
     expect(sharedCapture!.user_prompt).toBe(
-      '2026-05-25 の 共有スペース日報 を作成してください。\n' +
+        '2026-05-25 の 共有スペース日報 を作成してください。\n' +
         '入力ログだけを根拠にし、推測で補完しないでください。\n' +
         '個人DMと共有スペースの内容を混在させないでください。\n' +
+        'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
         '形式:\n' +
         '# YYYY-MM-DD 日報\n' +
         '## 主な話題\n' +
