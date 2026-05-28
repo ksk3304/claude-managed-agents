@@ -147,6 +147,7 @@ import { recordRuntimeEvent, stableHash } from '../lib/observability';
 const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
+const MORNING_AI_NEWS_EVENT_KEY_PREFIX = 'scheduled:morning_ai_news_seto_dm:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
@@ -899,7 +900,7 @@ export async function handleChatEvent(
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
 
-  if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) {
+  if (isLongRunningScheduledEvent(eventKey)) {
     parentHeartbeat = new LeaseHeartbeat({
       env,
       eventKey,
@@ -989,7 +990,7 @@ export async function handleChatEvent(
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
         // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
-        timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+        timeoutMs: isLongRunningScheduledEvent(eventKey)
           ? MORNING_BRIEF_STREAM_TIMEOUT_MS
           : undefined,
       });
@@ -1390,6 +1391,13 @@ export async function handleChatEvent(
       );
     }
   }
+}
+
+function isLongRunningScheduledEvent(eventKey: string): boolean {
+  return (
+    eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX) ||
+    eventKey.startsWith(MORNING_AI_NEWS_EVENT_KEY_PREFIX)
+  );
 }
 
 // ---------------------------------------------------------------------------

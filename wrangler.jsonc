@@ -96,8 +96,10 @@
   //     Cloud Run `scripts/cma_daily_report.py` (Issue #186 Phase 2).
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     — `morning_brief_seto` via the Google Chat Queue path.
+  //   - `20 20 * * *` (20:20 UTC = 毎日 05:20 JST)
+  //     — `morning_ai_news_seto_dm` via the Google Chat Queue path.
   "triggers": {
-    "crons": ["0 4 * * *", "30 15 * * *", "30 23 * * sun-thu"],
+    "crons": ["0 4 * * *", "30 15 * * *", "30 23 * * sun-thu", "20 20 * * *"],
   },
   // Cloudflare Queues for the AgentMail bridge (Issue #186). One
   // single-purpose queue carries verified webhook deliveries from the

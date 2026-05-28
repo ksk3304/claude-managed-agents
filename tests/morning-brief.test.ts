@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import {
+  buildMorningAiNewsChatEvent,
   buildMorningBriefChatEvent,
+  enqueueMorningAiNewsSeto,
   enqueueMorningBriefSeto,
+  MORNING_AI_NEWS_SETO_CRON,
+  MORNING_AI_NEWS_SETO_JOB_ID,
   MORNING_BRIEF_SETO_CRON,
   MORNING_BRIEF_SETO_EMAIL,
   MORNING_BRIEF_SETO_SPACE,
@@ -25,6 +29,10 @@ function envWithQueue(): Env & { MAKOTO_CHAT_QUEUE: Queue<ChatQueueMessage> & { 
 describe('morning brief scheduled enqueue', () => {
   it('uses the Cloudflare UTC cron equivalent of weekday 08:30 JST', () => {
     expect(MORNING_BRIEF_SETO_CRON).toBe('30 23 * * sun-thu');
+  });
+
+  it('uses the Cloudflare UTC cron equivalent of daily 05:20 JST AI news', () => {
+    expect(MORNING_AI_NEWS_SETO_CRON).toBe('20 20 * * *');
   });
 
   it('builds a synthetic Google Chat event for the Seto DM route', () => {
@@ -57,6 +65,32 @@ describe('morning brief scheduled enqueue', () => {
     })._tables.cma_worker_runtime_events.map((row) => row.event_type);
     expect(runtimeEvents).toContain('scheduled_morning_brief_enqueue_start');
     expect(runtimeEvents).toContain('scheduled_morning_brief_enqueued');
+  });
+
+  it('builds and enqueues the Seto DM AI news job', async () => {
+    const env = envWithQueue();
+    const nowMs = Date.parse('2026-05-28T20:20:00.000Z');
+    const event = buildMorningAiNewsChatEvent(
+      nowMs,
+      'scheduled:morning_ai_news_seto_dm:2026-05-29:1780009200000',
+    );
+    expect(event.space.name).toBe(MORNING_BRIEF_SETO_SPACE);
+    expect(event.message?.text).toContain('今日は 2026-05-29 (金) JST です。');
+    expect(event.message?.text).toContain('AI関連の最新ニュース');
+    expect(event.message?.text).toContain('必ず 3 件');
+    expect(event.message?.text).toContain('===BRIEF_FINAL===');
+
+    const result = await enqueueMorningAiNewsSeto(env, nowMs);
+    expect(result.kind).toBe('enqueued');
+    expect(result.eventKey).toContain(`scheduled:${MORNING_AI_NEWS_SETO_JOB_ID}:2026-05-29:`);
+    expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(1);
+    expect(env.MAKOTO_CHAT_QUEUE._sent[0]!.claim.owner).toMatch(/^cron-morning-ai-news-seto:/);
+
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string }> };
+    })._tables.cma_worker_runtime_events.map((row) => row.event_type);
+    expect(runtimeEvents).toContain('scheduled_morning_ai_news_enqueue_start');
+    expect(runtimeEvents).toContain('scheduled_morning_ai_news_enqueued');
   });
 
   it('does not enqueue duplicate event keys', async () => {
