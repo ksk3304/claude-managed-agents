@@ -233,10 +233,10 @@ export async function sendAndStream(
   const drain = (async () => {
     for await (const ev of stream as unknown as AsyncIterable<Record<string, unknown>>) {
       const evType = typeof ev.type === 'string' ? ev.type : '';
-      // Accumulate any string-typed `text` or `delta` field. SDK
-      // gives us `*.text_delta` per token and `*.text` for the final
-      // assembled block — accept either.
-      const text = pickString(ev, 'text') ?? pickString(ev, 'delta');
+      // Accumulate text-bearing events. The Managed Agents stream often
+      // emits final assistant text as `agent.message` with `content[]`
+      // blocks rather than top-level `text` / `delta`.
+      const text = textFromSessionEvent(ev);
       if (text) assistantText += text;
 
       if (evType === 'session.status_idle' || evType === 'session.status_terminated') {
@@ -279,6 +279,22 @@ function toUserMessageContent(
 function pickString(ev: Record<string, unknown>, key: string): string | undefined {
   const v = ev[key];
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+function textFromSessionEvent(ev: Record<string, unknown>): string | undefined {
+  const evType = typeof ev.type === 'string' ? ev.type : '';
+  if (evType === 'agent.message') {
+    const content = (ev as { content?: Array<Record<string, unknown>> }).content;
+    if (Array.isArray(content)) {
+      const parts: string[] = [];
+      for (const block of content) {
+        const t = pickString(block, 'text');
+        if (t) parts.push(t);
+      }
+      if (parts.length > 0) return parts.join('');
+    }
+  }
+  return pickString(ev, 'text') ?? pickString(ev, 'delta');
 }
 
 function userMessageContentText(content: unknown): string {
@@ -520,24 +536,7 @@ export async function sendAndStreamWithToolDispatch(
       // block の text field** を集計する必要がある (= 2026-05-26 reactive
       // bot 実機検証で発覚、空 assistantText → empty clean text → 投稿
       // skip の根本原因)。
-      let text: string | undefined;
-      if (evType === 'agent.message') {
-        const content = (ev as { content?: Array<Record<string, unknown>> })
-          .content;
-        if (Array.isArray(content)) {
-          const parts: string[] = [];
-          for (const block of content) {
-            const t = pickString(block, 'text');
-            if (t) parts.push(t);
-          }
-          if (parts.length > 0) text = parts.join('');
-        }
-      }
-      // fallback: top-level の `text` / `delta` (= 旧仕様 / partial delta
-      // event、念のため残置で後方互換)
-      if (!text) {
-        text = pickString(ev, 'text') ?? pickString(ev, 'delta');
-      }
+      const text = textFromSessionEvent(ev);
       if (text) assistantText += text;
 
       // 2a. built-in tool use — bash / web_search / code_execution. The

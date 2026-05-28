@@ -16,6 +16,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   buildAnthropicClient,
+  sendAndStream,
   sendAndStreamWithToolDispatch,
   type ToolDispatcher,
 } from '../src/lib/session';
@@ -390,5 +391,27 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.assistantText).toBe('done.');
     expect(r.terminalEventType).toBe('session.status_idle');
     expect(r.stopReason).toBe('end_turn');
+  });
+});
+
+describe('sendAndStream', () => {
+  it('accumulates agent.message content blocks into assistantText', async () => {
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.message',
+          content: [
+            { type: 'text', text: 'Hello, ' },
+            { type: 'text', text: 'world.' },
+          ],
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+    const r = await sendAndStream(client, {
+      sessionId: 'sesn_1',
+      userMessage: 'hi',
+    });
+    expect(r.assistantText).toBe('Hello, world.');
   });
 });
