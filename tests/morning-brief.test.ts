@@ -24,7 +24,7 @@ function envWithQueue(): Env & { MAKOTO_CHAT_QUEUE: Queue<ChatQueueMessage> & { 
 
 describe('morning brief scheduled enqueue', () => {
   it('uses the Cloudflare UTC cron equivalent of weekday 08:30 JST', () => {
-    expect(MORNING_BRIEF_SETO_CRON).toBe('30 23 * * 0-4');
+    expect(MORNING_BRIEF_SETO_CRON).toBe('30 23 * * sun-thu');
   });
 
   it('builds a synthetic Google Chat event for the Seto DM route', () => {

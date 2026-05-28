@@ -2,7 +2,7 @@ import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat
 import { newClaimOwner, releaseClaim, tryClaim } from '../lib/dedupe';
 import { recordRuntimeEvent } from '../lib/observability';
 
-export const MORNING_BRIEF_SETO_CRON = '30 23 * * 0-4';
+export const MORNING_BRIEF_SETO_CRON = '30 23 * * sun-thu';
 export const MORNING_BRIEF_SETO_JOB_ID = 'morning_brief_seto';
 export const MORNING_BRIEF_SETO_SPACE = 'spaces/rKtECyAAAAE';
 export const MORNING_BRIEF_SETO_EMAIL = 'k.seto@makotoprime.com';

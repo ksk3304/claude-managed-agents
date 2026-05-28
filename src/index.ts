@@ -111,7 +111,7 @@ export default {
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
   //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
-  //   - `30 23 * * 0-4` (23:30 UTC Sun-Thu = 平日 08:30 JST)
+  //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
   async scheduled(
     controller: ScheduledController,
