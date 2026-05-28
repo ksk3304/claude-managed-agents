@@ -101,6 +101,39 @@ export interface CostGuardDeps {
   now?: () => Date;
 }
 
+export interface SessionCostGuardConfig {
+  /** 確認する USD 段階。既定: 8,12,16。 */
+  thresholdsUsd: number[];
+  /** 最後の明示段階以降の増分。既定: 4 (= 20,24,28...). */
+  stepUsd: number;
+  /** Chat 表示用の概算円換算。既定: 155。 */
+  usdToJpy: number;
+  /** usage に model が無い時の保守的な価格表 fallback。 */
+  fallbackModel: string;
+}
+
+export interface SessionCostGuardDeps {
+  kv: KVNamespace;
+  now?: () => Date;
+  config?: Partial<SessionCostGuardConfig>;
+}
+
+export interface SessionUsageSnapshot {
+  usage: Record<string, unknown> | null | undefined;
+  model?: string | null;
+}
+
+export interface SessionCostPromptResult {
+  promptText: string;
+  sessionUsd: number;
+  thresholdUsd: number;
+  nextThresholdUsd: number;
+}
+
+export type PendingSessionApprovalResult =
+  | { kind: 'none' }
+  | { kind: 'reply'; text: string; closeSession: boolean };
+
 export interface BudgetStatus {
   /** kind ごとの現在値 (= KV から読んだ生数)。 */
   current: {
@@ -215,6 +248,242 @@ export async function checkBudget(deps: CostGuardDeps): Promise<BudgetStatus> {
     exceeded.push('chatDailyCount');
   }
   return { current, limit, exceeded };
+}
+
+// ----------------------------------------------------------------------------
+// 2b. Per-session staged approval
+// ----------------------------------------------------------------------------
+
+const SESSION_STATE_TTL_SEC = 35 * 24 * 60 * 60;
+const SESSION_PENDING_TTL_SEC = 24 * 60 * 60;
+
+const DEFAULT_SESSION_CONFIG: SessionCostGuardConfig = {
+  thresholdsUsd: [8, 12, 16],
+  stepUsd: 4,
+  usdToJpy: 155,
+  fallbackModel: 'claude-opus-4-7',
+};
+
+const PRICING_USD_PER_MTOK: Record<
+  string,
+  {
+    input: number;
+    output: number;
+    cache_creation: number;
+    cache_creation_1h: number;
+    cache_read: number;
+  }
+> = {
+  'claude-opus-4-7': {
+    input: 5,
+    output: 25,
+    cache_creation: 6.25,
+    cache_creation_1h: 10,
+    cache_read: 0.5,
+  },
+  'claude-opus-4-6': {
+    input: 5,
+    output: 25,
+    cache_creation: 6.25,
+    cache_creation_1h: 10,
+    cache_read: 0.5,
+  },
+  'claude-opus-4-5': {
+    input: 5,
+    output: 25,
+    cache_creation: 6.25,
+    cache_creation_1h: 10,
+    cache_read: 0.5,
+  },
+  'claude-opus-4-1': {
+    input: 15,
+    output: 75,
+    cache_creation: 18.75,
+    cache_creation_1h: 30,
+    cache_read: 1.5,
+  },
+  'claude-sonnet-4-6': {
+    input: 3,
+    output: 15,
+    cache_creation: 3.75,
+    cache_creation_1h: 6,
+    cache_read: 0.3,
+  },
+  'claude-haiku-4-5': {
+    input: 1,
+    output: 5,
+    cache_creation: 1.25,
+    cache_creation_1h: 2,
+    cache_read: 0.1,
+  },
+};
+
+interface SessionCostState {
+  sessionId: string;
+  approvedThroughUsd: number;
+  lastSeenUsd: number;
+}
+
+interface PendingSessionApproval {
+  sessionId: string;
+  thresholdUsd: number;
+  currentUsd: number;
+  nextThresholdUsd: number;
+  createdAt: string;
+}
+
+export function resolveSessionCostGuardConfig(
+  env?: Partial<
+    Pick<
+      Env,
+      | 'COST_GUARD_SESSION_THRESHOLDS_USD'
+      | 'COST_GUARD_SESSION_STEP_USD'
+      | 'COST_GUARD_USD_TO_JPY'
+      | 'COST_GUARD_SESSION_PRICING_MODEL'
+    >
+  >,
+): SessionCostGuardConfig {
+  const thresholds = parseNumberList(env?.COST_GUARD_SESSION_THRESHOLDS_USD)
+    ?? DEFAULT_SESSION_CONFIG.thresholdsUsd;
+  return {
+    thresholdsUsd: thresholds,
+    stepUsd: positiveNumber(env?.COST_GUARD_SESSION_STEP_USD)
+      ?? DEFAULT_SESSION_CONFIG.stepUsd,
+    usdToJpy: positiveNumber(env?.COST_GUARD_USD_TO_JPY)
+      ?? DEFAULT_SESSION_CONFIG.usdToJpy,
+    fallbackModel:
+      (env?.COST_GUARD_SESSION_PRICING_MODEL || '').trim()
+      || DEFAULT_SESSION_CONFIG.fallbackModel,
+  };
+}
+
+export async function handlePendingSessionApproval(
+  deps: SessionCostGuardDeps,
+  input: {
+    threadSessionKey: string | null;
+    text: string;
+  },
+): Promise<PendingSessionApprovalResult> {
+  if (!input.threadSessionKey) return { kind: 'none' };
+  const pending = await readPendingApproval(deps.kv, input.threadSessionKey);
+  if (!pending) return { kind: 'none' };
+
+  const decision = parseApprovalDecision(input.text);
+  if (decision === 'yes') {
+    const state = await readSessionState(deps.kv, pending.sessionId);
+    const nextState: SessionCostState = {
+      sessionId: pending.sessionId,
+      approvedThroughUsd: Math.max(
+        state?.approvedThroughUsd ?? 0,
+        pending.thresholdUsd,
+      ),
+      lastSeenUsd: Math.max(state?.lastSeenUsd ?? 0, pending.currentUsd),
+    };
+    await writeSessionState(deps.kv, nextState);
+    await deps.kv.delete(pendingApprovalKey(input.threadSessionKey));
+    return {
+      kind: 'reply',
+      closeSession: false,
+      text:
+        `了解です。この session を続行します。\n` +
+        `次は $${formatUsd(pending.nextThresholdUsd)} 到達時に確認します。`,
+    };
+  }
+  if (decision === 'no') {
+    await deps.kv.delete(pendingApprovalKey(input.threadSessionKey));
+    await deps.kv.delete(input.threadSessionKey);
+    return {
+      kind: 'reply',
+      closeSession: true,
+      text:
+        '了解です。この session は終了扱いにしました。\n' +
+        '次の発話は新しい session で開始します。',
+    };
+  }
+  return {
+    kind: 'reply',
+    closeSession: false,
+    text: buildSessionApprovalPrompt(pending, resolveConfig(deps)),
+  };
+}
+
+export async function evaluateSessionCostAfterTurn(
+  deps: SessionCostGuardDeps,
+  input: {
+    threadSessionKey: string | null;
+    sessionId: string;
+    snapshot: SessionUsageSnapshot;
+  },
+): Promise<SessionCostPromptResult | null> {
+  if (!input.threadSessionKey) return null;
+  const config = resolveConfig(deps);
+  const sessionUsd = usdFromUsage(input.snapshot.usage, input.snapshot.model, config);
+  if (sessionUsd === null) return null;
+
+  const prev = await readSessionState(deps.kv, input.sessionId);
+  const lastSeenUsd = prev?.lastSeenUsd ?? 0;
+  const deltaUsd = Math.max(0, sessionUsd - lastSeenUsd);
+  if (deltaUsd > 0) {
+    await incrementCounter(
+      { kv: deps.kv, now: deps.now },
+      KIND_ANTHROPIC_COST_USD,
+      deltaUsd,
+    );
+  }
+
+  const approvedThroughUsd = prev?.approvedThroughUsd ?? 0;
+  const thresholdUsd = crossedThreshold(sessionUsd, approvedThroughUsd, config);
+  const nextState: SessionCostState = {
+    sessionId: input.sessionId,
+    approvedThroughUsd,
+    lastSeenUsd: Math.max(lastSeenUsd, sessionUsd),
+  };
+  await writeSessionState(deps.kv, nextState);
+
+  if (thresholdUsd === null) return null;
+
+  const nextThresholdUsd = nextThresholdAfter(thresholdUsd, config);
+  const pending: PendingSessionApproval = {
+    sessionId: input.sessionId,
+    thresholdUsd,
+    currentUsd: sessionUsd,
+    nextThresholdUsd,
+    createdAt: now(deps).toISOString(),
+  };
+  await deps.kv.put(
+    pendingApprovalKey(input.threadSessionKey),
+    JSON.stringify(pending),
+    { expirationTtl: SESSION_PENDING_TTL_SEC },
+  );
+
+  return {
+    promptText: buildSessionApprovalPrompt(pending, config),
+    sessionUsd,
+    thresholdUsd,
+    nextThresholdUsd,
+  };
+}
+
+export function usdFromUsage(
+  usage: Record<string, unknown> | null | undefined,
+  model: string | null | undefined,
+  config: SessionCostGuardConfig = DEFAULT_SESSION_CONFIG,
+): number | null {
+  if (!usage || typeof usage !== 'object') return null;
+  const pricing = pricingForModel(model || config.fallbackModel, config);
+  if (!pricing) return null;
+  const inputTokens = safeTokenCount(usage.input_tokens);
+  const outputTokens = safeTokenCount(usage.output_tokens);
+  if (inputTokens === null || outputTokens === null) return null;
+  const [cache5mTokens, cache1hTokens] = cacheCreationTokens(usage);
+  const cacheReadTokens = safeTokenCount(usage.cache_read_input_tokens) ?? 0;
+  return (
+    inputTokens * pricing.input / 1_000_000 +
+    outputTokens * pricing.output / 1_000_000 +
+    cache5mTokens * pricing.cache_creation / 1_000_000 +
+    cache1hTokens * pricing.cache_creation_1h / 1_000_000 +
+    cacheReadTokens * pricing.cache_read / 1_000_000
+  );
 }
 
 // ----------------------------------------------------------------------------
@@ -355,6 +624,25 @@ function resolveLimits(override: Partial<CostLimits> | undefined): CostLimits {
   };
 }
 
+function resolveConfig(deps: SessionCostGuardDeps): SessionCostGuardConfig {
+  const override = deps.config ?? {};
+  const thresholds = sanitiseThresholds(override.thresholdsUsd)
+    ?? DEFAULT_SESSION_CONFIG.thresholdsUsd;
+  return {
+    thresholdsUsd: thresholds,
+    stepUsd:
+      typeof override.stepUsd === 'number' && override.stepUsd > 0
+        ? override.stepUsd
+        : DEFAULT_SESSION_CONFIG.stepUsd,
+    usdToJpy:
+      typeof override.usdToJpy === 'number' && override.usdToJpy > 0
+        ? override.usdToJpy
+        : DEFAULT_SESSION_CONFIG.usdToJpy,
+    fallbackModel:
+      override.fallbackModel?.trim() || DEFAULT_SESSION_CONFIG.fallbackModel,
+  };
+}
+
 function now(deps: CostGuardDeps): Date {
   return deps.now ? deps.now() : new Date();
 }
@@ -371,6 +659,217 @@ function currentBucket(deps: CostGuardDeps, kind: CostKind): string {
 
 function buildKey(kind: CostKind, bucket: string): string {
   return `${PREFIX}:${kind}:${bucket}`;
+}
+
+function sessionStateKey(sessionId: string): string {
+  return `${PREFIX}:session_state:${sessionId}`;
+}
+
+function pendingApprovalKey(threadSessionKey: string): string {
+  return `${PREFIX}:session_pending:${threadSessionKey}`;
+}
+
+async function readSessionState(
+  kv: KVNamespace,
+  sessionId: string,
+): Promise<SessionCostState | null> {
+  try {
+    const raw = await kv.get(sessionStateKey(sessionId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SessionCostState>;
+    if (parsed.sessionId !== sessionId) return null;
+    return {
+      sessionId,
+      approvedThroughUsd: finiteNumber(parsed.approvedThroughUsd) ?? 0,
+      lastSeenUsd: finiteNumber(parsed.lastSeenUsd) ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeSessionState(
+  kv: KVNamespace,
+  state: SessionCostState,
+): Promise<void> {
+  try {
+    await kv.put(sessionStateKey(state.sessionId), JSON.stringify(state), {
+      expirationTtl: SESSION_STATE_TTL_SEC,
+    });
+  } catch {
+    // fail-open: guard state write failure must not stop Chat.
+  }
+}
+
+async function readPendingApproval(
+  kv: KVNamespace,
+  threadSessionKey: string,
+): Promise<PendingSessionApproval | null> {
+  try {
+    const raw = await kv.get(pendingApprovalKey(threadSessionKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingSessionApproval>;
+    if (!parsed.sessionId) return null;
+    const thresholdUsd = finiteNumber(parsed.thresholdUsd);
+    const currentUsd = finiteNumber(parsed.currentUsd);
+    const nextThresholdUsd = finiteNumber(parsed.nextThresholdUsd);
+    if (
+      thresholdUsd === null ||
+      currentUsd === null ||
+      nextThresholdUsd === null
+    ) {
+      return null;
+    }
+    return {
+      sessionId: parsed.sessionId,
+      thresholdUsd,
+      currentUsd,
+      nextThresholdUsd,
+      createdAt: parsed.createdAt || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function crossedThreshold(
+  currentUsd: number,
+  approvedThroughUsd: number,
+  config: SessionCostGuardConfig,
+): number | null {
+  let crossed: number | null = null;
+  for (const threshold of thresholdsUpTo(currentUsd, config)) {
+    if (threshold > approvedThroughUsd && currentUsd >= threshold) {
+      crossed = threshold;
+    }
+  }
+  return crossed;
+}
+
+function thresholdsUpTo(
+  currentUsd: number,
+  config: SessionCostGuardConfig,
+): number[] {
+  const out = [...config.thresholdsUsd];
+  let cursor = out[out.length - 1] ?? 0;
+  while (cursor + config.stepUsd <= currentUsd) {
+    cursor += config.stepUsd;
+    out.push(cursor);
+  }
+  return out;
+}
+
+function nextThresholdAfter(
+  thresholdUsd: number,
+  config: SessionCostGuardConfig,
+): number {
+  for (const t of config.thresholdsUsd) {
+    if (t > thresholdUsd) return t;
+  }
+  const last = config.thresholdsUsd[config.thresholdsUsd.length - 1] ?? 0;
+  if (thresholdUsd < last) return last;
+  return thresholdUsd + config.stepUsd;
+}
+
+function buildSessionApprovalPrompt(
+  pending: PendingSessionApproval,
+  config: SessionCostGuardConfig,
+): string {
+  const yen = Math.round(pending.currentUsd * config.usdToJpy);
+  return [
+    'Cost Guard 確認',
+    `この session の累計が $${formatUsd(pending.currentUsd)}（約${yen.toLocaleString('ja-JP')}円）です。`,
+    `この session の対話を続けますか？`,
+    `「はい」なら $${formatUsd(pending.nextThresholdUsd)} 到達時まで続行します。`,
+    '「いいえ」なら次の発話を新しい session で開始します。',
+  ].join('\n');
+}
+
+function parseApprovalDecision(text: string): 'yes' | 'no' | null {
+  const normalised = text.trim().toLowerCase().replace(/[\s。、．.！!？?]+/g, '');
+  if (!normalised) return null;
+  if (
+    normalised.startsWith('はい') ||
+    normalised.startsWith('yes') ||
+    normalised === 'y' ||
+    normalised.startsWith('続け') ||
+    normalised.startsWith('続行')
+  ) {
+    return 'yes';
+  }
+  if (
+    normalised.startsWith('いいえ') ||
+    normalised.startsWith('no') ||
+    normalised === 'n' ||
+    normalised.startsWith('やめ') ||
+    normalised.startsWith('止め') ||
+    normalised.startsWith('停止') ||
+    normalised.startsWith('終了')
+  ) {
+    return 'no';
+  }
+  return null;
+}
+
+function pricingForModel(
+  model: string,
+  config: SessionCostGuardConfig,
+): typeof PRICING_USD_PER_MTOK[string] | null {
+  const trimmed = model.trim();
+  if (PRICING_USD_PER_MTOK[trimmed]) return PRICING_USD_PER_MTOK[trimmed];
+  for (const [key, value] of Object.entries(PRICING_USD_PER_MTOK)) {
+    if (trimmed.includes(key)) return value;
+  }
+  return PRICING_USD_PER_MTOK[config.fallbackModel] ?? null;
+}
+
+function cacheCreationTokens(usage: Record<string, unknown>): [number, number] {
+  const nested = usage.cache_creation;
+  if (nested && typeof nested === 'object') {
+    const obj = nested as Record<string, unknown>;
+    return [
+      safeTokenCount(obj.ephemeral_5m_input_tokens) ?? 0,
+      safeTokenCount(obj.ephemeral_1h_input_tokens) ?? 0,
+    ];
+  }
+  return [safeTokenCount(usage.cache_creation_input_tokens) ?? 0, 0];
+}
+
+function safeTokenCount(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return Math.trunc(value);
+}
+
+function parseNumberList(raw: string | undefined): number[] | null {
+  if (!raw) return null;
+  return sanitiseThresholds(
+    raw
+      .split(',')
+      .map((part) => Number.parseFloat(part.trim()))
+      .filter((n) => Number.isFinite(n)),
+  );
+}
+
+function sanitiseThresholds(values: number[] | undefined): number[] | null {
+  const out = [...new Set((values ?? []).filter((n) => Number.isFinite(n) && n > 0))]
+    .sort((a, b) => a - b);
+  return out.length > 0 ? out : null;
+}
+
+function positiveNumber(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const n = Number.parseFloat(raw.trim());
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function finiteNumber(raw: unknown): number | null {
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+}
+
+function formatUsd(value: number): string {
+  return value.toFixed(Number.isInteger(value) ? 0 : 2);
 }
 
 function ym(d: Date): string {

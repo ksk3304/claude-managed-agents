@@ -111,6 +111,14 @@ declare namespace Cloudflare {
      * Provisioned via `wrangler secret put COST_GUARD_ADMIN_EMAILS`.
      */
     COST_GUARD_ADMIN_EMAILS?: string;
+    /** Per-session confirmation thresholds in USD CSV. Default: `8,12,16`. */
+    COST_GUARD_SESSION_THRESHOLDS_USD?: string;
+    /** USD increment after the last explicit threshold. Default: `4`. */
+    COST_GUARD_SESSION_STEP_USD?: string;
+    /** Display-only USD→JPY rate for confirmation text. Default: `155`. */
+    COST_GUARD_USD_TO_JPY?: string;
+    /** Conservative pricing fallback when sessions.retrieve omits model. */
+    COST_GUARD_SESSION_PRICING_MODEL?: string;
     /**
      * AgentMail inbox id used by the reactive Chat bot for outbound
      * EMAIL_SEND markers. Cloud Run の `cma-bot` inbox 等価 — 1 つの bot

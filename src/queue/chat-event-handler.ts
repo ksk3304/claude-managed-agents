@@ -79,6 +79,11 @@ import {
   parseCostGuardCommand,
   handleCostGuardCommand,
 } from '../lib/cost-guard-command';
+import {
+  evaluateSessionCostAfterTurn,
+  handlePendingSessionApproval,
+  resolveSessionCostGuardConfig,
+} from '../lib/cost-guard';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
 import {
   resolveCapRecoveryConfig,
@@ -96,6 +101,7 @@ import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
+  chatThreadSessionKey,
   orchestrateChatTurn,
   OrchestratorFailure,
 } from '../lib/session-orchestrator';
@@ -105,7 +111,10 @@ import {
 } from '../lib/session-log';
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
-import { sendAndStreamWithToolDispatch } from '../lib/session';
+import {
+  retrieveSessionUsageSnapshot,
+  sendAndStreamWithToolDispatch,
+} from '../lib/session';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
@@ -318,6 +327,25 @@ export async function handleChatEvent(
           `attach_memory=${slashOutcome.attachMemory} (agent path)`,
       );
     }
+  }
+
+  const threadSessionKey = chatThreadSessionKey(senderEmail, spaceName, threadName);
+  const pendingCostApproval = await handlePendingSessionApproval(
+    {
+      kv: env.MAKOTO_KV,
+      config: resolveSessionCostGuardConfig(env),
+    },
+    { threadSessionKey, text: bodyText },
+  );
+  if (pendingCostApproval.kind === 'reply') {
+    await safePost(env, spaceName, pendingCostApproval.text, threadName, eventKey);
+    await safeCommit(env, eventKey, claim);
+    console.log(
+      `[chat-event] cost_guard_session_approval handled eventKey=${eventKey} ` +
+        `decision=${pendingCostApproval.closeSession ? 'no' : 'yes_or_pending'} ` +
+        `thread_key=${threadSessionKey ? 'present' : 'none'}`,
+    );
+    return { kind: 'committed' };
   }
 
   // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
@@ -544,6 +572,7 @@ export async function handleChatEvent(
   const sessionIdRef: { current: string } = { current: '' };
   let sessionId: string;
   let assistantText: string;
+  let sessionCostPrompt = '';
   try {
     try {
       const orchestrated = await orchestrateChatTurn({
@@ -660,6 +689,30 @@ export async function handleChatEvent(
           assistantText = recoveryResult.text;
         }
       }
+
+      const usageSnapshot = await retrieveSessionUsageSnapshot(client, sessionId);
+      if (usageSnapshot) {
+        const costPrompt = await evaluateSessionCostAfterTurn(
+          {
+            kv: env.MAKOTO_KV,
+            config: resolveSessionCostGuardConfig(env),
+          },
+          {
+            threadSessionKey,
+            sessionId,
+            snapshot: usageSnapshot,
+          },
+        );
+        if (costPrompt) {
+          sessionCostPrompt = costPrompt.promptText;
+          console.log(
+            `[chat-event] cost_guard_session_prompt eventKey=${eventKey} ` +
+              `session=${sessionId} threshold=${costPrompt.thresholdUsd} ` +
+              `current=${costPrompt.sessionUsd.toFixed(4)} ` +
+              `next=${costPrompt.nextThresholdUsd}`,
+          );
+        }
+      }
     } catch (err) {
       // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
       // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
@@ -774,9 +827,12 @@ export async function handleChatEvent(
   // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
-  const finalText = attachmentNotice
+  let finalText = attachmentNotice
     ? `${scrubbed.text}\n\n${attachmentNotice}`.trim()
     : scrubbed.text;
+  if (sessionCostPrompt) {
+    finalText = `${finalText}\n\n${sessionCostPrompt}`.trim();
+  }
   if (finalText.trim().length > 0) {
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は

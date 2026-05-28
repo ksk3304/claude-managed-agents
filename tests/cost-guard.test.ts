@@ -18,6 +18,9 @@ import {
   readCounter,
   checkBudget,
   wrapChatSender,
+  evaluateSessionCostAfterTurn,
+  handlePendingSessionApproval,
+  usdFromUsage,
   DEFAULT_LIMITS,
   _internals,
   type CostGuardDeps,
@@ -382,5 +385,143 @@ describe('wrapChatSender', () => {
     // operator への警告は届いている
     expect(sender.calls.filter((c) => c.space === 'spaces/OPS')).toHaveLength(1);
     expect(putCallCount).toBeGreaterThan(0);
+  });
+});
+
+describe('per-session staged approval', () => {
+  const sessionConfig = {
+    thresholdsUsd: [8, 12, 16],
+    stepUsd: 4,
+    usdToJpy: 155,
+    fallbackModel: 'claude-opus-4-7',
+  };
+
+  it('calculates usage USD including cache tokens', () => {
+    const usd = usdFromUsage(
+      {
+        input_tokens: 1_000_000,
+        output_tokens: 100_000,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 10_000,
+          ephemeral_1h_input_tokens: 20_000,
+        },
+        cache_read_input_tokens: 30_000,
+      },
+      'claude-sonnet-4-6',
+      sessionConfig,
+    );
+    expect(usd).toBeCloseTo(4.6665, 6);
+  });
+
+  it('asks at $8 then allows yes until the $12 stage', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    const snapshot = {
+      model: 'claude-opus-4-7',
+      usage: { input_tokens: 1_600_000, output_tokens: 0 },
+    };
+
+    const first = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot,
+    });
+    expect(first?.thresholdUsd).toBe(8);
+    expect(first?.promptText).toContain('この session の対話を続けますか？');
+    expect(first?.promptText).toContain('$12 到達時');
+
+    const yes = await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'はい',
+    });
+    expect(yes.kind).toBe('reply');
+    if (yes.kind === 'reply') {
+      expect(yes.closeSession).toBe(false);
+      expect(yes.text).toContain('$12');
+    }
+
+    const stillUnderNextStage = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_000_000, output_tokens: 0 },
+      },
+    });
+    expect(stillUnderNextStage).toBeNull();
+
+    const next = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_400_000, output_tokens: 0 },
+      },
+    });
+    expect(next?.thresholdUsd).toBe(12);
+    expect(next?.promptText).toContain('$16 到達時');
+  });
+
+  it('does not make one yes unlimited; jumps approve the highest crossed stage only', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = { kv, config: sessionConfig };
+
+    const prompt = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_jump',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_600_000, output_tokens: 0 },
+      },
+    });
+    expect(prompt?.thresholdUsd).toBe(12);
+    expect(prompt?.nextThresholdUsd).toBe(16);
+
+    await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'はい、続けて',
+    });
+
+    const next = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_jump',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 3_200_000, output_tokens: 0 },
+      },
+    });
+    expect(next?.thresholdUsd).toBe(16);
+    expect(next?.nextThresholdUsd).toBe(20);
+  });
+
+  it('いいえ clears the thread session binding so another turn starts fresh', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_old');
+    const deps = { kv, config: sessionConfig };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_old',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_600_000, output_tokens: 0 },
+      },
+    });
+
+    const no = await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'いいえ',
+    });
+    expect(no.kind).toBe('reply');
+    if (no.kind === 'reply') {
+      expect(no.closeSession).toBe(true);
+    }
+    expect(await kv.get(threadSessionKey)).toBeNull();
   });
 });

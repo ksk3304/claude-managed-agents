@@ -81,6 +81,47 @@ export async function createSessionWithResources(
   return created.id;
 }
 
+export interface ManagedSessionUsageSnapshot {
+  usage: Record<string, unknown> | null;
+  model?: string | null;
+}
+
+export async function retrieveSessionUsageSnapshot(
+  client: Anthropic,
+  sessionId: string,
+): Promise<ManagedSessionUsageSnapshot | null> {
+  try {
+    const sessions = client.beta.sessions as unknown as {
+      retrieve: (
+        id: string,
+        params?: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>;
+    };
+    if (typeof sessions.retrieve !== 'function') return null;
+    const session = await sessions.retrieve(sessionId, {
+      betas: [ANTHROPIC_BETA],
+    });
+    const usage =
+      session.usage && typeof session.usage === 'object'
+        ? (session.usage as Record<string, unknown>)
+        : null;
+    const model =
+      typeof session.model === 'string'
+        ? session.model
+        : typeof (session.agent as Record<string, unknown> | undefined)?.model === 'string'
+          ? ((session.agent as Record<string, unknown>).model as string)
+          : null;
+    return { usage, model };
+  } catch (err) {
+    console.warn(
+      `[session] sessions.retrieve usage failed sessionId=${sessionId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
+}
+
 /**
  * User message content block — the SDK accepts an array of typed blocks
  * (`text` / `image` / `document` / etc) on `user.message`. The bridge

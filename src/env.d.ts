@@ -94,6 +94,10 @@ declare namespace Cloudflare {
      * (`memory-attach.ts:resolveSenderToResources` comment).
      */
     DEFAULT_USER_SLUG?: string;
+    COST_GUARD_SESSION_THRESHOLDS_USD?: string;
+    COST_GUARD_SESSION_STEP_USD?: string;
+    COST_GUARD_USD_TO_JPY?: string;
+    COST_GUARD_SESSION_PRICING_MODEL?: string;
 
     /**
      * KV namespace for the MAKOTO bridge: sender→user_slug→agent_id
