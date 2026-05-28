@@ -424,6 +424,10 @@ describe('handleChatEvent', () => {
       // 最終 reply は PATCH 経由で placeholder を書き換える。
       expect(chatApiMock.patches).toHaveLength(1);
       expect(chatApiMock.patches[0]!.text).toContain('了解しました');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
+      expect(chatApiMock.patches[0]!.text).toContain('宛先: alice@example.com');
+      expect(chatApiMock.patches[0]!.text).toContain('件名: Re');
+      expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
       expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
       // sent_messages 行
       const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
@@ -432,6 +436,81 @@ describe('handleChatEvent', () => {
       expect(
         (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
       ).toBe('chat_user_requested');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1b: AgentMail API failure → status-aware failure is shown', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送ります。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"返信本文"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response('unauthorized', { status: 401 }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('❌ メール送信失敗');
+      expect(chatApiMock.patches[0]!.text).toContain('理由: AgentMail 認証エラー (401)');
+      const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
+        ._tables.sent_messages;
+      expect(sent.size).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1c: EMAIL_SEND preview text renders escaped newlines as real newlines', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '以下の内容で送ります。\n\n宛先: alice@example.com\n件名: Re\n本文: 1行目\\n2行目\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"1行目\\n2行目"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response(JSON.stringify({ message_id: 'msg_preview' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('本文: 1行目\n2行目');
+      expect(chatApiMock.patches[0]!.text).not.toContain('1行目\\n2行目');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -748,6 +827,33 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
+  });
+
+  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: '前のメッセージですでに `EMAIL_SEND` マーカーを出しています。bot 側で処理中です。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe(
+      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+    );
+    expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
+    expect(chatApiMock.patches[0]!.text).not.toContain('bot');
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
