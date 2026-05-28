@@ -60,6 +60,7 @@ const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
+const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
  * `_session_key_for_thread` (Python l.494-512) と byte 等価な KV key を
@@ -144,6 +145,8 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
+  /** Session watchdog override (test / incident-debug 用)。 */
+  sessionWatchdogSec?: number;
   /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
@@ -220,6 +223,26 @@ export class OrchestratorFailure extends Error {
     this.reason = reason;
     this.cause = cause;
   }
+}
+
+export function resolveReactiveSessionWatchdogSec(
+  raw: string | undefined,
+): number | undefined {
+  const value = (raw ?? '').trim();
+  if (value === '') return undefined;
+  const parsed = Number(value);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < 0 ||
+    parsed > DEFAULT_SESSION_WATCHDOG_SEC
+  ) {
+    console.warn(
+      `[chat-event] invalid CMA_REACTIVE_SESSION_WATCHDOG_SEC=${JSON.stringify(value)} ` +
+        `fallback=${DEFAULT_SESSION_WATCHDOG_SEC}`,
+    );
+    return undefined;
+  }
+  return parsed;
 }
 
 /**
@@ -447,12 +470,16 @@ export async function orchestrateChatTurn(
 
   // ---- stream consume ----
   let streamResult: SendAndStreamResult;
+  const sessionWatchdogSec =
+    input.sessionWatchdogSec ??
+    resolveReactiveSessionWatchdogSec(input.env.CMA_REACTIVE_SESSION_WATCHDOG_SEC);
   try {
     streamResult = await sendAndStreamWithToolDispatch(client, {
       sessionId,
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+      sessionWatchdogSec,
       payloadAudit: {
         kv,
         enabled: input.env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
@@ -480,6 +507,8 @@ export async function orchestrateChatTurn(
           assistant_chars: streamResult.assistantText.length,
           terminal_event_type: streamResult.terminalEventType ?? null,
           stop_reason: streamResult.stopReason ?? null,
+          session_watchdog_sec:
+            sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
         },
       });
     }

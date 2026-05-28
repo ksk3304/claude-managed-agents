@@ -84,6 +84,8 @@ declare namespace Cloudflare {
 
     /** Incident/debug-only payload audit switch. Normal operation leaves this unset/off. */
     CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Reactive Chat session watchdog override in seconds. Unset = 600. */
+    CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
     /** Secret-gated debug endpoint token. Unset means debug endpoints return 404. */
     MAKOTO_DEBUG_TOKEN?: string;
 

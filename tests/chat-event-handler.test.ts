@@ -1387,6 +1387,38 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
+  it('passes CMA_REACTIVE_SESSION_WATCHDOG_SEC through to the stream layer', async () => {
+    const env = buildEnv({
+      envOverrides: { CMA_REACTIVE_SESSION_WATCHDOG_SEC: '1' } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_watchdog_cfg',
+      events: [
+        { type: 'agent.message.text', text: '通常応答です。' },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    const streamEvent = runtimeEvents.find(
+      (row) => row.event_type === 'cma_events_send_completed',
+    );
+    expect(streamEvent).toBeDefined();
+    expect(JSON.parse(String(streamEvent!.detail_json))).toMatchObject({
+      stop_reason: 'end_turn',
+      session_watchdog_sec: 1,
+    });
+  });
+
   // -------------------------------------------------------------------------
   // #186 既知 #3 配線: cap-recovery wire up (= chat-event-handler.ts の
   // orchestrator return 後の cap 超過判定 + runCapRecovery 起動)。

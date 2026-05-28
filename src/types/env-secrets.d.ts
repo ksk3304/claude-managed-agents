@@ -158,6 +158,13 @@ declare namespace Cloudflare {
      */
     CMA_REACTIVE_CAP_RECOVERY_ENABLED?: string;
     /**
+     * Reactive Chat session watchdog override in seconds. Unset = 600
+     * (Cloud Run parity). Incident tests may set a small value so
+     * session_watchdog can be exercised without waiting 10 minutes.
+     * Invalid / out-of-range values fail closed to default.
+     */
+    CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
+    /**
      * Explicit opt-in for short-lived `user.message` payload audit in
      * Cloudflare KV. Default off. Enable only while observing an incident.
      */
