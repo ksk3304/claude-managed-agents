@@ -133,12 +133,12 @@ describe('dailyReportPrompt', () => {
 // ============================================================================
 
 describe('defaultDateLabel', () => {
-  it('returns the previous JST day', () => {
+  it('returns the previous JST day before the JST day has ended', () => {
     // 2026-05-26 14:00 UTC = 2026-05-26 23:00 JST → 前日 = 2026-05-25.
     const tick = new Date('2026-05-26T14:00:00.000Z');
     expect(defaultDateLabel(tick)).toBe('2026-05-25');
   });
-  it('handles JST day boundary', () => {
+  it('matches the Cloudflare daily-report cron at 00:30 JST', () => {
     // 2026-05-26 15:30 UTC = 2026-05-27 00:30 JST → 前日 = 2026-05-26.
     const tick = new Date('2026-05-26T15:30:00.000Z');
     expect(defaultDateLabel(tick)).toBe('2026-05-26');

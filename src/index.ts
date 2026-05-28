@@ -105,14 +105,14 @@ export default {
   // Cron dispatcher — wrangler.jsonc `triggers.crons` 経由で複数 schedule を
   // 受ける. `controller.cron` で経路を分岐する:
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
-  //   - `0 14 * * *` (14:00 UTC = 23:00 JST) → daily-report (前日 JST の
+  //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
   async scheduled(
     controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    if (controller.cron === "0 14 * * *") {
+    if (controller.cron === "30 15 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
       return;
     }
@@ -192,7 +192,7 @@ export default {
 // ----------------------------------------------------------------------------
 
 /**
- * `0 14 * * *` (= 23:00 JST) tick で起動する daily-report バッチ.
+ * `30 15 * * *` (= 00:30 JST) tick で起動する daily-report バッチ.
  * `src/scheduled/daily-report.ts:generateDailyReports` に処理を委譲する.
  * Anthropic client の組み立て / env override 解決 / 起動ログだけここで行う.
  */
