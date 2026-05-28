@@ -384,6 +384,7 @@ export async function sendAndStreamWithToolDispatch(
   >();
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
+  let currentTurnStarted = false;
 
   /**
    * Fire `user.interrupt` so the agent stops generating. Mirrors the
@@ -428,6 +429,15 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       const evType = typeof ev.type === 'string' ? ev.type : '';
+      if (
+        evType === 'session.status_running' ||
+        evType === 'session.thread_status_running' ||
+        evType === 'user.message' ||
+        evType === 'span.model_request_start' ||
+        evType.startsWith('agent.')
+      ) {
+        currentTurnStarted = true;
+      }
 
       // 1. text-bearing events — accumulate into assistantText.
       // Anthropic Managed Agents の実 event shape (Python `cma_lib.py:2730-2734`
@@ -506,6 +516,13 @@ export async function sendAndStreamWithToolDispatch(
       // 3. terminal events.
       if (evType === 'session.status_idle') {
         terminalEventType = evType;
+        if (!currentTurnStarted && assistantText.length === 0 && pendingCustomToolUses.size === 0) {
+          // A new stream can replay the previous turn's idle boundary just
+          // before the run triggered by our freshly-sent user.message starts.
+          // Ignore that stale boundary; otherwise cap recovery can return
+          // empty even though the recovery turn later produces text.
+          continue;
+        }
         // Python `_stop_reason_type(event)` reads `event.stop_reason.type`.
         // The SDK exposes it on the event as either a nested object
         // ({type:'end_turn'}) or a bare string depending on shape.

@@ -182,6 +182,34 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.stopReason).toBe('end_turn');
   });
 
+  it('ignores a stale idle boundary before the newly-sent turn starts', async () => {
+    const client = makeFakeClient({
+      events: [
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+        { type: 'session.status_running' },
+        { type: 'session.thread_status_running' },
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: 'recovery prompt' }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'recovered text' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_recovery',
+      userMessage: 'recover',
+      toolDispatcher: dispatcher,
+    });
+    expect(r.assistantText).toBe('recovered text');
+    expect(r.terminalEventType).toBe('session.status_idle');
+    expect(r.stopReason).toBe('end_turn');
+  });
+
   it('stops on session.status_terminated', async () => {
     const client = makeFakeClient({
       events: [{ type: 'agent.message.text_delta', text: 'partial' }, { type: 'session.status_terminated' }],

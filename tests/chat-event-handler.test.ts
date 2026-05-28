@@ -1427,6 +1427,8 @@ describe('handleChatEvent', () => {
       // 2 回目 stream = recovery turn の応答。完成本文を text として返す。
       followupEventBatches: [
         [
+          { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+          { type: 'session.status_running' },
           {
             type: 'agent.message',
             content: [
