@@ -105,6 +105,8 @@ declare namespace Cloudflare {
      * (`memory-attach.ts:resolveSenderToResources` comment).
      */
     DEFAULT_USER_SLUG?: string;
+    /** Operator Google Chat space for Cost Guard warning notifications. */
+    COST_GUARD_OPERATOR_SPACE?: string;
     COST_GUARD_SESSION_THRESHOLDS_USD?: string;
     COST_GUARD_SESSION_STEP_USD?: string;
     COST_GUARD_USD_TO_JPY?: string;

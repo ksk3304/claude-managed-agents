@@ -14,7 +14,8 @@
  *      再利用 (= 重複 regex を避ける)。
  *
  *   2. **status 応答** — 非 admin でも閲覧可。Worker 側 `cost-guard.ts` の
- *      `checkBudget` (= 月 USD + 日 Chat 件数) を読んで現在値 / 上限 / 超過
+ *      `checkBudget` (= 月 Anthropic 呼び数 / 月 USD / 日 Chat 件数 / 日外部
+ *      API 件数) を読んで現在値 / 上限 / 超過
  *      軸 / 設定源を 1 つの Chat 投稿用テキストに整形する。Python
  *      `_status_text` (`command.py:l.104-134`) と等価 (= `axes` / `cache_age`
  *      列挙)。
@@ -86,7 +87,7 @@ function isAdmin(
 
 /**
  * Python `notify.build_costguard_status_message` の Worker 縮約版。
- * `BudgetStatus` (= 月 USD + 日件数 2 軸) のみを整形する。
+ * `BudgetStatus` (= Cloudflare D1/KV counters) を整形する。
  */
 function buildStatusText(
   status: BudgetStatus,
@@ -95,13 +96,19 @@ function buildStatusText(
   const exceededLabel =
     status.exceeded.length === 0 ? 'なし' : status.exceeded.join(', ');
   const lines: string[] = [];
-  lines.push('Cost Guard 状態 (KV 経路、Phase 2)');
+  lines.push('Cost Guard 状態 (D1/KV 経路、Phase 4)');
   lines.push(`- 操作者: ${opts.actor}${opts.admin ? ' (admin)' : ' (read-only)'}`);
+  lines.push(
+    `- Anthropic API 呼び数 (月次): ${status.current.anthropicMonthlyCalls} / ${status.limit.anthropicMonthlyCalls}`,
+  );
   lines.push(
     `- Anthropic 月累計 USD: ${status.current.anthropicMonthlyUsd} / ${status.limit.anthropicMonthlyUsd}`,
   );
   lines.push(
     `- Chat 日次件数: ${status.current.chatDailyCount} / ${status.limit.chatDailyCount}`,
+  );
+  lines.push(
+    `- 外部 API 呼び数 (日次): ${status.current.externalApiDailyCount} / ${status.limit.externalApiDailyCount}`,
   );
   lines.push(`- 超過軸: ${exceededLabel}`);
   lines.push(`- operator 通知 space: ${opts.operatorSpaceConfigured ? '設定済' : '未設定 (警告は no-op)'}`);

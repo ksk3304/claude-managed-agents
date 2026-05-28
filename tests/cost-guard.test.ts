@@ -29,8 +29,13 @@ import {
 } from '../src/lib/cost-guard';
 import { makeKv } from './makoto-helpers';
 
-const { KIND_ANTHROPIC_CALL, KIND_ANTHROPIC_COST_USD, KIND_CHAT_POST, PREFIX } =
-  _internals;
+const {
+  KIND_ANTHROPIC_CALL,
+  KIND_ANTHROPIC_COST_USD,
+  KIND_CHAT_POST,
+  KIND_EXTERNAL_API_CALL,
+  PREFIX,
+} = _internals;
 
 function fixedNow(iso: string): () => Date {
   return () => new Date(iso);
@@ -41,6 +46,54 @@ function makeDeps(overrides: Partial<CostGuardDeps> = {}): CostGuardDeps {
     kv: makeKv(),
     now: fixedNow('2026-05-15T12:00:00Z'),
     ...overrides,
+  };
+}
+
+function makeCostGuardDb(): D1Database & {
+  _rows: Map<string, { kind: string; bucket: string; value: number }>;
+} {
+  const rows = new Map<string, { kind: string; bucket: string; value: number }>();
+  const keyFor = (kind: string, bucket: string) => `${kind}:${bucket}`;
+  return {
+    _rows: rows,
+    prepare(sql: string) {
+      let params: unknown[] = [];
+      const stmt = {
+        bind(...bound: unknown[]) {
+          params = bound;
+          return stmt;
+        },
+        async first<T>() {
+          if (/^SELECT value FROM cost_guard_counters/i.test(sql.trim())) {
+            const [kind, bucket] = params as [string, string];
+            const row = rows.get(keyFor(kind, bucket));
+            return (row ? { value: row.value } : null) as T | null;
+          }
+          if (/^INSERT INTO cost_guard_counters/i.test(sql.trim())) {
+            const [kind, bucket, by] = params as [string, string, number];
+            const key = keyFor(kind, bucket);
+            const prev = rows.get(key);
+            const value = (prev?.value ?? 0) + by;
+            rows.set(key, { kind, bucket, value });
+            return { value } as T;
+          }
+          throw new Error(`unexpected SQL: ${sql}`);
+        },
+        async run() {
+          return { success: true, meta: {}, results: [] };
+        },
+        async all<T>() {
+          return { success: true, meta: {}, results: [] as T[] };
+        },
+        raw: async () => [],
+      };
+      return stmt;
+    },
+    batch: async () => [],
+    exec: async () => ({ count: 0, duration: 0 }),
+    dump: async () => new ArrayBuffer(0),
+  } as unknown as D1Database & {
+    _rows: Map<string, { kind: string; bucket: string; value: number }>;
   };
 }
 
@@ -61,6 +114,16 @@ describe('incrementCounter — basic increment and key shape', () => {
     const raw = await deps.kv.get(`${PREFIX}:chat_post:2026-05-15`);
     expect(raw).not.toBeNull();
     expect(JSON.parse(raw!)).toEqual({ v: 1 });
+  });
+
+  it('uses D1 counters first when DB is provided', async () => {
+    const db = makeCostGuardDb();
+    const deps = makeDeps({ db });
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 2);
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 3);
+    expect(await readCounter(deps, KIND_EXTERNAL_API_CALL)).toBe(5);
+    expect(db._rows.get('external_api_call:2026-05-15')?.value).toBe(5);
+    expect(await deps.kv.get(`${PREFIX}:external_api_call:2026-05-15`)).toBeNull();
   });
 
   it('sums repeated increments into the same bucket', async () => {
@@ -162,8 +225,10 @@ describe('checkBudget', () => {
     const deps = makeDeps();
     const status = await checkBudget(deps);
     expect(status.current).toEqual({
+      anthropicMonthlyCalls: 0,
       anthropicMonthlyUsd: 0,
       chatDailyCount: 0,
+      externalApiDailyCount: 0,
     });
     expect(status.exceeded).toEqual([]);
     expect(status.limit).toEqual(DEFAULT_LIMITS);
@@ -176,6 +241,14 @@ describe('checkBudget', () => {
     expect(status.current.anthropicMonthlyUsd).toBeCloseTo(1.5, 6);
     expect(status.exceeded).toContain('anthropicMonthlyUsd');
     expect(status.exceeded).not.toContain('chatDailyCount');
+  });
+
+  it('flags anthropicMonthlyCalls as exceeded when current >= limit', async () => {
+    const deps = makeDeps({ limits: { anthropicMonthlyCalls: 2 } });
+    await incrementCounter(deps, KIND_ANTHROPIC_CALL, 2);
+    const status = await checkBudget(deps);
+    expect(status.current.anthropicMonthlyCalls).toBe(2);
+    expect(status.exceeded).toContain('anthropicMonthlyCalls');
   });
 
   it('flags chatDailyCount as exceeded at the boundary (>= limit)', async () => {
@@ -205,6 +278,14 @@ describe('checkBudget', () => {
       'anthropicMonthlyUsd',
       'chatDailyCount',
     ]);
+  });
+
+  it('flags externalApiDailyCount as exceeded when current >= limit', async () => {
+    const deps = makeDeps({ limits: { externalApiDailyCount: 1 } });
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 1);
+    const status = await checkBudget(deps);
+    expect(status.current.externalApiDailyCount).toBe(1);
+    expect(status.exceeded).toContain('externalApiDailyCount');
   });
 });
 

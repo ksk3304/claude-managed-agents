@@ -328,7 +328,11 @@ export async function handleChatEvent(
       cgCommand,
       {
         senderEmail,
-        guardDeps: { kv: env.MAKOTO_KV },
+        guardDeps: {
+          db: env.DB,
+          kv: env.MAKOTO_KV,
+          operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+        },
       },
     );
     await safePost(env, spaceName, cgText, threadName, eventKey);

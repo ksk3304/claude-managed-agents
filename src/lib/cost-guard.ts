@@ -1,15 +1,16 @@
 /**
- * KV-backed cost guard for the MAKOTOくん bridge.
+ * Cloudflare-backed cost guard for the MAKOTOくん bridge.
  *
  * Cloud Run の `scripts/cost_guard/` (Firestore txn + 3 軸 thresholds +
  * /costguard 運用者コマンド) を、Cloudflare Worker 向けに簡素化した KV
- * カウンタ実装。Worker は cold-start が頻繁で Firestore txn の重みを
- * 持たせにくいため、本層は以下に絞る:
+ * カウンタ実装。D1 を authoritative counter store にし、D1 が使えない
+ * 場合だけ KV に fail-open fallback する。本層は以下に絞る:
  *
  *   1. **カウンタ管理** (KV increment)
- *      - `cost_guard:anthropic_call:<YYYY-MM>` : Anthropic API 呼び数 (月)
- *      - `cost_guard:anthropic_cost_usd:<YYYY-MM>` : Anthropic 月累計 USD
- *      - `cost_guard:chat_post:<YYYY-MM-DD>` : Chat 投稿数 (日)
+ *      - `anthropic_call:<YYYY-MM>` : Anthropic API 呼び数 (月)
+ *      - `anthropic_cost_usd:<YYYY-MM>` : Anthropic 月累計 USD
+ *      - `chat_post:<YYYY-MM-DD>` : Chat 投稿数 (日)
+ *      - `external_api_call:<YYYY-MM-DD>` : 外部 API 呼び数 (日)
  *
  *   2. **予算判定** (`checkBudget`) — current vs limit を返すだけの純関数。
  *      caller 側で gating する。
@@ -19,11 +20,9 @@
  *      と同じ思想、`_configure_cost_guard_chat_sender` 等価)。
  *
  * 設計判断:
- *   - **KV 専用**: D1 / Durable Object に依存しない。同一日/月の 2 つの
- *     reactive 経路が同時に increment しても KV の eventual consistency
- *     範囲で吸収する (= Worker 同一 isolate 内 = 単一書込み、cross-isolate
- *     は数秒遅延あり)。budget は **保守側に倒す ≒ 多少多めに数えても OK**
- *     な性質なので KV で十分。
+ *   - **D1 優先 + KV fallback**: D1 `cost_guard_counters` があれば
+ *     `INSERT ... ON CONFLICT DO UPDATE` で atomic increment。migration 未適用 /
+ *     D1 障害時は既存 KV key に fallback し、Chat 経路の可用性を優先する。
  *   - **外部 fetch しない**: Chat 投稿は wrap 対象の `chatSender` 経由のみ。
  *     egress-guard import 不要 (= caller が既に egress 通過している)。
  *   - **TTL 自動掃除**: 月カウンタは 35 日、日カウンタは 35 日で expire
@@ -61,10 +60,17 @@ const KIND_ANTHROPIC_COST_USD = 'anthropic_cost_usd';
  */
 const KIND_CHAT_POST = 'chat_post';
 
+/**
+ * Per-day 外部 API 呼び数。現時点では foundation counter で、各 tool / egress
+ * 経路から段階的に `incrementCounter(..., 'external_api_call', 1)` を足す。
+ */
+const KIND_EXTERNAL_API_CALL = 'external_api_call';
+
 export type CostKind =
   | typeof KIND_ANTHROPIC_CALL
   | typeof KIND_ANTHROPIC_COST_USD
-  | typeof KIND_CHAT_POST;
+  | typeof KIND_CHAT_POST
+  | typeof KIND_EXTERNAL_API_CALL;
 
 /** Cloudflare KV `expirationTtl` (seconds). 35 日 = 月跨ぎカウンタの自動掃除に十分。 */
 const COUNTER_TTL_SEC = 35 * 24 * 60 * 60;
@@ -75,18 +81,26 @@ const COUNTER_TTL_SEC = 35 * 24 * 60 * 60;
  * KV 層では USD ベース月予算 + 投稿頻度上限の 2 軸に絞る。
  */
 export interface CostLimits {
+  /** Anthropic 月 API 呼び数の上限。 */
+  anthropicMonthlyCalls: number;
   /** Anthropic 月累計 USD の上限。超えると wrap した chatSender が no-op。 */
   anthropicMonthlyUsd: number;
   /** Chat 投稿の日次上限 (= ループ抑制の安全弁)。 */
   chatDailyCount: number;
+  /** 外部 API 呼び数の日次上限。 */
+  externalApiDailyCount: number;
 }
 
 export const DEFAULT_LIMITS: CostLimits = {
+  anthropicMonthlyCalls: 10_000,
   anthropicMonthlyUsd: 300,
   chatDailyCount: 200,
+  externalApiDailyCount: 1_000,
 };
 
 export interface CostGuardDeps {
+  /** D1 database. If present, counters are read/written here first. */
+  db?: D1Database;
   /** KV namespace (= Worker binding `COST_GUARD_KV` 等を caller が渡す)。 */
   kv: KVNamespace;
   /**
@@ -157,13 +171,20 @@ export type PendingSessionApprovalResult =
 export interface BudgetStatus {
   /** kind ごとの現在値 (= KV から読んだ生数)。 */
   current: {
+    anthropicMonthlyCalls: number;
     anthropicMonthlyUsd: number;
     chatDailyCount: number;
+    externalApiDailyCount: number;
   };
   /** 解決済み limit。 */
   limit: CostLimits;
   /** 超過軸の名前 (なければ空配列)。 */
-  exceeded: Array<'anthropicMonthlyUsd' | 'chatDailyCount'>;
+  exceeded: Array<
+    | 'anthropicMonthlyCalls'
+    | 'anthropicMonthlyUsd'
+    | 'chatDailyCount'
+    | 'externalApiDailyCount'
+  >;
 }
 
 /**
@@ -198,7 +219,15 @@ export async function incrementCounter(
   if (by === 0) {
     return await readCounter(deps, kind);
   }
-  const key = buildKey(kind, currentBucket(deps, kind));
+  const bucket = currentBucket(deps, kind);
+  if (deps.db) {
+    try {
+      return await incrementD1Counter(deps.db, kind, bucket, by, now(deps).getTime());
+    } catch {
+      // D1 unavailable or migration missing: fall back to KV.
+    }
+  }
+  const key = buildKey(kind, bucket);
   try {
     const prev = await readCounterRaw(deps.kv, key);
     const next = prev + by;
@@ -219,12 +248,58 @@ export async function readCounter(
   deps: CostGuardDeps,
   kind: CostKind,
 ): Promise<number> {
-  const key = buildKey(kind, currentBucket(deps, kind));
+  const bucket = currentBucket(deps, kind);
+  if (deps.db) {
+    try {
+      return await readD1Counter(deps.db, kind, bucket);
+    } catch {
+      // D1 unavailable or migration missing: fall back to KV.
+    }
+  }
+  const key = buildKey(kind, bucket);
   try {
     return await readCounterRaw(deps.kv, key);
   } catch {
     return 0;
   }
+}
+
+async function incrementD1Counter(
+  db: D1Database,
+  kind: CostKind,
+  bucket: string,
+  by: number,
+  nowMs: number,
+): Promise<number> {
+  const expireAtMs = nowMs + COUNTER_TTL_SEC * 1000;
+  const row = await db
+    .prepare(
+      `INSERT INTO cost_guard_counters
+        (kind, bucket, value, updated_at_ms, expire_at_ms)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(kind, bucket) DO UPDATE SET
+        value = value + excluded.value,
+        updated_at_ms = excluded.updated_at_ms,
+        expire_at_ms = excluded.expire_at_ms
+       RETURNING value`,
+    )
+    .bind(kind, bucket, by, nowMs, expireAtMs)
+    .first<{ value: number }>();
+  const value = row?.value;
+  return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN;
+}
+
+async function readD1Counter(
+  db: D1Database,
+  kind: CostKind,
+  bucket: string,
+): Promise<number> {
+  const row = await db
+    .prepare(`SELECT value FROM cost_guard_counters WHERE kind = ? AND bucket = ?`)
+    .bind(kind, bucket)
+    .first<{ value: number }>();
+  const value = row?.value;
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 async function readCounterRaw(kv: KVNamespace, key: string): Promise<number> {
@@ -252,20 +327,30 @@ async function readCounterRaw(kv: KVNamespace, key: string): Promise<number> {
  */
 export async function checkBudget(deps: CostGuardDeps): Promise<BudgetStatus> {
   const limit = resolveLimits(deps.limits);
-  const [costUsd, chatCount] = await Promise.all([
+  const [anthropicCalls, costUsd, chatCount, externalApiCount] = await Promise.all([
+    readCounter(deps, KIND_ANTHROPIC_CALL),
     readCounter(deps, KIND_ANTHROPIC_COST_USD),
     readCounter(deps, KIND_CHAT_POST),
+    readCounter(deps, KIND_EXTERNAL_API_CALL),
   ]);
   const current = {
+    anthropicMonthlyCalls: anthropicCalls,
     anthropicMonthlyUsd: costUsd,
     chatDailyCount: chatCount,
+    externalApiDailyCount: externalApiCount,
   };
   const exceeded: BudgetStatus['exceeded'] = [];
+  if (current.anthropicMonthlyCalls >= limit.anthropicMonthlyCalls) {
+    exceeded.push('anthropicMonthlyCalls');
+  }
   if (current.anthropicMonthlyUsd >= limit.anthropicMonthlyUsd) {
     exceeded.push('anthropicMonthlyUsd');
   }
   if (current.chatDailyCount >= limit.chatDailyCount) {
     exceeded.push('chatDailyCount');
+  }
+  if (current.externalApiDailyCount >= limit.externalApiDailyCount) {
+    exceeded.push('externalApiDailyCount');
   }
   return { current, limit, exceeded };
 }
@@ -669,10 +754,20 @@ function buildWarningText(status: BudgetStatus): string {
         `- Anthropic 月累計: $${status.current.anthropicMonthlyUsd.toFixed(4)} ` +
           `(上限 $${status.limit.anthropicMonthlyUsd.toFixed(2)})`,
       );
+    } else if (axis === 'anthropicMonthlyCalls') {
+      lines.push(
+        `- Anthropic API 呼び数 (月次): ${status.current.anthropicMonthlyCalls} 件 ` +
+          `(上限 ${status.limit.anthropicMonthlyCalls} 件)`,
+      );
     } else if (axis === 'chatDailyCount') {
       lines.push(
         `- Chat 投稿 (日次): ${status.current.chatDailyCount} 件 ` +
           `(上限 ${status.limit.chatDailyCount} 件)`,
+      );
+    } else if (axis === 'externalApiDailyCount') {
+      lines.push(
+        `- 外部 API 呼び数 (日次): ${status.current.externalApiDailyCount} 件 ` +
+          `(上限 ${status.limit.externalApiDailyCount} 件)`,
       );
     }
   }
@@ -686,9 +781,13 @@ function buildWarningText(status: BudgetStatus): string {
 
 function resolveLimits(override: Partial<CostLimits> | undefined): CostLimits {
   return {
+    anthropicMonthlyCalls:
+      override?.anthropicMonthlyCalls ?? DEFAULT_LIMITS.anthropicMonthlyCalls,
     anthropicMonthlyUsd:
       override?.anthropicMonthlyUsd ?? DEFAULT_LIMITS.anthropicMonthlyUsd,
     chatDailyCount: override?.chatDailyCount ?? DEFAULT_LIMITS.chatDailyCount,
+    externalApiDailyCount:
+      override?.externalApiDailyCount ?? DEFAULT_LIMITS.externalApiDailyCount,
   };
 }
 
@@ -721,7 +820,7 @@ function now(deps: CostGuardDeps): Date {
  */
 function currentBucket(deps: CostGuardDeps, kind: CostKind): string {
   const d = now(deps);
-  if (kind === KIND_CHAT_POST) return ymd(d);
+  if (kind === KIND_CHAT_POST || kind === KIND_EXTERNAL_API_CALL) return ymd(d);
   return ym(d);
 }
 
@@ -1007,6 +1106,7 @@ export const _internals = {
   KIND_ANTHROPIC_CALL,
   KIND_ANTHROPIC_COST_USD,
   KIND_CHAT_POST,
+  KIND_EXTERNAL_API_CALL,
   PREFIX,
   COUNTER_TTL_SEC,
 };
