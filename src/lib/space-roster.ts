@@ -18,7 +18,8 @@
  *     truncate。
  *   - `_build_space_roster_block:3321` — roster から「在籍者一覧」内部メモ
  *     ブロックを構築。DM は skip、取得失敗も skip (fail-closed §D)、空 roster
- *     も skip、50 名超は件数のみ提示し、それ以下は名前を並べる。
+ *     も skip、50 名超は件数のみ提示し、それ以下は displayName + user_id
+ *     対応表を並べる。
  *   - `_build_space_context_block:3667` — space.name / type / alias / thread
  *     を「この space は何で誰宛か」を agent に伝える内部メモブロックに整形。
  *     alias は `chat_gchat_aliases.json` 台帳の逆引きで解決 (`reverseResolveChatAlias`
