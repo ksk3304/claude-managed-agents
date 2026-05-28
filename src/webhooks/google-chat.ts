@@ -48,6 +48,10 @@ import {
   type ClaimResult,
 } from '../lib/dedupe';
 import { assertBridgeEgressAllowed } from '../lib/egress-guard';
+import {
+  recordChatWebhookPayload,
+  recordRuntimeEvent,
+} from '../lib/observability';
 
 // ============================================================================
 // 型定義
@@ -500,6 +504,20 @@ export async function handleGoogleChatWebhook(
 
   // ---- 6. dedupe claim ----
   const eventKey = `chat:msgname:${event.message.name}`;
+  await recordChatWebhookPayload(env, eventKey, event);
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId: event.message.name,
+    eventType: 'chat_webhook_received',
+    source: 'google-chat-webhook',
+    detail: {
+      type: event.type,
+      space_type: event.space?.type ?? null,
+      text_chars: event.message.text?.length ?? 0,
+      attachment_count: event.message.attachment?.length ?? 0,
+      annotation_count: event.message.annotations?.length ?? 0,
+    },
+  });
   const owner = newClaimOwner(cfRay);
   let claim: ClaimResult;
   try {
@@ -536,6 +554,13 @@ export async function handleGoogleChatWebhook(
   };
   try {
     await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: event.message.name,
+      eventType: 'chat_queue_enqueued',
+      source: 'google-chat-webhook',
+      detail: { claim_state: claim.state, claim_version: claim.version },
+    });
   } catch (err) {
     // Queue 投入失敗 → claim は release して successor が retake できる
     // ようにする。Google Chat 側 retry に任せる。
@@ -549,6 +574,14 @@ export async function handleGoogleChatWebhook(
     console.error(
       `[chat-webhook] queue-send failed cfRay=${cfRay} eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
     );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: event.message.name,
+      eventType: 'chat_queue_enqueue_failed',
+      level: 'error',
+      source: 'google-chat-webhook',
+      detail: { error: err instanceof Error ? err.message : String(err) },
+    });
     return Response.json({ error: 'queue send failed' }, { status: 500 });
   }
 

@@ -82,6 +82,17 @@ declare namespace Cloudflare {
      */
     WORKER_INSTANCE_ID?: string;
 
+    /** Incident/debug-only payload audit switch. Normal operation leaves this unset/off. */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Reactive Chat session watchdog override in seconds. Unset = 600. */
+    CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
+    /** Anthropic custom Skill id for outbound mail composition. */
+    MAIL_SEND_SKILL_ID?: string;
+    /** Optional pinned version for MAIL_SEND_SKILL_ID. */
+    MAIL_SEND_SKILL_VERSION?: string;
+    /** Secret-gated debug endpoint token. Unset means debug endpoints return 404. */
+    MAKOTO_DEBUG_TOKEN?: string;
+
     /**
      * Optional default user_slug for the Chat reactive path. When set,
      * `chat-event-handler.ts` step 5 falls back to

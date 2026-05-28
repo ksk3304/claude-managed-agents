@@ -126,22 +126,15 @@ declare namespace Cloudflare {
      * される (= deploy 漏れで accidentally メール送信が止まる方を選ぶ)。
      *
      * Provisioned via `wrangler secret put AGENTMAIL_DEFAULT_INBOX_ID`.
-     */
+    */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
     /**
-     * Anthropic custom Skill for outbound email composition. When present, the
-     * Google Chat `/mail` / natural-language mail intent path uses a managed
-     * agent with this skill attached, so the behavior is visible in Claude
-     * Console instead of living only in prompt hints.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_ID`.
+     * Anthropic custom Skill for outbound email composition. Deprecated for
+     * session routing: existing employee agents must already carry required
+     * skills, and #208 no longer creates mail-specific agents/environments.
      */
     MAIL_SEND_SKILL_ID?: string;
-    /**
-     * Optional pinned version for `MAIL_SEND_SKILL_ID`. Omit to use latest.
-     *
-     * Provisioned via `wrangler secret put MAIL_SEND_SKILL_VERSION`.
-     */
+    /** Optional pinned version for MAIL_SEND_SKILL_ID. */
     MAIL_SEND_SKILL_VERSION?: string;
     /**
      * GCP project ID hosting Cloud Scheduler jobs (Issue #186
@@ -180,5 +173,21 @@ declare namespace Cloudflare {
      * scheduled 経路の recovery には影響しない (reactive 専用)。
      */
     CMA_REACTIVE_CAP_RECOVERY_ENABLED?: string;
+    /**
+     * Reactive Chat session watchdog override in seconds. Unset = 600
+     * (Cloud Run parity). Incident tests may set a small value so
+     * session_watchdog can be exercised without waiting 10 minutes.
+     * Invalid / out-of-range values fail closed to default.
+     */
+    CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
+    /**
+     * Explicit opt-in for short-lived `user.message` payload audit in
+     * Cloudflare KV. Default off. Enable only while observing an incident.
+     */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Optional TTL in days for Cloudflare payload audit KV rows. */
+    CMA_AUDIT_TTL_DAYS?: string;
+    /** Optional max chars per string in Cloudflare payload audit records. */
+    CMA_AUDIT_MAX_TEXT_CHARS?: string;
   }
 }

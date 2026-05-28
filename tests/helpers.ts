@@ -67,13 +67,14 @@ export function makeDb(): D1Database & { _tables: FakeTables } {
 
     // recordSentMessage — INSERT OR REPLACE
     if (/^INSERT OR REPLACE INTO sent_messages/i.test(trimmed)) {
-      const [message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid] = params as [
+      const [message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid, auto_reply_policy] = params as [
         string,
         string,
         string,
         string,
         number,
         string | null,
+        string,
       ];
       tables.sent_messages.set(message_id, {
         message_id,
@@ -82,6 +83,7 @@ export function makeDb(): D1Database & { _tables: FakeTables } {
         to_addr,
         sent_at_ms,
         rfc822_msgid: rfc822_msgid ?? null,
+        auto_reply_policy,
       });
       return { results: [], meta: { changes: 1 } };
     }

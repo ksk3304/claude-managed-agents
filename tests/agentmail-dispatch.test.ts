@@ -220,6 +220,9 @@ describe('agentmailDispatch', () => {
       // sent_messages should have the outbound row.
       const sent = (ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('agentmail_auto_reply');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -393,6 +396,90 @@ describe('agentmailDispatch', () => {
         ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } }
       )._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('agentmail_auto_reply');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('SignalB thread self-scan: no Re/header match but thread has bot mail → continuation path', async () => {
+    chatApiMock.posts.length = 0;
+    const sendCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      env: {
+        MAKOTO_NOTIFY_SPACE: 'spaces/ABCNotify',
+        CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
+      },
+      message: {
+        ...INBOUND_MSG,
+        subject: 'こんにちは',
+        thread_id: 'thr_signal_b',
+      },
+      event: {
+        id: 'evt_1',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          subject: 'こんにちは',
+          thread_id: 'thr_signal_b',
+          inbox_id: 'makoto@agentmail.to',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    const replyBody = 'SignalB 継続返信です。';
+    installFakeAnthropic({
+      sessionId: 'sesn_signal_b',
+      sendCapture,
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            `了解しました。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re: こんにちは","body":"${replyBody}"}`,
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: Array<{ url: string; method?: string; body?: unknown }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, method: init.method, body: init.body });
+      if (url.includes('/threads/thr_signal_b')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              { from: 'alice@example.com', extracted_text: '最初の問い合わせ' },
+              { from: 'MAKOTO <makoto@agentmail.to>', extracted_text: '前回返信' },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ message_id: 'msg_signal_b_out', rfc822_message_id: '<out-signal-b@example.com>' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+
+      expect(amCalls.some((c) => c.url.includes('/threads/thr_signal_b'))).toBe(true);
+      expect(amCalls.some((c) => c.url.includes('/messages/msg_inbound/reply'))).toBe(true);
+      expect(chatApiMock.posts).toHaveLength(1);
+      expect(chatApiMock.posts[0]!.text).toContain('📤 continuation 自動返信を送信しました');
+
+      expect(JSON.stringify(sendCapture)).toContain('前回返信');
     } finally {
       globalThis.fetch = origFetch;
     }

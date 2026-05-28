@@ -30,7 +30,16 @@ import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
-import { makeFetchMock, makeKv, makeMakotoDb } from './makoto-helpers';
+import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
+import {
+  makeFakeThreadLockNamespace,
+  makeFetchMock,
+  makeKv,
+  makeMakotoDb,
+  TEST_VAULT_KEY_B64,
+} from './makoto-helpers';
+import { getThreadLock } from '../src/durable-objects/thread-lock';
+import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -268,6 +277,7 @@ function buildEnv(opts: BuildEnvOpts = {}): Env {
     AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_main',
     CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
     MAKOTO_BOT_DISPLAY_NAME: 'MAKOTOくん',
+    MAKOTO_THREAD_LOCK: makeFakeThreadLockNamespace(),
     ...opts.envOverrides,
   } as unknown as Env;
 }
@@ -285,6 +295,7 @@ function buildQueueMsg(overrides: {
     length?: number;
     userMention?: { user?: { name?: string; type?: string } };
   }>;
+  attachment?: ChatQueueMessage['payload']['message']['attachment'];
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
@@ -308,6 +319,7 @@ function buildQueueMsg(overrides: {
           ? { thread: { name: overrides.threadName } }
           : {}),
         ...(overrides.annotations ? { annotations: overrides.annotations } : {}),
+        ...(overrides.attachment ? { attachment: overrides.attachment } : {}),
       },
       space: {
         name: spaceName,
@@ -357,6 +369,7 @@ async function putMapping(env: Env, email: string, opts: { withSessionLog?: bool
 }
 
 beforeEach(() => {
+  _resetChatOAuthCacheForTests();
   chatApiMock.posts.length = 0;
   chatApiMock.patches.length = 0;
   chatApiMock.deletes.length = 0;
@@ -412,11 +425,168 @@ describe('handleChatEvent', () => {
       // 最終 reply は PATCH 経由で placeholder を書き換える。
       expect(chatApiMock.patches).toHaveLength(1);
       expect(chatApiMock.patches[0]!.text).toContain('了解しました');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
+      expect(chatApiMock.patches[0]!.text).toContain('宛先: alice@example.com');
+      expect(chatApiMock.patches[0]!.text).toContain('件名: Re');
+      expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
       expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
       // sent_messages 行
       const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
         ._tables.sent_messages;
       expect(sent.size).toBe(1);
+      expect(
+        (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
+      ).toBe('chat_user_requested');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1b: AgentMail API failure → status-aware failure is shown', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送ります。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"返信本文"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response('unauthorized', { status: 401 }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('❌ メール送信失敗');
+      expect(chatApiMock.patches[0]!.text).toContain('理由: AgentMail 認証エラー (401)');
+      const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
+        ._tables.sent_messages;
+      expect(sent.size).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1c: EMAIL_SEND preview text renders escaped newlines as real newlines', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '以下の内容で送ります。\n\n宛先: alice@example.com\n件名: Re\n本文: 1行目\\n2行目\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"1行目\\n2行目"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response(JSON.stringify({ message_id: 'msg_preview' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('本文: 1行目\n2行目');
+      expect(chatApiMock.patches[0]!.text).not.toContain('1行目\\n2行目');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1b: AgentMail API failure → status-aware failure is shown', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送ります。\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"返信本文"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response('unauthorized', { status: 401 }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('❌ メール送信失敗');
+      expect(chatApiMock.patches[0]!.text).toContain('理由: AgentMail 認証エラー (401)');
+      const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
+        ._tables.sent_messages;
+      expect(sent.size).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1c: EMAIL_SEND preview text renders escaped newlines as real newlines', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_1c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '以下の内容で送ります。\n\n宛先: alice@example.com\n件名: Re\n本文: 1行目\\n2行目\nEMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"1行目\\n2行目"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response(JSON.stringify({ message_id: 'msg_preview' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('本文: 1行目\n2行目');
+      expect(chatApiMock.patches[0]!.text).not.toContain('1行目\\n2行目');
+      expect(chatApiMock.patches[0]!.text).toContain('✅ メール送信完了');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -463,6 +633,88 @@ describe('handleChatEvent', () => {
     );
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
+  });
+
+  it('Case 2b: shared thread history uses User OAuth token instead of service account', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCHAT_OAUTH_REFRESH_TOKEN_SEED: 'seed-refresh-token',
+        GCHAT_OAUTH_CLIENT_ID: 'chat-client-id.apps.googleusercontent.com',
+        GCHAT_OAUTH_CLIENT_SECRET: 'chat-client-secret',
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      },
+    });
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM2',
+      text: '@MAKOTOくん 続きお願い',
+      threadName: 'spaces/ROOM2/threads/T2',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_2b',
+      events: [
+        { type: 'agent.message.text', text: '履歴を踏まえた回答です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const calls: Array<{ url: string; auth?: string; body?: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      calls.push({
+        url,
+        auth: (init.headers as Record<string, string> | undefined)?.Authorization,
+        body: typeof init.body === 'string' ? init.body : undefined,
+      });
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({
+            access_token: 'user-oauth-access-token',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/spaces/ROOM2/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                name: 'spaces/ROOM2/messages/M0',
+                text: '前の発言',
+                sender: { name: 'users/456', type: 'HUMAN' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      const tokenCall = calls.find((c) => c.url === 'https://oauth2.googleapis.com/token');
+      expect(tokenCall?.body).toContain('grant_type=refresh_token');
+      const historyCall = calls.find((c) =>
+        c.url.startsWith('https://chat.googleapis.com/v1/spaces/ROOM2/messages'),
+      );
+      expect(historyCall?.auth).toBe('Bearer user-oauth-access-token');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('Case 3: shared space + bot mention なし → skip + commit', async () => {
@@ -653,6 +905,33 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
   });
 
+  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: '前のメッセージですでに `EMAIL_SEND` マーカーを出しています。bot 側で処理中です。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe(
+      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+    );
+    expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
+    expect(chatApiMock.patches[0]!.text).not.toContain('bot');
+  });
+
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
@@ -671,7 +950,7 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this thread.
+    // pre-populate KV with existing session for this sender + space + thread.
     const sessionKey =
       'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
     await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
@@ -692,6 +971,128 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(created).toHaveLength(0); // sessions.create skipped
     expect(sends).toEqual(['sesn_existing']);
+  });
+
+  it('Case 10b: broad scope KV hit は無視し、新しい Chat thread は新規 session', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10',
+      text: '@MAKOTOくん 続きの質問',
+      threadName: 'spaces/ROOM10/threads/T11',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const scopeKey = 'chat_scope_session:agent_001:space:spaces/ROOM10';
+    await env.MAKOTO_KV.put(scopeKey, 'sesn_old_scope');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_new_thread',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '続きへの応答です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_new_thread']);
+    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_old_scope');
+    expect(
+      await env.MAKOTO_KV.get(
+        'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+      ),
+    ).toBe('sesn_new_thread');
+  });
+
+  it('attachment turn follows Chat thread session and ignores broad DM scope session', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        CHAT_SA_KEY_JSON: undefined,
+      } as Partial<Env>,
+    });
+    const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
+    const threadKey =
+      'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TATT';
+    await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
+    await env.MAKOTO_KV.put(threadKey, 'sesn_thread_existing');
+    const msg = buildQueueMsg({
+      threadName: 'spaces/AAA/threads/TATT',
+      attachment: [
+        {
+          contentName: 'issue198-small-pdf-test.pdf',
+          contentType: 'application/pdf',
+          attachmentDataRef: { resourceName: 'spaces/AAA/messages/M1/attachments/A1' },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_attachment_new',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '添付を読みました。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(0);
+    expect(sends).toEqual(['sesn_thread_existing']);
+    expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_existing');
+    expect(await env.MAKOTO_KV.get(threadKey)).toBe('sesn_thread_existing');
+  });
+
+  it('same Chat thread lock held → releases claim and retries without posting placeholder', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ threadName: 'spaces/AAA/threads/TLOCK' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const scopeKey =
+      'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TLOCK';
+    const lock = getThreadLock(env, scopeKey);
+    const held = await lock.acquire(scopeKey, 60_000);
+    expect(held.acquired).toBe(true);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_be_used',
+      events: [{ type: 'agent.message.text', text: 'should not run' }],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('chat_scope_lock_held');
+    }
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(0);
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const row = dedupe.get(msg.eventKey);
+    expect(row?.claim_state).toBe('NEW');
+    expect(Number(row?.lease_expires_at_ms)).toBe(0);
   });
 
   it('Case 11: confirmOwner 失敗 (successor TAKEOVER) → skip', async () => {
@@ -1061,6 +1462,38 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
+  it('passes CMA_REACTIVE_SESSION_WATCHDOG_SEC through to the stream layer', async () => {
+    const env = buildEnv({
+      envOverrides: { CMA_REACTIVE_SESSION_WATCHDOG_SEC: '1' } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_watchdog_cfg',
+      events: [
+        { type: 'agent.message.text', text: '通常応答です。' },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    const streamEvent = runtimeEvents.find(
+      (row) => row.event_type === 'cma_events_send_completed',
+    );
+    expect(streamEvent).toBeDefined();
+    expect(JSON.parse(String(streamEvent!.detail_json))).toMatchObject({
+      stop_reason: 'end_turn',
+      session_watchdog_sec: 1,
+    });
+  });
+
   // -------------------------------------------------------------------------
   // #186 既知 #3 配線: cap-recovery wire up (= chat-event-handler.ts の
   // orchestrator return 後の cap 超過判定 + runCapRecovery 起動)。
@@ -1102,6 +1535,12 @@ describe('handleChatEvent', () => {
       // 2 回目 stream = recovery turn の応答。完成本文を text として返す。
       followupEventBatches: [
         [
+          { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+          { type: 'session.status_running' },
+          {
+            type: 'user.message',
+            content: [{ type: 'text', text: RECOVERY_PROMPT }],
+          },
           {
             type: 'agent.message',
             content: [
@@ -1122,6 +1561,15 @@ describe('handleChatEvent', () => {
     );
     // 元の部分テキスト「途中まで作りました…」は置換されているため含まれない。
     expect(chatApiMock.patches[0]!.text).not.toContain('途中まで作りました');
+    const runtimeEvents = (env.DB as unknown as { _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> } })
+      ._tables.cma_worker_runtime_events;
+    const capEvent = runtimeEvents.find((row) => row.event_type === 'cap_recovery_result');
+    expect(capEvent).toBeDefined();
+    expect(JSON.parse(String(capEvent!.detail_json))).toMatchObject({
+      outcome: 'recovered',
+      original_stop_reason: 'tool_call_cap',
+      recovery_text_chars: 18,
+    });
   });
 
   it('cap-recovery: env CMA_REACTIVE_CAP_RECOVERY_ENABLED=0 で cap 超過 → recovery 起動せず部分テキストのまま', async () => {

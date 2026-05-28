@@ -241,10 +241,12 @@ describe('google-chat webhook handler', () => {
     globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
     const env = envWith();
     const jwt = await signJwt(fixture);
-    // Flip the last character of the signature segment.
+    // Flip the first character of the signature segment. The final base64url
+    // character can contain padding bits, so changing it may not change the
+    // decoded signature bytes for every random fixture.
     const parts = jwt.split('.');
     parts[2] =
-      parts[2]!.slice(0, -1) + (parts[2]!.endsWith('A') ? 'B' : 'A');
+      (parts[2]!.startsWith('A') ? 'B' : 'A') + parts[2]!.slice(1);
     const tampered = parts.join('.');
     const body = JSON.stringify(makeMessageEvent('spaces/A/messages/M1'));
     const resp = await handleGoogleChatWebhook(

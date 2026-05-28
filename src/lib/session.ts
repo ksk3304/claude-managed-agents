@@ -23,6 +23,10 @@ import { ANTHROPIC_BETA, resolveAnthropicApiKey } from '../anthropic';
 import type { MemoryStoreResourceParam } from '../types/memory';
 import type { EmailSendMarker } from '../types/agentmail';
 import { parseEmailSendMarkers } from './email-send-marker';
+import {
+  saveUserMessagePayloadAudit,
+  type PayloadAuditConfig,
+} from './payload-audit';
 
 /**
  * Build an Anthropic SDK client. Mirrors `email-handler.ts:emailClient`
@@ -143,6 +147,8 @@ export interface SendAndStreamInput {
   userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
 }
 
 export interface SendAndStreamResult {
@@ -202,13 +208,15 @@ export async function sendAndStream(
   // document) rather than a raw string; we wrap into a single text
   // block here. Verified against
   // @anthropic-ai/sdk BetaManagedAgentsTextBlock shape.
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
@@ -273,6 +281,17 @@ function pickString(ev: Record<string, unknown>, key: string): string | undefine
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+function userMessageContentText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const text = pickString(block as Record<string, unknown>, 'text');
+    if (text) parts.push(text);
+  }
+  return parts.join('');
+}
+
 // ============================================================================
 // sendAndStreamWithToolDispatch — agent.custom_tool_use event loop
 // ============================================================================
@@ -312,6 +331,8 @@ export interface SendAndStreamWithToolDispatchInput {
    */
   userMessage: string | UserMessageContentBlock[];
   toolDispatcher: ToolDispatcher;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
   /**
@@ -346,6 +367,13 @@ export interface SendAndStreamWithToolDispatchInput {
    * returns partial results instead of throwing.
    */
   sessionWatchdogSec?: number;
+  /**
+   * Ignore replayed historical session events until the stream echoes the
+   * exact user.message we just sent. Use for follow-up turns such as cap
+   * recovery where Managed Agents can replay the previous turn before the
+   * newly-sent prompt starts.
+   */
+  startAfterUserMessageEcho?: boolean;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;
@@ -388,13 +416,15 @@ export async function sendAndStreamWithToolDispatch(
   // `sendAndStream`: wrap a string into a single text block, otherwise
   // pass the typed content array straight through (= image / document
   // attachments are pre-built by the caller, see attachment-processing.ts).
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
@@ -413,6 +443,11 @@ export async function sendAndStreamWithToolDispatch(
   >();
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
+  let currentTurnStarted = false;
+  let seenUserMessageEcho = input.startAfterUserMessageEcho !== true;
+  const sentUserMessageText = input.startAfterUserMessageEcho
+    ? userMessageContentText(userMessageEvents[0]!.content)
+    : '';
 
   /**
    * Fire `user.interrupt` so the agent stops generating. Mirrors the
@@ -457,6 +492,25 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       const evType = typeof ev.type === 'string' ? ev.type : '';
+      if (!seenUserMessageEcho) {
+        if (
+          evType === 'user.message' &&
+          userMessageContentText((ev as { content?: unknown }).content) === sentUserMessageText
+        ) {
+          seenUserMessageEcho = true;
+          currentTurnStarted = true;
+        }
+        continue;
+      }
+      if (
+        evType === 'session.status_running' ||
+        evType === 'session.thread_status_running' ||
+        evType === 'user.message' ||
+        evType === 'span.model_request_start' ||
+        evType.startsWith('agent.')
+      ) {
+        currentTurnStarted = true;
+      }
 
       // 1. text-bearing events — accumulate into assistantText.
       // Anthropic Managed Agents の実 event shape (Python `cma_lib.py:2730-2734`
@@ -535,6 +589,13 @@ export async function sendAndStreamWithToolDispatch(
       // 3. terminal events.
       if (evType === 'session.status_idle') {
         terminalEventType = evType;
+        if (!currentTurnStarted && assistantText.length === 0 && pendingCustomToolUses.size === 0) {
+          // A new stream can replay the previous turn's idle boundary just
+          // before the run triggered by our freshly-sent user.message starts.
+          // Ignore that stale boundary; otherwise cap recovery can return
+          // empty even though the recovery turn later produces text.
+          continue;
+        }
         // Python `_stop_reason_type(event)` reads `event.stop_reason.type`.
         // The SDK exposes it on the event as either a nested object
         // ({type:'end_turn'}) or a bare string depending on shape.

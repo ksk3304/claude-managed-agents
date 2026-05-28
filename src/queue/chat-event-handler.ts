@@ -45,7 +45,6 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { buildMailSendSkills } from '../lib/attached-skills';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
@@ -66,7 +65,9 @@ import {
   clearHistoryFailure,
   handleHistoryFetchPermanentFailure,
   isHistoryPermanentlyFailed,
+  type ChatHistoryDeps,
 } from '../lib/chat-history';
+import { getChatReadonlyAccessToken } from '../lib/chat-oauth';
 import {
   fetchSpaceMemberRoster,
   buildSpaceContextBlock,
@@ -85,6 +86,7 @@ import {
   resolveSessionCostGuardConfig,
 } from '../lib/cost-guard';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
+import { getThreadLock } from '../durable-objects/thread-lock';
 import {
   resolveCapRecoveryConfig,
   runCapRecovery,
@@ -125,6 +127,7 @@ import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
+import { recordRuntimeEvent, stableHash } from '../lib/observability';
 
 /**
  * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
@@ -137,6 +140,7 @@ import type { EmailSendMarker } from '../types/agentmail';
  * 失敗時に `deleteChatMessage` で残骸 cleanup する (#186 UX 致命傷)。
  */
 const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
+const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -188,6 +192,13 @@ export async function handleChatEvent(
   void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
 
   const { eventKey, claim, payload } = body;
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId: payload.message?.name ?? null,
+    eventType: 'chat_queue_consumer_started',
+    source: 'chat-event-handler',
+    detail: { claim_owner: claim.owner, claim_version: claim.version },
+  });
 
   // ---- 1. claim 維持確認 ----
   const stillOwner = await confirmOwner(env.DB, eventKey, claim.owner, claim.version);
@@ -330,23 +341,46 @@ export async function handleChatEvent(
   }
 
   const threadSessionKey = chatThreadSessionKey(senderEmail, spaceName, threadName);
-  const pendingCostApproval = await handlePendingSessionApproval(
-    {
-      kv: env.MAKOTO_KV,
-      config: resolveSessionCostGuardConfig(env),
-    },
-    { threadSessionKey, text: bodyText },
+  const chatScopeKey = threadSessionKey ?? `chat_event_scope:${eventKey}`;
+  const chatScopeLock = getThreadLock(env, chatScopeKey);
+  const chatScopeLockResult = await chatScopeLock.acquire(
+    chatScopeKey,
+    CHAT_SCOPE_LOCK_TTL_MS,
   );
-  if (pendingCostApproval.kind === 'reply') {
-    await safePost(env, spaceName, pendingCostApproval.text, threadName, eventKey);
-    await safeCommit(env, eventKey, claim);
-    console.log(
-      `[chat-event] cost_guard_session_approval handled eventKey=${eventKey} ` +
-        `decision=${pendingCostApproval.closeSession ? 'no' : 'yes_or_pending'} ` +
-        `thread_key=${threadSessionKey ? 'present' : 'none'}`,
-    );
-    return { kind: 'committed' };
+  if (!chatScopeLockResult.acquired) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'chat_scope_lock_held',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        scope_key_hash: stableHash(chatScopeKey),
+        retry_after_ms: chatScopeLockResult.retry_after_ms ?? null,
+      },
+    });
+    await safeRelease(env, eventKey, claim);
+    return { kind: 'release_and_retry', reason: 'chat_scope_lock_held' };
   }
+
+  try {
+    const pendingCostApproval = await handlePendingSessionApproval(
+      {
+        kv: env.MAKOTO_KV,
+        config: resolveSessionCostGuardConfig(env),
+      },
+      { threadSessionKey, text: bodyText },
+    );
+    if (pendingCostApproval.kind === 'reply') {
+      await safePost(env, spaceName, pendingCostApproval.text, threadName, eventKey);
+      await safeCommit(env, eventKey, claim);
+      console.log(
+        `[chat-event] cost_guard_session_approval handled eventKey=${eventKey} ` +
+          `decision=${pendingCostApproval.closeSession ? 'no' : 'yes_or_pending'} ` +
+          `thread_key=${threadSessionKey ? 'present' : 'none'}`,
+      );
+      return { kind: 'committed' };
+    }
 
   // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
   // shared space + thread reply、または DM の mail confirmation reply 時のみ
@@ -369,14 +403,15 @@ export async function handleChatEvent(
   let historyBlock = '';
   const shouldFetchHistory =
     threadName !== null &&
-    Boolean(env.CHAT_SA_KEY_JSON) &&
+    canFetchThreadHistory(env) &&
     (!isDm || isMailSendApprovalText(bodyText));
   if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
       try {
+        const historyDeps = await resolveThreadHistoryDeps(env);
         const history = await fetchThreadMessages(
-          { saKeyJson: env.CHAT_SA_KEY_JSON! },
+          historyDeps,
           spaceName,
           threadName,
         );
@@ -384,6 +419,18 @@ export async function handleChatEvent(
           currentMessageName: message.name ?? '',
         });
         historyBlock = historyResult.text;
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'chat_history_fetch',
+          source: 'chat-event-handler',
+          detail: {
+            ok: true,
+            thread_hash_present: Boolean(threadName),
+            history_chars: historyBlock.length,
+            unresolved_count: historyResult.unresolvedCount,
+          },
+        });
         if (historyResult.unresolvedCount > 0) {
           hasUnresolvedSpeakers = true;
           console.warn(
@@ -394,10 +441,28 @@ export async function handleChatEvent(
         }
         await clearHistoryFailure(env.MAKOTO_KV, threadName);
       } catch (err) {
-        const failure = await recordHistoryFailure(env.MAKOTO_KV, threadName);
-        console.warn(
-          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${err instanceof Error ? err.message : String(err)}`,
+        const reason = err instanceof Error ? err.message : String(err);
+        const failure = await recordHistoryFailure(
+          env.MAKOTO_KV,
+          threadName,
+          reason,
         );
+        console.warn(
+          `[chat-event] history fetch fail eventKey=${eventKey} thread=${threadName} count=${failure.count}: ${reason}`,
+        );
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          eventType: 'chat_history_fetch',
+          level: failure.permanent ? 'error' : 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            ok: false,
+            failure_count: failure.count,
+            permanent: failure.permanent,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
         if (failure.permanent) {
           await handleHistoryFetchPermanentFailure(
             env.MAKOTO_KV,
@@ -441,11 +506,34 @@ export async function handleChatEvent(
       if (contextBlock) {
         speakerContextBlock = contextBlock;
         if (rosterResult.kind === 'roster') {
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            eventType: 'space_roster_fetch',
+            source: 'chat-event-handler',
+            detail: {
+              ok: true,
+              member_count: rosterResult.members.size,
+              context_chars: contextBlock.length,
+            },
+          });
           console.log(
             `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
               `space=${spaceName} member_count=${rosterResult.members.size}`,
           );
         } else {
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            eventType: 'space_roster_fetch',
+            level: 'warn',
+            source: 'chat-event-handler',
+            detail: {
+              ok: false,
+              reason: rosterResult.reason,
+              context_chars: contextBlock.length,
+            },
+          });
           console.warn(
             `[chat-event] space_context injected without roster eventKey=${eventKey} ` +
               `space=${spaceName} roster_failure=${rosterResult.reason}`,
@@ -467,13 +555,22 @@ export async function handleChatEvent(
       console.warn(
         `[chat-event] space_context build fail eventKey=${eventKey} space=${spaceName}: ${err instanceof Error ? err.message : String(err)}`,
       );
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'space_roster_fetch',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { ok: false, error: err instanceof Error ? err.message : String(err) },
+      });
     }
   }
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
   // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
   // intent-detector に通して以下を決定:
-  //   - `isActionSkill=true` なら orchestrator に `forceFreshSession=true` を
-  //     渡し既存 thread session 継続を破棄 (Python l.4002-4013 等価)
+  //   - `/mail` 以外の `isActionSkill=true` は orchestrator に
+  //     `forceFreshSession=true` を渡し既存 thread session 継続を破棄
+  //     (mail skill は既存社員 agent / session に統合する)
   //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
   //   - intent 種別を user message envelope の <context> に prefix 注入
   //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
@@ -489,7 +586,8 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
-  const forceFreshSession = intent?.isActionSkill === true;
+  const forceFreshSession =
+    intent?.isActionSkill === true && intent.command !== '/mail';
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -498,12 +596,6 @@ export async function handleChatEvent(
     } else if (intent.source === 'schedule_intent') {
       console.log(
         `[chat-event] schedule intent detected eventKey=${eventKey} command=${intent.command}`,
-      );
-    }
-    if (forceFreshSession) {
-      console.log(
-        `[chat-event] continuation discarded for action skill eventKey=${eventKey} ` +
-          `command=${intent.command} source=${intent.source}`,
       );
     }
   }
@@ -549,14 +641,6 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
-  const attachedSkills =
-    intent?.command === '/mail' ? buildMailSendSkills(env) : [];
-  if (intent?.command === '/mail' && attachedSkills.length === 0) {
-    console.warn(
-      `[chat-event] mail intent without MAIL_SEND_SKILL_ID eventKey=${eventKey}`,
-    );
-  }
-
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -598,7 +682,6 @@ export async function handleChatEvent(
               },
             }
           : {}),
-        ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,
@@ -606,8 +689,10 @@ export async function handleChatEvent(
             boundMessageId: '',
             callerSessionId: sessionIdRef.current,
           }),
-        // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
-        // false) 起動時は KV thread session lookup/put を bypass。
+        eventKey,
+        messageId: message.name,
+        // Issue #208: mail skill は既存社員 agent / session へ統合するため
+        // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
       });
       sessionId = orchestrated.sessionId;
@@ -658,6 +743,20 @@ export async function handleChatEvent(
             userMessage: recoveryPrompt,
             toolDispatcher,
             maxToolCalls,
+            startAfterUserMessageEcho: true,
+            payloadAudit: {
+              kv: env.MAKOTO_KV,
+              enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+              ttlDays: env.CMA_AUDIT_TTL_DAYS,
+              maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+              mode: 'chat-cap-recovery',
+              context: {
+                event_key: eventKey,
+                space_name: spaceName,
+                thread_name: threadName ?? '',
+                sender_email: senderEmail,
+              },
+            },
           });
           return {
             text: res.assistantText,
@@ -681,6 +780,23 @@ export async function handleChatEvent(
             `rec_degraded=${degraded} ` +
             `rec_error=${recoveryResult.error || 'n/a'}`,
         );
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'cap_recovery_result',
+          level: recoveryResult.outcome === 'recovered' ? 'info' : 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            outcome: recoveryResult.outcome,
+            original_stop_reason: pythonStopReason,
+            recovery_stop_reason: recoveryResult.stopReason || null,
+            recovery_text_chars: recoveryResult.text.length,
+            recovery_tool_names: recoveryResult.toolNames,
+            degraded,
+            error: recoveryResult.error || null,
+          },
+        });
         if (recoveryResult.outcome === 'recovered' && recoveryResult.text) {
           // 収集済み部分テキストを recovered 本文で置換。
           // Python `collected[:] = [_rec["text"]]` + `_recovery_suppressed_cap_notice`
@@ -765,7 +881,7 @@ export async function handleChatEvent(
       `[chat-event] EMAIL_SEND parse failure eventKey=${eventKey} reason=${f.reason} raw=${f.raw.slice(0, 200)}`,
     );
   }
-  await dispatchEmailMarkers(
+  const emailDispatchSummaries = await dispatchEmailMarkers(
     env,
     eventKey,
     emailParsed.markers,
@@ -818,7 +934,21 @@ export async function handleChatEvent(
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
-  const scrubbed = scrubInternalStateForChat(scheduleResult.cleanedText, `chat:${sessionId}`);
+  const displayText = normalizeEmailPreviewEscapedNewlines(
+    scheduleResult.cleanedText,
+    emailParsed.markers.length,
+  );
+  const markerLeakScrubbed = scrubActionMarkerLeakForChat(
+    displayText,
+    emailParsed.markers.length,
+  );
+  if (markerLeakScrubbed.scrubbed) {
+    console.warn(
+      `[chat-event] action-marker leak scrubbed eventKey=${eventKey} ` +
+        `reason=${markerLeakScrubbed.reason}`,
+    );
+  }
+  const scrubbed = scrubInternalStateForChat(markerLeakScrubbed.text, `chat:${sessionId}`);
   if (scrubbed.hits.length > 0) {
     console.warn(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
@@ -827,12 +957,10 @@ export async function handleChatEvent(
   // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
-  let finalText = attachmentNotice
-    ? `${scrubbed.text}\n\n${attachmentNotice}`.trim()
-    : scrubbed.text;
-  if (sessionCostPrompt) {
-    finalText = `${finalText}\n\n${sessionCostPrompt}`.trim();
-  }
+  const emailDispatchText = formatEmailDispatchSummaries(emailDispatchSummaries);
+  const finalTextParts = [scrubbed.text, emailDispatchText, attachmentNotice, sessionCostPrompt]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
+  const finalText = finalTextParts.join('\n\n').trim();
   if (finalText.trim().length > 0) {
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
@@ -860,17 +988,56 @@ export async function handleChatEvent(
       },
     });
     if (chatReplyOutcome.outcome === 'already') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        source: 'chat-event-handler',
+        detail: { outcome: 'already' },
+      });
       console.log(
         `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
       );
     } else if (chatReplyOutcome.outcome === 'lease_alive') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { outcome: 'lease_alive' },
+      });
       console.warn(
         `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
       );
     } else if (chatReplyOutcome.outcome === 'lease_lost') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { outcome: 'lease_lost' },
+      });
       console.warn(
         `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
       );
+    } else if (chatReplyOutcome.outcome === 'sent') {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        eventType: 'final_chat_reply_result',
+        source: 'chat-event-handler',
+        detail: {
+          outcome: 'sent',
+          mode: placeholderName ? 'patch_or_post_fallback' : 'post',
+          final_text_chars: finalText.length,
+        },
+      });
     }
   } else {
     console.log(
@@ -904,6 +1071,16 @@ export async function handleChatEvent(
   // ---- 9. commit ----
   await safeCommit(env, eventKey, claim);
   return { kind: 'committed' };
+  } finally {
+    try {
+      await chatScopeLock.release(chatScopeKey);
+    } catch (err) {
+      console.warn(
+        `[chat-event] chat scope lock release failed eventKey=${eventKey}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,21 +1100,32 @@ async function dispatchEmailMarkers(
   sessionId: string,
   agentId: string,
   claim: { owner: string; version: number },
-): Promise<void> {
-  if (markers.length === 0) return;
+): Promise<EmailDispatchSummary[]> {
+  if (markers.length === 0) return [];
+  const summaries: EmailDispatchSummary[] = [];
   const apiKey = env.AGENTMAIL_API_KEY;
   const inboxId = env.AGENTMAIL_DEFAULT_INBOX_ID;
   if (!apiKey) {
     console.warn(
       `[chat-event] EMAIL_SEND skipped eventKey=${eventKey}: AGENTMAIL_API_KEY missing (${markers.length} marker(s))`,
     );
-    return;
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: 'メール送信設定が不足しています',
+    }));
   }
   if (!inboxId) {
     console.warn(
       `[chat-event] EMAIL_SEND skipped eventKey=${eventKey}: AGENTMAIL_DEFAULT_INBOX_ID missing (${markers.length} marker(s))`,
     );
-    return;
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: 'メール送信設定が不足しています',
+    }));
   }
   const opts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
   const client = new AgentMailClient(apiKey, opts);
@@ -987,12 +1175,19 @@ async function dispatchEmailMarkers(
         console.log(
           `[chat-event] EMAIL_SEND already sent eventKey=${eventKey} to=${redactPiiInText(m.to)} — skipping duplicate`,
         );
+        summaries.push({ status: 'already', to: m.to, subject: m.subject });
         continue;
       }
       if (emOutcome.outcome === 'lease_alive') {
         console.warn(
           `[chat-event] EMAIL_SEND in-flight by another worker eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '別処理が送信中です',
+        });
         continue;
       }
       if (emOutcome.outcome === 'lease_lost') {
@@ -1000,12 +1195,24 @@ async function dispatchEmailMarkers(
         console.warn(
           `[chat-event] EMAIL_SEND lease lost eventKey=${eventKey} to=${redactPiiInText(m.to)}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '送信確認が完了できませんでした',
+        });
         continue;
       }
       if (emOutcome.outcome === 'precheck_failed') {
         console.warn(
           `[chat-event] EMAIL_SEND precheck failed eventKey=${eventKey} to=${redactPiiInText(m.to)} reason=${emOutcome.reason}`,
         );
+        summaries.push({
+          status: 'failed',
+          to: m.to,
+          subject: m.subject,
+          reason: '送信前確認に失敗しました',
+        });
         continue;
       }
       // outcome === 'sent'
@@ -1018,24 +1225,156 @@ async function dispatchEmailMarkers(
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'chat_user_requested',
         );
       }
       console.log(
         `[chat-event] EMAIL_SEND ok eventKey=${eventKey} to=${redactPiiInText(m.to)} subject_chars=${m.subject.length}`,
       );
+      summaries.push({ status: 'sent', to: m.to, subject: m.subject });
     } catch (err) {
       if (err instanceof AgentMailError) {
         console.warn(
           `[chat-event] EMAIL_SEND fail eventKey=${eventKey} to=${redactPiiInText(m.to)} status=${err.status} transient=${err.transient}: ${redactPiiInText(err.message)}`,
         );
+        await recordEmailDispatchFailure(env, {
+          eventKey,
+          sessionId,
+          to: m.to,
+          subject: m.subject,
+          status: err.status,
+          transient: err.transient,
+          message: err.message,
+          body: err.body,
+        });
       } else {
+        const message = err instanceof Error ? err.message : String(err);
         console.warn(
-          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${redactPiiInText(m.to)}: ${redactPiiInText(err instanceof Error ? err.message : String(err))}`,
+          `[chat-event] EMAIL_SEND threw eventKey=${eventKey} to=${redactPiiInText(m.to)}: ${redactPiiInText(message)}`,
         );
+        await recordEmailDispatchFailure(env, {
+          eventKey,
+          sessionId,
+          to: m.to,
+          subject: m.subject,
+          status: 0,
+          transient: true,
+          message,
+        });
       }
       // 1 marker 失敗で全体落とさない (failure isolation)。
+      summaries.push({
+        status: 'failed',
+        to: m.to,
+        subject: m.subject,
+        reason: formatEmailDispatchErrorReason(err),
+      });
     }
   }
+  return summaries;
+}
+
+interface EmailDispatchSummary {
+  status: 'sent' | 'already' | 'failed';
+  to: string;
+  subject: string;
+  reason?: string;
+}
+
+function formatEmailDispatchSummaries(summaries: EmailDispatchSummary[]): string {
+  if (summaries.length === 0) return '';
+  return summaries
+    .map((summary) => {
+      const header =
+        summary.status === 'sent'
+          ? '✅ メール送信完了'
+          : summary.status === 'already'
+            ? '✅ メール送信済み'
+            : '❌ メール送信失敗';
+      const lines = [
+        header,
+        `宛先: ${summary.to}`,
+        `件名: ${summary.subject}`,
+      ];
+      if (summary.status === 'failed' && summary.reason) {
+        lines.push(`理由: ${summary.reason}`);
+      }
+      return lines.join('\n');
+    })
+    .join('\n\n');
+}
+
+function scrubActionMarkerLeakForChat(
+  text: string,
+  parsedEmailMarkerCount: number,
+): { text: string; scrubbed: boolean; reason: string } {
+  if (parsedEmailMarkerCount > 0) {
+    return { text, scrubbed: false, reason: '' };
+  }
+  const normalized = text.toLowerCase();
+  const leaks =
+    normalized.includes('email_send') ||
+    text.includes('bot 側') ||
+    text.includes('bot側') ||
+    text.includes('マーカー');
+  if (!leaks) return { text, scrubbed: false, reason: '' };
+  return {
+    text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+    scrubbed: true,
+    reason: 'action_marker_terms',
+  };
+}
+
+function normalizeEmailPreviewEscapedNewlines(
+  text: string,
+  parsedEmailMarkerCount: number,
+): string {
+  if (parsedEmailMarkerCount === 0) return text;
+  return text.replace(/\\n/g, '\n');
+}
+
+function formatEmailDispatchErrorReason(err: unknown): string {
+  if (err instanceof AgentMailError) {
+    if (err.status === 0) return 'AgentMail API への接続に失敗しました';
+    if (err.status === 401 || err.status === 403) {
+      return `AgentMail 認証エラー (${err.status})`;
+    }
+    if (err.status === 404) return 'AgentMail inbox が見つかりません (404)';
+    if (err.status === 429) return 'AgentMail API のレート制限です (429)';
+    if (err.status >= 500) return `AgentMail API 側エラー (${err.status})`;
+    return `AgentMail API エラー (${err.status})`;
+  }
+  return 'メール送信処理で例外が発生しました';
+}
+
+async function recordEmailDispatchFailure(
+  env: Env,
+  input: {
+    eventKey: string;
+    sessionId: string;
+    to: string;
+    subject: string;
+    status: number;
+    transient: boolean;
+    message: string;
+    body?: string;
+  },
+): Promise<void> {
+  await recordRuntimeEvent(env, {
+    eventKey: input.eventKey,
+    sessionId: input.sessionId,
+    eventType: 'email_dispatch_failed',
+    level: 'warn',
+    source: 'chat-event-handler',
+    detail: {
+      to: redactPiiInText(input.to),
+      subject_chars: input.subject.length,
+      status: input.status,
+      transient: input.transient,
+      message: redactPiiInText(input.message),
+      body_preview: input.body ? redactPiiInText(input.body).slice(0, 1000) : undefined,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1855,58 @@ async function safeDeletePlaceholder(
   }
 }
 
+function canFetchThreadHistory(env: Env): boolean {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length > 0 && env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      `[chat-event] history user OAuth incomplete; service-account fallback available missing=${missing.join(',')}`,
+    );
+  }
+  return Boolean(
+    missing.length === 0 ||
+      env.CHAT_SA_KEY_JSON,
+  );
+}
+
+async function resolveThreadHistoryDeps(env: Env): Promise<ChatHistoryDeps> {
+  const missing = missingChatHistoryOAuthSecrets(env);
+  if (missing.length === 0) {
+    const vaultKeyB64 = env.OAUTH_VAULT_KEY!;
+    const clientId = env.GCHAT_OAUTH_CLIENT_ID!;
+    const clientSecret = env.GCHAT_OAUTH_CLIENT_SECRET!;
+    const refreshTokenSeed = env.GCHAT_OAUTH_REFRESH_TOKEN_SEED!;
+    const token = await getChatReadonlyAccessToken({
+      kv: env.MAKOTO_KV,
+      vaultKeyB64,
+      clientId,
+      clientSecret,
+      refreshTokenSeed,
+    });
+    console.log(
+      `[chat-event] history oauth token resolved source=${token.from_cache ? 'cache' : 'refresh'}`,
+    );
+    return { accessToken: token.access_token };
+  }
+
+  if (env.CHAT_SA_KEY_JSON) {
+    console.warn(
+      `[chat-event] history fetch using service-account fallback; user OAuth secrets incomplete missing=${missing.join(',')}`,
+    );
+    return { saKeyJson: env.CHAT_SA_KEY_JSON };
+  }
+
+  throw new Error('thread history fetch is not configured');
+}
+
+function missingChatHistoryOAuthSecrets(env: Env): string[] {
+  const missing: string[] = [];
+  if (!env.GCHAT_OAUTH_REFRESH_TOKEN_SEED) missing.push('GCHAT_OAUTH_REFRESH_TOKEN_SEED');
+  if (!env.GCHAT_OAUTH_CLIENT_ID) missing.push('GCHAT_OAUTH_CLIENT_ID');
+  if (!env.GCHAT_OAUTH_CLIENT_SECRET) missing.push('GCHAT_OAUTH_CLIENT_SECRET');
+  if (!env.OAUTH_VAULT_KEY) missing.push('OAUTH_VAULT_KEY');
+  return missing;
+}
+
 async function safeCommit(
   env: Env,
   eventKey: string,
@@ -1673,19 +2064,18 @@ function loadSlashSkillsData(env: Env): SkillsData {
 //                       永続層が必要、Issue #186 follow-up)。Phase 2 では
 //                       status のみ port 済 (= `cost-guard-command.ts`)。
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
-// Done (Issue #186 既知 #4): intent-detector 統合 (= forceFreshSession +
-//   bodyText intent prefix。完全な /mail /schedule skill dispatch 自体は
-//   `_resolve_skill_run` 全体 port の follow-up に温存)。
-// TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
+// Done (Issue #186 既知 #4): intent-detector 統合 (= bodyText intent prefix。
+//   Grill Me 正本に合わせ /mail でも同じ社員 agent / session を継続)。
+// Done (#198): Cold continuation の SignalB 経由 thread-self-scan.
 // ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で
 //    history fetch 結果に未登録 chat_user_id が居るとき CHAT_POST 全 marker
 //    を `applyChatPostGateToText` で strip。speaker-resolver.ts pure 関数群
 //    + speaker-gate.ts wire-up 経路。external tool gate は actor 駆動軸で
 //    別途 #186 follow-up)。
-// TODO(#186 follow-up): CHAT_POST alias resolver port (= cma_gchat_send.resolve_space)
-// TODO(#186 follow-up): user_mapping default fallback (= 既知ユーザ以外の処理)
-// TODO(#186 follow-up): annotation-based mention detection (= _is_for_bot 完全 port)
-// TODO(#186 follow-up): _strip_mention の annotations ベース完全実装
+// Done (#198/#186): CHAT_POST alias resolver port (= `chat-alias-resolver.ts`).
+// Done (#198/#186): user_mapping default fallback (= `readUserMappingWithDefault`).
+// Done (#198/#186): annotation-based mention detection (= `isMentioningBot`).
+// Done (#198/#186): _strip_mention annotations-based port (= `stripMentions`).
 // NOTE(#186): user_message envelope の cap-recovery / intent / speaker prefix
 //             は既知 #11 で `src/lib/user-message-envelope.ts` に実装済 (= 配線
 //             は本 file の `intentResult` / `historyBlock` 経由)。残る完全化

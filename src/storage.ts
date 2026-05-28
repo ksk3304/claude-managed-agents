@@ -22,6 +22,7 @@ export async function recordSentMessage(
   agentId: string,
   toAddr: string,
   rfc822MessageId?: string,
+  autoReplyPolicy: string = 'unknown',
 ): Promise<void> {
   // `rfc822_msgid` is optional so AgentMail bridge callers pass the
   // normalized RFC 822 Message-ID; inbound In-Reply-To / References
@@ -30,10 +31,10 @@ export async function recordSentMessage(
   await db
     .prepare(
       `INSERT OR REPLACE INTO sent_messages
-         (message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+         (message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid, auto_reply_policy)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
     )
-    .bind(messageId, sessionId, agentId, toAddr, Date.now(), rfc822)
+    .bind(messageId, sessionId, agentId, toAddr, Date.now(), rfc822, autoReplyPolicy)
     .run();
 }
 

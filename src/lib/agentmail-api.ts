@@ -108,16 +108,16 @@ export class AgentMailClient {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   /**
-   * `POST /inboxes/{inboxId}/messages` — fresh outbound message.
+   * `POST /inboxes/{inboxId}/messages/send` — fresh outbound message.
    * Returns the AgentMail message_id (opaque) and the RFC 822
    * Message-ID that ended up on the wire.
    */
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-    const path = `/inboxes/${encodeURIComponent(input.inboxId)}/messages`;
+    const path = `/inboxes/${encodeURIComponent(input.inboxId)}/messages/send`;
     return this.postSend(path, input);
   }
 

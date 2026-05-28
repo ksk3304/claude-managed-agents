@@ -51,17 +51,16 @@
  *        successor can take over.
  *
  * Thread history fetching (= prior messages on the same thread, used
- * to seed `buildContinuationPrompt`) is NOT implemented in this layer.
- * `buildContinuationPrompt(inbound, [])` is passed an empty history
- * for now — the agent gets only the most-recent inbound, plus the
- * persona's own memory. A follow-up issue tracks history population
- * from D1 / AgentMail `listMessages`.
+ * to seed `buildContinuationPrompt`) is implemented on continuation
+ * paths. SignalB thread self-scan also reuses the fetched AgentMail
+ * thread when RFC 822 headers do not map to a known D1 row.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 — 層 7-2 dispatch body + 層 7-3 wire-up)
  * Spec: plan-draft.md §step 9 dispatch + impl-mid-3 §3.2 案 B
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import { threadSelfScan, type AgentMailThread } from '../lib/agentmail-signal-b';
 import { ChatApiError, postChatMessage } from '../lib/chat-api';
 import {
   buildAutoreplyNotificationText,
@@ -85,6 +84,7 @@ import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
 import { executeWithCommit } from '../lib/three-stage-precheck';
+import { assertBridgeEgressAllowed } from '../lib/egress-guard';
 import type { AgentMailMessage, EmailSendMarker } from '../types/agentmail';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import type {
@@ -141,8 +141,38 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     }
   }
 
+  const inboxIdForThread = extractInboxId(event);
+  const threadId =
+    typeof message.thread_id === 'string' && message.thread_id.length > 0
+      ? message.thread_id
+      : '';
+
   // 4. Continuation vs first-contact branch.
-  const isContinuation = sessionId !== null || reChainDepth(message.subject) >= 1;
+  // SignalB: when RFC 822 headers do not map to D1 but the AgentMail
+  // thread itself contains a bot-authored message, keep the inbound on
+  // the continuation path. This mirrors Python `_thread_self_scan`.
+  let signalBHistory: AgentMailMessage[] = [];
+  let signalBHasSelf = false;
+  if (sessionId === null && inboxIdForThread && threadId) {
+    const scan = await threadSelfScan(
+      (inboxId, tid) => fetchAgentMailThread(env, inboxId, tid),
+      inboxIdForThread,
+      threadId,
+      {
+        warn: (msg) =>
+          console.warn(
+            `[agentmail-dispatch] signalB eventKey=${eventKey} ${msg}`,
+          ),
+      },
+    );
+    signalBHasSelf = scan.selfPresent;
+    signalBHistory = scan.messages;
+    console.log(
+      `[agentmail-dispatch] signalB eventKey=${eventKey} thread_id=${threadId} self=${scan.selfPresent} messages=${scan.messages.length} senders_self=${scan.sendersSelf}`,
+    );
+  }
+  const isContinuation =
+    sessionId !== null || signalBHasSelf || reChainDepth(message.subject) >= 1;
 
   // 4a. Cold inbound notify-only path (Issue #186 #2). When the
   // operator has wired a notify space + Chat SA key, defer cold
@@ -186,7 +216,11 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     console.log(
       `[agentmail-dispatch] created session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey}`,
     );
-    userMessage = buildInitialUserMessage(message, isContinuation);
+    if (isContinuation) {
+      userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, signalBHistory)}`;
+    } else {
+      userMessage = buildInitialUserMessage(message, false);
+    }
   } else {
     // Existing session — fetch prior thread messages so the
     // continuation prompt carries full context into the agent. Mirrors
@@ -199,15 +233,10 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     // pre-fetch behaviour). We deliberately don't gate the reply on
     // this fetch — a stuck threads endpoint should never block the
     // agent from at least responding to the latest inbound.
-    const inboxIdForHistory = extractInboxId(event);
-    const threadId =
-      typeof message.thread_id === 'string' && message.thread_id.length > 0
-        ? message.thread_id
-        : '';
     let history: AgentMailMessage[] = [];
-    if (inboxIdForHistory && threadId) {
+    if (inboxIdForThread && threadId) {
       try {
-        history = await fetchMailThreadMessages(env, inboxIdForHistory, threadId);
+        history = await fetchMailThreadMessages(env, inboxIdForThread, threadId);
       } catch (err) {
         // Defensive: `fetchMailThreadMessages` is documented to swallow
         // every error, but if a future change ever bubbles one we still
@@ -223,7 +252,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     } else {
       console.warn(
         `[agentmail-dispatch] mail history skipped eventKey=${eventKey} reason=${
-          !inboxIdForHistory ? 'no_inbox_id' : 'no_thread_id'
+          !inboxIdForThread ? 'no_inbox_id' : 'no_thread_id'
         }`,
       );
     }
@@ -247,6 +276,19 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           callerSessionId: sessionId!,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
+      payloadAudit: {
+        kv: env.MAKOTO_KV,
+        enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+        ttlDays: env.CMA_AUDIT_TTL_DAYS,
+        maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+        mode: 'agentmail',
+        context: {
+          event_key: eventKey,
+          sender_email: sender,
+          user_slug: userSlug,
+          agent_id: agentId,
+        },
+      },
     });
   } catch (err) {
     console.error(
@@ -376,6 +418,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'agentmail_auto_reply',
         );
       }
     } catch (err) {
@@ -519,6 +562,31 @@ function extractInboxId(event: AgentMailDispatchContext['event']): string {
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return '';
+}
+
+async function fetchAgentMailThread(
+  env: AgentMailDispatchContext['env'],
+  inboxId: string,
+  threadId: string,
+): Promise<AgentMailThread> {
+  if (!env.AGENTMAIL_API_KEY) {
+    throw new Error('no_agentmail_api_key');
+  }
+  const baseUrl = (env.AGENTMAIL_API_BASE_URL ?? 'https://api.agentmail.to/v0').replace(/\/$/, '');
+  const url = `${baseUrl}/inboxes/${encodeURIComponent(inboxId)}/threads/${encodeURIComponent(threadId)}`;
+  assertBridgeEgressAllowed(url, 'agentmail-dispatch:signalB');
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${env.AGENTMAIL_API_KEY}`,
+      accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    throw new Error(`AgentMail thread fetch failed: ${resp.status}`);
+  }
+  const text = await resp.text();
+  return text.length === 0 ? {} : (JSON.parse(text) as AgentMailThread);
 }
 
 /**
