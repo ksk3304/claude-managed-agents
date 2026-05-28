@@ -381,6 +381,17 @@ blocks at the bottom of `tests/egress.test.ts` for the planned shape.
 A handful of edge cases that bite people, most of them around the
 empty `id` / `database_id` placeholders in `wrangler.jsonc`:
 
+- **Production deploy target is shared across worktrees.** Git worktrees
+  isolate local files and branches, but they do not isolate the Cloudflare
+  Worker named in `wrangler.jsonc` (`claude-managed-agents-control-plane`).
+  `npm run deploy` runs `scripts/deploy-guard.mjs` before `wrangler deploy`.
+  The guard prints the worktree path, branch, HEAD, upstream ref, Worker
+  name, and package version, then blocks production deploys when the branch
+  is behind `origin/main` or known required fix markers are missing. This
+  currently includes the Issue #214 PDF preflight markers
+  `pdf_preflight_result` and `pendingPdfPreflightApprovalKey`, so an older
+  worktree cannot overwrite production with a build that lacks that guard.
+  See `docs/deploy-guard.md` for the runbook.
 - **Running `npx wrangler deploy` directly fails.** The committed
   `wrangler.jsonc` has empty KV `id` and `database_id` fields by design;
   wrangler refuses to load that without first running the patch
