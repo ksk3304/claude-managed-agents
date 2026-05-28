@@ -185,12 +185,22 @@ describe('sendAndStreamWithToolDispatch', () => {
   it('ignores a stale idle boundary before the newly-sent turn starts', async () => {
     const client = makeFakeClient({
       events: [
+        { type: 'session.status_running' },
+        { type: 'session.thread_status_running' },
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: 'previous prompt' }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'previous text' }],
+        },
         { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
         { type: 'session.status_running' },
         { type: 'session.thread_status_running' },
         {
           type: 'user.message',
-          content: [{ type: 'text', text: 'recovery prompt' }],
+          content: [{ type: 'text', text: 'recover' }],
         },
         {
           type: 'agent.message',
@@ -204,8 +214,10 @@ describe('sendAndStreamWithToolDispatch', () => {
       sessionId: 'sesn_recovery',
       userMessage: 'recover',
       toolDispatcher: dispatcher,
+      startAfterUserMessageEcho: true,
     });
     expect(r.assistantText).toBe('recovered text');
+    expect(r.assistantText).not.toContain('previous text');
     expect(r.terminalEventType).toBe('session.status_idle');
     expect(r.stopReason).toBe('end_turn');
   });

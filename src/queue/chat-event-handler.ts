@@ -701,6 +701,7 @@ export async function handleChatEvent(
             userMessage: recoveryPrompt,
             toolDispatcher,
             maxToolCalls,
+            startAfterUserMessageEcho: true,
             payloadAudit: {
               kv: env.MAKOTO_KV,
               enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,

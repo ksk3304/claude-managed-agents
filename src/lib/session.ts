@@ -240,6 +240,17 @@ function pickString(ev: Record<string, unknown>, key: string): string | undefine
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+function userMessageContentText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const text = pickString(block as Record<string, unknown>, 'text');
+    if (text) parts.push(text);
+  }
+  return parts.join('');
+}
+
 // ============================================================================
 // sendAndStreamWithToolDispatch — agent.custom_tool_use event loop
 // ============================================================================
@@ -315,6 +326,13 @@ export interface SendAndStreamWithToolDispatchInput {
    * returns partial results instead of throwing.
    */
   sessionWatchdogSec?: number;
+  /**
+   * Ignore replayed historical session events until the stream echoes the
+   * exact user.message we just sent. Use for follow-up turns such as cap
+   * recovery where Managed Agents can replay the previous turn before the
+   * newly-sent prompt starts.
+   */
+  startAfterUserMessageEcho?: boolean;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;
@@ -385,6 +403,10 @@ export async function sendAndStreamWithToolDispatch(
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
   let currentTurnStarted = false;
+  let seenUserMessageEcho = input.startAfterUserMessageEcho !== true;
+  const sentUserMessageText = input.startAfterUserMessageEcho
+    ? userMessageContentText(userMessageEvents[0]!.content)
+    : '';
 
   /**
    * Fire `user.interrupt` so the agent stops generating. Mirrors the
@@ -429,6 +451,16 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       const evType = typeof ev.type === 'string' ? ev.type : '';
+      if (!seenUserMessageEcho) {
+        if (
+          evType === 'user.message' &&
+          userMessageContentText((ev as { content?: unknown }).content) === sentUserMessageText
+        ) {
+          seenUserMessageEcho = true;
+          currentTurnStarted = true;
+        }
+        continue;
+      }
       if (
         evType === 'session.status_running' ||
         evType === 'session.thread_status_running' ||

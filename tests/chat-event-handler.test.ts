@@ -39,6 +39,7 @@ import {
   TEST_VAULT_KEY_B64,
 } from './makoto-helpers';
 import { getThreadLock } from '../src/durable-objects/thread-lock';
+import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -1429,6 +1430,10 @@ describe('handleChatEvent', () => {
         [
           { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
           { type: 'session.status_running' },
+          {
+            type: 'user.message',
+            content: [{ type: 'text', text: RECOVERY_PROMPT }],
+          },
           {
             type: 'agent.message',
             content: [
