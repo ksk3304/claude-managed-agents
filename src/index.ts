@@ -118,14 +118,25 @@ export default {
     }
     // default = prune cron (`0 4 * * *`). 旧 path を保持.
     const cutoff = Date.now() - ONE_DAY_MS;
+    const eventKey = `prune:${controller.cron}:${Date.now()}`;
     ctx.waitUntil(
       (async () => {
+        await recordRuntimeEvent(env, {
+          eventKey,
+          eventType: "cron_prune_start",
+          source: "cron.prune",
+          detail: { cron: controller.cron, cutoff },
+        });
+        const detail: Record<string, unknown> = { cron: controller.cron, cutoff };
         try {
           const result = await pruneOlderThan(env.DB, cutoff);
+          detail.sentMessages = result.sentMessages;
           console.log(
             `[cron] prune sentMessages=${result.sentMessages} cutoff=${new Date(cutoff).toISOString()}`,
           );
         } catch (error) {
+          detail.sentMessagesError =
+            error instanceof Error ? error.message : String(error);
           console.error("[cron] prune failed", error);
         }
         // AgentMail bridge prunes — kept on the same daily tick so
@@ -136,6 +147,9 @@ export default {
           const dedupePruned = await pruneExpiredDedupe(env.DB);
           const seenPruned = await pruneExpiredAgentMailWebhookSeen(env.DB);
           const observabilityPruned = await pruneObservability(env);
+          detail.dedupePruned = dedupePruned;
+          detail.webhookSeenPruned = seenPruned;
+          detail.observabilityPruned = observabilityPruned;
           console.log(
             `[cron] agentmail-prune dedupe=${dedupePruned} webhook_seen=${seenPruned}`,
           );
@@ -146,8 +160,20 @@ export default {
               `payload_audit=${observabilityPruned.payloadAudit}`,
           );
         } catch (error) {
+          detail.agentmailPruneError =
+            error instanceof Error ? error.message : String(error);
           console.error("[cron] agentmail prune failed", error);
         }
+        const hasError =
+          typeof detail.sentMessagesError === "string" ||
+          typeof detail.agentmailPruneError === "string";
+        await recordRuntimeEvent(env, {
+          eventKey,
+          eventType: hasError ? "cron_prune_failed" : "cron_prune_done",
+          level: hasError ? "error" : "info",
+          source: "cron.prune",
+          detail,
+        });
       })(),
     );
   },
