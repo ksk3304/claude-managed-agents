@@ -214,6 +214,7 @@ async function runDailyReportCron(env: Env): Promise<void> {
       client,
       dateLabel,
       model,
+      environmentId: env.ENVIRONMENT_ID,
       dryRun,
     });
     console.log(

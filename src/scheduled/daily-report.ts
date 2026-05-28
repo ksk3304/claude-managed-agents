@@ -18,9 +18,8 @@
  * 出力:
  *   - target Memory Store の `/<date>.md` を update / create
  *
- * LLM 呼出: Python `cma_lib.run_session` (Managed Agent 経由) を簡略化し、
- * `client.messages.create` の 1 回呼出に置換. 理由: scheduled handler に
- * agent lifecycle 管理は重い、tools 空、system+user prompt は byte 等価維持.
+ * LLM 呼出: Python `cma_lib.run_session` と同じく Managed Agent 経由。
+ * user_mapping の `agent_id` と Worker secret `ENVIRONMENT_ID` で session を作る。
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 2 — Cloudflare 移行 Day 3)
  * Source of truth (Python):
@@ -30,6 +29,7 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 import type { UserMappingValue } from '../lib/memory-attach';
+import { createSessionWithResources, sendAndStream } from '../lib/session';
 
 // ============================================================================
 // Constants / route definitions
@@ -75,16 +75,19 @@ const NEEDLES: Readonly<Record<string, readonly [string, string]>> = {
 /** KV key prefix (= `src/lib/memory-attach.ts` と同じ). */
 const KV_USER_MAPPING_PREFIX = 'user_mapping:';
 
+/** Known stand-mode agent IDs. Compatibility fallback for older KV mapping values. */
+const KNOWN_AGENT_IDS: Readonly<Record<string, string>> = {
+  'k.seto@makotoprime.com': 'agent_015g2g4SKACdzaPyQ8QiSi2o',
+  'takei@makotoprime.com': 'agent_01Vtoq66KenhBQzR4vnHG33t',
+};
+
+const KNOWN_AGENT_IDS_BY_SLUG: Readonly<Record<string, string>> = {
+  'k-seto': 'agent_015g2g4SKACdzaPyQ8QiSi2o',
+  takei: 'agent_01Vtoq66KenhBQzR4vnHG33t',
+};
+
 /** Anthropic API default model (= scheduled handler の env override 可). */
 const DEFAULT_MODEL = 'claude-haiku-4-5';
-
-/** Anthropic API max_tokens (= 日報 1 本に余裕). */
-const MAX_TOKENS = 8192;
-
-/** LLM system prompt — Python `_summarize_logs` l.160-163 と byte 等価. */
-const SYSTEM_PROMPT =
-  'あなたは MAKOTOくんの日報生成バッチです。' +
-  '渡されたセッションログだけを要約し、DM と共有スペースを絶対に混在させません。';
 
 // ============================================================================
 // Pure helpers (byte-equivalent ports)
@@ -303,11 +306,21 @@ export async function writeReport(
 }
 
 // ============================================================================
-// LLM summarize
+// Managed Agent summarize
 // ============================================================================
 
-interface MessagesCreateResponse {
-  content?: unknown;
+export interface ReportStorePair {
+  label: string;
+  sourceStoreId: string;
+  targetStoreId: string;
+  agentId: string;
+}
+
+function agentIdForEntry(email: string, entry: UserMappingValue): string {
+  const raw = (entry as { agent_id?: unknown }).agent_id;
+  if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim();
+  const normalized = email.trim().toLowerCase();
+  return KNOWN_AGENT_IDS[normalized] ?? KNOWN_AGENT_IDS_BY_SLUG[entry.user_slug] ?? '';
 }
 
 /**
@@ -315,39 +328,36 @@ interface MessagesCreateResponse {
  * logs 0 件時は `# {date_label} {route.title}\n\n新着セッションなし。\n` を
  * LLM 呼出なしで返す (byte 等価).
  *
- * logs ある時は `client.messages.create` (= Anthropic Messages API) を 1 回叩く.
- * Python は Managed Agent + `run_session` 経由だが、TS は agent lifecycle を
- * 持たず軽量化する (tools 空・system prompt 固定 = 挙動は等価).
+ * logs ある時は user mapping の agent_id で Managed Agent session を作り、
+ * Python `run_session` 同様、日報 prompt を `user.message` として送る。
  */
 export async function summarizeLogs(
   client: Anthropic,
   route: ReportRoute,
   dateLabel: string,
   logs: ReadonlyArray<[string, string]>,
-  model: string,
+  _model: string,
+  agentId: string,
+  environmentId: string,
 ): Promise<string> {
   if (logs.length === 0) {
     return `# ${dateLabel} ${route.title}\n\n新着セッションなし。\n`;
   }
-  const userPrompt = dailyReportPrompt(route, dateLabel, logs);
-  const response = (await client.messages.create({
-    model,
-    max_tokens: MAX_TOKENS,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: userPrompt }],
-  })) as MessagesCreateResponse;
-  const blocks = Array.isArray(response.content) ? response.content : [];
-  const parts: string[] = [];
-  for (const block of blocks) {
-    if (block && typeof block === 'object') {
-      const b = block as { type?: unknown; text?: unknown };
-      if (b.type === 'text' && typeof b.text === 'string') {
-        parts.push(b.text);
-      }
-    }
+  if (!agentId) {
+    throw new Error('daily-report agent_id missing');
   }
+  const userPrompt = dailyReportPrompt(route, dateLabel, logs);
+  const sessionId = await createSessionWithResources(client, {
+    agentId,
+    environmentId,
+    resources: [],
+  });
+  const streamed = await sendAndStream(client, {
+    sessionId,
+    userMessage: userPrompt,
+  });
   // Python: `"".join(chunks).strip() + "\n"` (l.175).
-  return parts.join('').trim() + '\n';
+  return streamed.assistantText.trim() + '\n';
 }
 
 // ============================================================================
@@ -355,7 +365,7 @@ export async function summarizeLogs(
 // ============================================================================
 
 /**
- * 1 route ぶんの `(label, source_store_id, target_store_id)` tuple 配列を作る.
+ * 1 route ぶんの store pair 配列を作る.
  * Python `_route_store_pairs` (l.86-103) の TS port.
  *
  * shared: singleton 1 件 (= 最初の email-sorted user mapping から抜く. 全 user
@@ -366,32 +376,46 @@ export async function summarizeLogs(
 export function routeStorePairs(
   mapping: Map<string, UserMappingValue>,
   route: ReportRoute,
-): Array<[string, string, string]> {
+): ReportStorePair[] {
   const sortedEmails = Array.from(mapping.keys()).sort();
   if (route.kind === 'shared') {
     // Python `_store_id_from_mapping`: entries を順に走査して最初に見つかった
     // store_id を採用 (entries は dict の values + default の順). TS では
     // email-sorted user mapping を順に走査する近似で同一結果 (全 user で
     // 共有 store は同じ id のはずなので、どの user から抜いても等価).
-    for (const email of sortedEmails) {
+    const orderedEmails = [
+      ...sortedEmails.filter((email) => email === 'k.seto@makotoprime.com'),
+      ...sortedEmails.filter((email) => email !== 'k.seto@makotoprime.com'),
+    ];
+    for (const email of orderedEmails) {
       const entry = mapping.get(email)!;
       const source = storeIdFromEntry(entry, route.source_store_name);
       const target = storeIdFromEntry(entry, route.target_store_name);
       if (source && target) {
-        return [['shared', source, target]];
+        return [{
+          label: 'shared',
+          sourceStoreId: source,
+          targetStoreId: target,
+          agentId: agentIdForEntry(email, entry),
+        }];
       }
     }
     throw new Error(`store not found in mapping: ${route.source_store_name}`);
   }
 
-  const pairs: Array<[string, string, string]> = [];
+  const pairs: ReportStorePair[] = [];
   for (const email of sortedEmails) {
     const entry = mapping.get(email)!;
     const source = storeIdFromEntry(entry, route.source_store_name);
     const target = storeIdFromEntry(entry, route.target_store_name);
     if (source && target) {
       const label = entry.user_slug || slugFromEmail(email);
-      pairs.push([label, source, target]);
+      pairs.push({
+        label,
+        sourceStoreId: source,
+        targetStoreId: target,
+        agentId: agentIdForEntry(email, entry),
+      });
     }
   }
   if (pairs.length === 0) {
@@ -420,6 +444,7 @@ export interface DailyReportRunInput {
   client: Anthropic;
   dateLabel: string;
   model: string;
+  environmentId: string;
   dryRun: boolean;
 }
 
@@ -429,6 +454,8 @@ export interface DailyReportRouteResult {
   log_count: number;
   output_path: string;
   chars: number;
+  agent_id?: string;
+  environment_id?: string;
   /** error 文字列 (route 単位 failure isolation で集約). 成功時は無し. */
   error?: string;
 }
@@ -444,12 +471,12 @@ export interface DailyReportRouteResult {
 export async function generateDailyReports(
   input: DailyReportRunInput,
 ): Promise<Record<string, DailyReportRouteResult>> {
-  const { kv, client, dateLabel, model, dryRun } = input;
+  const { kv, client, dateLabel, model, environmentId, dryRun } = input;
   const mapping = await loadAllUserMappings(kv);
   const result: Record<string, DailyReportRouteResult> = {};
 
   for (const route of REPORT_ROUTES) {
-    let pairs: Array<[string, string, string]>;
+    let pairs: ReportStorePair[];
     try {
       pairs = routeStorePairs(mapping, route);
     } catch (error) {
@@ -467,30 +494,42 @@ export async function generateDailyReports(
       continue;
     }
 
-    for (const [label, sourceStoreId, targetStoreId] of pairs) {
-      const key = route.kind === 'shared' ? 'shared' : `dm:${label}`;
+    for (const pair of pairs) {
+      const key = route.kind === 'shared' ? 'shared' : `dm:${pair.label}`;
       try {
-        const logs = await listDateSessionLogs(client, sourceStoreId, dateLabel);
-        const report = await summarizeLogs(client, route, dateLabel, logs, model);
+        const logs = await listDateSessionLogs(client, pair.sourceStoreId, dateLabel);
+        const report = await summarizeLogs(
+          client,
+          route,
+          dateLabel,
+          logs,
+          model,
+          pair.agentId,
+          environmentId,
+        );
         let outputPath = `/${dateLabel}.md`;
         if (!dryRun) {
-          outputPath = await writeReport(client, targetStoreId, dateLabel, report);
+          outputPath = await writeReport(client, pair.targetStoreId, dateLabel, report);
         }
         result[key] = {
-          source_store_id: sourceStoreId,
-          target_store_id: targetStoreId,
+          source_store_id: pair.sourceStoreId,
+          target_store_id: pair.targetStoreId,
           log_count: logs.length,
           output_path: outputPath,
           chars: report.length,
+          agent_id: pair.agentId,
+          environment_id: environmentId,
         };
       } catch (error) {
-        // 1 user の messages.create / list / write 失敗で他 user を巻き込まない.
+        // 1 user の session / list / write 失敗で他 user を巻き込まない.
         result[key] = {
-          source_store_id: sourceStoreId,
-          target_store_id: targetStoreId,
+          source_store_id: pair.sourceStoreId,
+          target_store_id: pair.targetStoreId,
           log_count: 0,
           output_path: '',
           chars: 0,
+          agent_id: pair.agentId,
+          environment_id: environmentId,
           error: error instanceof Error ? error.message : String(error),
         };
       }
