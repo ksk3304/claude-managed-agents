@@ -125,7 +125,7 @@ import {
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
-import { executeWithCommit } from '../lib/three-stage-precheck';
+import { executeWithCommit, LeaseHeartbeat } from '../lib/three-stage-precheck';
 import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import { PERSONA_SPEC } from '../data/persona-spec';
@@ -148,6 +148,8 @@ const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
+const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
+const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -205,8 +207,6 @@ export async function handleChatEvent(
   ctx: ExecutionContext,
   body: ChatQueueMessage,
 ): Promise<ChatEventOutcome> {
-  void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
-
   const { eventKey, claim, payload } = body;
   await recordRuntimeEvent(env, {
     eventKey,
@@ -393,6 +393,7 @@ export async function handleChatEvent(
   let attachmentForProcessing = message.attachment ?? null;
   let pdfApprovedThroughUsdFloor: number | null = null;
   let pdfPreflightApprovalConsumed = false;
+  let parentHeartbeat: LeaseHeartbeat | null = null;
 
   try {
     const pdfApprovalDecision = parsePdfPreflightApprovalDecision(bodyText);
@@ -897,6 +898,44 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
+
+  if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) {
+    parentHeartbeat = new LeaseHeartbeat({
+      env,
+      eventKey,
+      owner: claim.owner,
+      version: claim.version,
+      leaseTtlMs: MORNING_BRIEF_EVENT_LEASE_TTL_MS,
+      intervalMs: MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS,
+    });
+    const renewed = await parentHeartbeat.tick();
+    if (!renewed) {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'morning_brief_parent_lease_renew_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { reason: parentHeartbeat.lostBecause() ?? 'renew_failed' },
+      });
+      return { kind: 'skipped', reason: 'lost_claim' };
+    }
+    parentHeartbeat.start();
+    if (typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(parentHeartbeat.completionPromise);
+    }
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'morning_brief_parent_lease_heartbeat_started',
+      source: 'chat-event-handler',
+      detail: {
+        lease_ttl_ms: MORNING_BRIEF_EVENT_LEASE_TTL_MS,
+        interval_ms: MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS,
+      },
+    });
+  }
+
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -1250,6 +1289,7 @@ export async function handleChatEvent(
         // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
         return undefined as unknown as void;
       },
+      options: parentHeartbeat ? { heartbeat: parentHeartbeat } : {},
     });
     if (chatReplyOutcome.outcome === 'already') {
       await recordRuntimeEvent(env, {
@@ -1276,6 +1316,8 @@ export async function handleChatEvent(
       console.warn(
         `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
       );
+      await safeRelease(env, eventKey, claim);
+      return { kind: 'release_and_retry', reason: 'chat_reply_lease_alive' };
     } else if (chatReplyOutcome.outcome === 'lease_lost') {
       await recordRuntimeEvent(env, {
         eventKey,
@@ -1336,6 +1378,9 @@ export async function handleChatEvent(
   await safeCommit(env, eventKey, claim);
   return { kind: 'committed' };
   } finally {
+    if (parentHeartbeat) {
+      await parentHeartbeat.stop();
+    }
     try {
       await chatScopeLock.release(chatScopeKey);
     } catch (err) {

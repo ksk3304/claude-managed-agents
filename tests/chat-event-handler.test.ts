@@ -31,6 +31,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { handleChatEvent } from '../src/queue/chat-event-handler';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
+import { buildSideEffectKey } from '../src/lib/three-stage-precheck';
 import {
   makeFakeThreadLockNamespace,
   makeFetchMock,
@@ -1897,5 +1898,51 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('通常完了テキスト');
     expect(chatApiMock.patches[0]!.text).not.toContain('RECOVERY_ERRONEOUSLY_RAN');
+  });
+
+  it('morning brief: final reply lease_alive は parent を commit せず retry に戻す', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-05-29:test';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const chatReplyKey = await buildSideEffectKey(
+      msg.eventKey,
+      'chat_reply',
+      'spaces/AAA:',
+    );
+    await preClaim(env, chatReplyKey, 'other-worker#chat_reply');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_reply_lease_alive',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '朝ブリーフ本文' }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result).toEqual({
+      kind: 'release_and_retry',
+      reason: 'chat_reply_lease_alive',
+    });
+    expect(chatApiMock.patches).toEqual([]);
+    const parent = (env.DB as unknown as {
+      _tables: {
+        dedupe: Map<string, {
+          event_key: string;
+          committed_at_ms: number | null;
+          lease_expires_at_ms: number;
+        }>;
+      };
+    })._tables.dedupe.get(msg.eventKey);
+    expect(parent?.committed_at_ms).toBeNull();
+    expect(parent?.lease_expires_at_ms).toBe(0);
   });
 });
