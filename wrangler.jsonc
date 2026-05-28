@@ -94,6 +94,11 @@
   //     `client.messages.create`, and writes `/<date>.md` to the
   //     per-user / shared `daily_report_*_store`. TS port of the
   //     Cloud Run `scripts/cma_daily_report.py` (Issue #186 Phase 2).
+  //   - `34 2 * * 3` (02:34 UTC = 11:34 JST) — weekly Drive file list
+  //     for 竹井さん. Runs a MAKOTO agent session with Drive/Sheets tools,
+  //     then posts completion to Chat (Issue #189 Phase 1 PoC).
+  //     2026-05-29: not enabled in triggers yet because takei OAuth is
+  //     missing; enabling now would produce a deterministic failure post.
   "triggers": {
     "crons": ["0 4 * * *", "0 14 * * *"],
   },

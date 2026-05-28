@@ -5,6 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   sheetsAppend,
+  sheetsClear,
   sheetsCreate,
   sheetsRead,
   sheetsUpdate,
@@ -161,5 +162,22 @@ describe('sheetsUpdate', () => {
       deps(fetcher),
     );
     expect(r.updated_cells).toBe(2);
+  });
+});
+
+describe('sheetsClear', () => {
+  it('POSTs to values:clear and returns cleared_range', async () => {
+    const fetcher = makeFetchMock(async (url, init) => {
+      expect(url).toBe(
+        'https://sheets.googleapis.com/v4/spreadsheets/spr/values/Sheet1!A:Z:clear',
+      );
+      expect(init.method).toBe('POST');
+      return jsonResponse(200, { clearedRange: 'Sheet1!A:Z' });
+    });
+    const r = await sheetsClear(
+      { spreadsheet_id: 'spr', range: 'Sheet1!A:Z' },
+      deps(fetcher),
+    );
+    expect(r.cleared_range).toBe('Sheet1!A:Z');
   });
 });

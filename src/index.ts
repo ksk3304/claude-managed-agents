@@ -32,6 +32,10 @@ import {
 } from "./storage";
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
+import {
+  runWeeklyDriveFileListTakeiCron,
+  WEEKLY_DRIVE_FILE_LIST_TAKEI_CRON,
+} from "./scheduled/weekly-drive-file-list-takei";
 import { buildAnthropicClient } from "./lib/session";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import {
@@ -107,6 +111,9 @@ export default {
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
   //   - `0 14 * * *` (14:00 UTC = 23:00 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
+  //   - `34 2 * * 3` (02:34 UTC = 11:34 JST) → 竹井さん Drive 一覧の
+  //     Sheets 全件洗い替え + Chat 完了報告 (#189)。2026-05-29 現在、
+  //     竹井さん OAuth 未登録のため wrangler trigger 側では未有効化。
   async scheduled(
     controller: ScheduledController,
     env: Env,
@@ -114,6 +121,10 @@ export default {
   ): Promise<void> {
     if (controller.cron === "0 14 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
+      return;
+    }
+    if (controller.cron === WEEKLY_DRIVE_FILE_LIST_TAKEI_CRON) {
+      ctx.waitUntil(runWeeklyDriveFileListTakeiCron(env, controller));
       return;
     }
     // default = prune cron (`0 4 * * *`). 旧 path を保持.

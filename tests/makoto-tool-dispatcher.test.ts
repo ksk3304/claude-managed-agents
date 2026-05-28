@@ -1,6 +1,6 @@
 /**
  * Unit tests for `src/dispatch/makoto-tool-dispatcher.ts` — wraps the
- * 10 layer-6 tool functions with per-user OAuth resolution + error
+ * 11 layer-6 tool functions with per-user OAuth resolution + error
  * envelope encoding.
  */
 
@@ -38,8 +38,9 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
-  it('covers all 10 tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(10);
+  it('covers all 11 tools', () => {
+    expect(MAKOTO_TOOL_NAMES.length).toBe(11);
+    expect(MAKOTO_TOOL_NAMES).toContain('sheets_clear');
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);

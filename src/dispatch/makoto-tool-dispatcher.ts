@@ -39,6 +39,7 @@ import {
 } from '../tools/drive';
 import {
   sheetsAppend,
+  sheetsClear,
   sheetsCreate,
   sheetsRead,
   sheetsUpdate,
@@ -64,6 +65,7 @@ export type MakotoToolName =
   | 'drive_create_file'
   | 'drive_delete'
   | 'sheets_create'
+  | 'sheets_clear'
   | 'sheets_read'
   | 'sheets_update'
   | 'sheets_append'
@@ -76,6 +78,7 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_create_file',
   'drive_delete',
   'sheets_create',
+  'sheets_clear',
   'sheets_read',
   'sheets_update',
   'sheets_append',
@@ -212,6 +215,10 @@ export async function dispatchMakotoTool(
       case 'sheets_create':
         return ok(
           await sheetsCreate(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
+        );
+      case 'sheets_clear':
+        return ok(
+          await sheetsClear(args, sheetsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'sheets_read':
         return ok(

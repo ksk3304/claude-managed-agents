@@ -67,6 +67,7 @@ function fetchOpts(deps: DriveToolDeps): GoogleApiFetchOptions {
 const DRIVE_SEARCH_KNOWN_KEYS = new Set([
   'query',
   'page_size',
+  'page_token',
   'order_by',
   'corpora',
 ]);
@@ -132,6 +133,11 @@ export async function driveSearch(
     includeItemsFromAllDrives: 'true',
     supportsAllDrives: 'true',
   });
+  const pageToken =
+    typeof input.page_token === 'string' && input.page_token.length > 0
+      ? input.page_token
+      : null;
+  if (pageToken) params.set('pageToken', pageToken);
   const url = `${DRIVE_API_BASE}/files?${params.toString()}`;
   const resp = await googleApiFetch(url, { method: 'GET' }, fetchOpts(deps));
   if (!resp.ok) {

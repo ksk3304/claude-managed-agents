@@ -34,6 +34,7 @@ describe('driveSearch', () => {
   it('returns parsed files + nextPageToken', async () => {
     const fetcher = makeFetchMock(async (url) => {
       expect(url).toContain('files?');
+      expect(url).not.toContain('pageToken=');
       return jsonResponse(200, {
         files: [{ id: 'a', name: 'A' }],
         nextPageToken: 'tok',
@@ -42,6 +43,17 @@ describe('driveSearch', () => {
     const r = await driveSearch({ query: 'name contains "x"' }, baseDeps(fetcher));
     expect(r.files).toHaveLength(1);
     expect(r.next_page_token).toBe('tok');
+  });
+
+  it('passes page_token through to Drive pagination', async () => {
+    const fetcher = makeFetchMock(async (url) => {
+      expect(url).toContain('pageToken=next-1');
+      return jsonResponse(200, { files: [] });
+    });
+    await driveSearch(
+      { query: 'name contains "x"', page_token: 'next-1' },
+      baseDeps(fetcher),
+    );
   });
 
   it('throws ToolSchemaError on unknown key', async () => {

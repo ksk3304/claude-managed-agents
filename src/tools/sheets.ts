@@ -1,13 +1,14 @@
 /**
  * Google Sheets custom tools for the MAKOTO bridge.
  *
- * Four functions matching Python's `get_sheets_tool_dispatch` surface
+ * Five functions matching Python's `get_sheets_tool_dispatch` surface
  * (`scripts/cma_lib.py:2543-2548`):
  *
  *   - `sheetsCreate` → Python `_exec_sheets_create` (`cma_lib.py:2148-2190`)
  *   - `sheetsRead`   → Python `_exec_sheets_read`   (`cma_lib.py:2193-2245`)
  *   - `sheetsUpdate` → Python `_exec_sheets_update` (`cma_lib.py:2248-2312`)
  *   - `sheetsAppend` → Python `_exec_sheets_append` (`cma_lib.py:2315-2397`)
+ *   - `sheetsClear`  → Issue #189 weekly Drive list full refresh helper
  *
  * Same stateless-function shape as `drive.ts`. The dispatcher in
  * layer 7 wires the access token through `SheetsToolDeps.accessToken`.
@@ -263,7 +264,59 @@ export async function sheetsUpdate(
 }
 
 // ============================================================================
-// 4. sheets_append (Python: _exec_sheets_append)
+// 4. sheets_clear (Issue #189 full refresh helper)
+// ============================================================================
+
+const SHEETS_CLEAR_KNOWN_KEYS = new Set(['spreadsheet_id', 'range']);
+
+export interface SheetsClearResult {
+  spreadsheet_id: string;
+  cleared_range: string;
+}
+
+export async function sheetsClear(
+  input: Record<string, unknown>,
+  deps: SheetsToolDeps,
+): Promise<SheetsClearResult> {
+  rejectUnknownKeys(input, SHEETS_CLEAR_KNOWN_KEYS, 'sheets_clear');
+  const spreadsheetId = requireNonEmptyString(
+    input.spreadsheet_id,
+    'spreadsheet_id',
+    'sheets_clear',
+  );
+  const range = requireNonEmptyString(input.range, 'range', 'sheets_clear');
+  const url = `${SHEETS_API_BASE}/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeSheetsRange(range)}:clear`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    },
+    fetchOpts(deps),
+  );
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    if (resp.status === 403) {
+      throw new GoogleApiToolError(
+        `sheets_clear scope_insufficient: HTTP 403: ${snippet}`,
+        { status: 403, bodySnippet: snippet },
+      );
+    }
+    throw new GoogleApiToolError(
+      `sheets_clear HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  const body = (await resp.json()) as { clearedRange?: string };
+  return {
+    spreadsheet_id: spreadsheetId,
+    cleared_range: body.clearedRange ?? range,
+  };
+}
+
+// ============================================================================
+// 5. sheets_append (Python: _exec_sheets_append)
 // ============================================================================
 
 const SHEETS_APPEND_KNOWN_KEYS = new Set(['spreadsheet_id', 'range', 'values']);
