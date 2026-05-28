@@ -146,6 +146,8 @@ import { recordRuntimeEvent, stableHash } from '../lib/observability';
  */
 const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
+const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
+const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -948,6 +950,9 @@ export async function handleChatEvent(
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
         // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
+        timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+          ? MORNING_BRIEF_STREAM_TIMEOUT_MS
+          : undefined,
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
