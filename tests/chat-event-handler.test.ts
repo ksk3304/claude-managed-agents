@@ -122,10 +122,19 @@ interface SchedulerMockState {
   capturedCalls: Array<{ method: string; args: unknown[] }>;
   /** true なら manager の create_job が throw して dispatch failure 経路を発火させる。 */
   shouldThrow: boolean;
+  jobs: Array<{
+    job_id: string;
+    cron: string;
+    handler: string;
+    description?: string;
+    payload?: Record<string, unknown>;
+    paused?: boolean;
+  }>;
 }
 const schedulerMock: SchedulerMockState = {
   capturedCalls: [],
   shouldThrow: false,
+  jobs: [],
 };
 vi.mock('../src/lib/cloud-scheduler-client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/lib/cloud-scheduler-client')>();
@@ -142,12 +151,15 @@ vi.mock('../src/lib/cloud-scheduler-client', async (importOriginal) => {
       return {
         list_jobs: async () => {
           schedulerMock.capturedCalls.push({ method: 'list_jobs', args: [] });
-          return [];
+          return schedulerMock.jobs;
         },
-        format_job_list: () => '(empty)',
+        format_job_list: (jobs: typeof schedulerMock.jobs) =>
+          jobs.length === 0
+            ? '(empty)'
+            : jobs.map((j) => `・${j.job_id} ${j.cron} ${j.description ?? ''}`).join('\n'),
         get_job: async (jobId: string) => {
           schedulerMock.capturedCalls.push({ method: 'get_job', args: [jobId] });
-          return null;
+          return schedulerMock.jobs.find((j) => j.job_id === jobId) ?? null;
         },
         create_job: record('create_job'),
         pause_job: record('pause_job'),
@@ -447,6 +459,7 @@ beforeEach(() => {
   chatApiMock.deleteThrow = null;
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
+  schedulerMock.jobs = [];
   installFakeAnthropic(null);
 });
 
@@ -1515,6 +1528,105 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).toContain('登録');
     expect(chatApiMock.patches[0]!.text).toContain('daily-x');
     expect(chatApiMock.patches[0]!.text).not.toContain('SCHEDULE_ACTION:');
+  });
+
+  it('natural schedule command: 削除は agent を待たず delete_job に直行する', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    schedulerMock.jobs = [
+      {
+        job_id: 'morning_ai_news_seto_dm',
+        cron: '20 5 * * *',
+        handler: 'cma_session',
+        description: '毎朝5:20 AIニュース3本 → 瀬戸さんDM',
+      },
+    ];
+    const msg = buildQueueMsg({
+      text: '毎朝5時20分のAIニュースの定期実行を削除してください',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_run',
+      events: [{ type: 'agent.message.text', text: 'should not run' }],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(schedulerMock.capturedCalls).toContainEqual({
+      method: 'delete_job',
+      args: ['morning_ai_news_seto_dm'],
+    });
+    expect(schedulerMock.capturedCalls.some((c) => c.method === 'create_job')).toBe(false);
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('✅ `morning_ai_news_seto_dm` 削除');
+    expect(chatApiMock.patches).toHaveLength(0);
+  });
+
+  it('natural schedule command: 停止は delete ではなく pause_job', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    schedulerMock.jobs = [
+      {
+        job_id: 'morning_ai_news_seto',
+        cron: '45 5 * * *',
+        handler: 'cma_session',
+        description: '毎朝5:45 AIニュース',
+      },
+    ];
+    const msg = buildQueueMsg({
+      text: 'morning_ai_news_seto の定期実行を停止して',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(schedulerMock.capturedCalls).toContainEqual({
+      method: 'pause_job',
+      args: ['morning_ai_news_seto'],
+    });
+    expect(schedulerMock.capturedCalls.some((c) => c.method === 'delete_job')).toBe(false);
+    expect(chatApiMock.posts[0]!.text).toBe('✅ `morning_ai_news_seto` 一時停止');
+  });
+
+  it('natural schedule command: 更新は update_job に cron patch を渡す', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    schedulerMock.jobs = [
+      {
+        job_id: 'morning_ai_news_seto',
+        cron: '45 5 * * *',
+        handler: 'cma_session',
+        description: '毎朝5:45 AIニュース',
+      },
+    ];
+    const msg = buildQueueMsg({
+      text: 'morning_ai_news_seto の定期実行を6時10分に変更して',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(schedulerMock.capturedCalls).toContainEqual({
+      method: 'update_job',
+      args: ['morning_ai_news_seto', { cron: '10 6 * * *' }],
+    });
+    expect(chatApiMock.posts[0]!.text).toBe('✅ `morning_ai_news_seto` 更新 (cron=10 6 * * *)');
   });
 
   it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 未設定 → dispatch skip + 既存 chat 投稿のみ', async () => {

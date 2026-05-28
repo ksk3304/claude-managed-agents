@@ -106,6 +106,7 @@ import {
 } from '../lib/intent-detector';
 import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
+import { handleNaturalScheduleCommand } from '../lib/schedule-natural-command';
 import {
   buildAnthropicClient,
   chatThreadSessionKey,
@@ -365,6 +366,17 @@ export async function handleChatEvent(
           `attach_memory=${slashOutcome.attachMemory} (agent path)`,
       );
     }
+  }
+
+  const naturalScheduleResult = await dispatchNaturalScheduleCommand(
+    env,
+    bodyText,
+  );
+  if (naturalScheduleResult !== null) {
+    await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
+    await safeCommit(env, eventKey, claim);
+    console.log(`[chat-event] natural schedule command handled eventKey=${eventKey}`);
+    return { kind: 'committed' };
   }
 
   const threadSessionKey = chatThreadSessionKey(senderEmail, spaceName, threadName);
@@ -1896,6 +1908,39 @@ async function dispatchScheduleActionMarkers(
     // 失敗時は元の cleanedText で投稿継続。
     return { cleanedText: inputText };
   }
+}
+
+async function dispatchNaturalScheduleCommand(
+  env: Env,
+  inputText: string,
+): Promise<string | null> {
+  const manager = buildScheduleManager(env);
+  if (!manager) return null;
+  try {
+    const result = await handleNaturalScheduleCommand(inputText, manager);
+    return result.handled ? result.text : null;
+  } catch (err) {
+    return `❌ スケジュール操作失敗: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function buildScheduleManager(env: Env): ReturnType<typeof createCloudSchedulerManager> | null {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  const project = env.GCP_SCHEDULER_PROJECT;
+  const location = env.GCP_SCHEDULER_LOCATION;
+  if (!saKey || !project || !location) return null;
+  const managerDeps: Parameters<typeof createCloudSchedulerManager>[0] = {
+    saKeyJson: saKey,
+    project,
+    location,
+  };
+  if (env.SCHEDULER_TOPIC_NAME) {
+    managerDeps.schedulerTopicName = env.SCHEDULER_TOPIC_NAME;
+  }
+  if (env.SCHEDULER_HANDLER_TOPIC_PREFIX) {
+    managerDeps.handlerTopicPrefix = env.SCHEDULER_HANDLER_TOPIC_PREFIX;
+  }
+  return createCloudSchedulerManager(managerDeps);
 }
 
 // ---------------------------------------------------------------------------
