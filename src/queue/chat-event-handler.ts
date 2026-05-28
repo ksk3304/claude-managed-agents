@@ -80,6 +80,7 @@ import {
   parseCostGuardCommand,
   handleCostGuardCommand,
 } from '../lib/cost-guard-command';
+import { extractFinalMarkerText } from '../lib/final-marker';
 import {
   evaluateSessionCostAfterTurn,
   handlePendingSessionApproval,
@@ -934,8 +935,12 @@ export async function handleChatEvent(
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
+  const finalMarkerExtraction = extractFinalMarkerText(scheduleResult.cleanedText);
+  if (finalMarkerExtraction.markerFound) {
+    console.log(`[chat-event] final marker extracted eventKey=${eventKey}`);
+  }
   const displayText = normalizeEmailPreviewEscapedNewlines(
-    scheduleResult.cleanedText,
+    finalMarkerExtraction.text,
     emailParsed.markers.length,
   );
   const markerLeakScrubbed = scrubActionMarkerLeakForChat(

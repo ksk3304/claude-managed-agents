@@ -32,6 +32,10 @@ import {
 } from "./storage";
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
+import {
+  enqueueMorningBriefSeto,
+  MORNING_BRIEF_SETO_CRON,
+} from "./scheduled/morning-brief";
 import { buildAnthropicClient } from "./lib/session";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import {
@@ -107,6 +111,8 @@ export default {
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
   //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
+  //   - `30 23 * * 0-4` (23:30 UTC Sun-Thu = 平日 08:30 JST)
+  //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
   async scheduled(
     controller: ScheduledController,
     env: Env,
@@ -114,6 +120,10 @@ export default {
   ): Promise<void> {
     if (controller.cron === "30 15 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
+      return;
+    }
+    if (controller.cron === MORNING_BRIEF_SETO_CRON) {
+      ctx.waitUntil(enqueueMorningBriefSeto(env));
       return;
     }
     // default = prune cron (`0 4 * * *`). 旧 path を保持.
