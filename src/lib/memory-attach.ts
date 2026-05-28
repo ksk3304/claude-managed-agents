@@ -37,6 +37,8 @@ export interface UserMappingValue {
   user_slug: string;
   /** Anthropic agent id this user is bound to (1 user = 1 agent). */
   agent_id: string;
+  /** Memory store ids that must not be attached in shared spaces. */
+  personal_memory_store_ids?: string[];
   /**
    * Memory Stores to attach for this user's sessions. Each entry
    * becomes one `MemoryStoreResourceParam` at sessions.create time.
@@ -44,6 +46,8 @@ export interface UserMappingValue {
   memory_attachments: MemoryAttachment[];
   /** Optional per-user system-prompt addendum. */
   system_prompt_addendum?: string;
+  /** Observability count added by `filterPersonalMemoryForSpace`. */
+  filtered_personal_store_count?: number;
 }
 
 /**
@@ -112,9 +116,15 @@ export async function readUserMappingWithDefault(
   kv: KVNamespace,
   senderEmail: string,
   defaultSlug: string | undefined,
+  spaceType: string = 'DM',
 ): Promise<UserMappingResolution | null> {
   const direct = await readUserMapping(kv, senderEmail);
-  if (direct !== null) return { mapping: direct, isDefault: false };
+  if (direct !== null) {
+    return {
+      mapping: filterPersonalMemoryForSpace(direct, spaceType),
+      isDefault: false,
+    };
+  }
   if (!defaultSlug) return null;
   const slug = defaultSlug.trim();
   if (slug.length === 0) return null;
@@ -124,7 +134,38 @@ export async function readUserMappingWithDefault(
   // inside the same JSON file; the KV port flattens to a dedicated key.
   const raw = await kv.get(`${KV_USER_MAPPING_PREFIX}:${slug}`, 'json');
   if (raw === null) return null;
-  return { mapping: raw as UserMappingValue, isDefault: true };
+  return {
+    mapping: filterPersonalMemoryForSpace(raw as UserMappingValue, spaceType),
+    isDefault: true,
+  };
+}
+
+export function isSharedSpace(spaceType: string): boolean {
+  const normalized = (spaceType || '').trim().toUpperCase();
+  return normalized !== 'DM' && normalized !== 'DIRECT_MESSAGE';
+}
+
+export function filterPersonalMemoryForSpace(
+  mapping: UserMappingValue,
+  spaceType: string,
+): UserMappingValue {
+  const personalIds = new Set(mapping.personal_memory_store_ids ?? []);
+  if (!isSharedSpace(spaceType) || personalIds.size === 0) {
+    return {
+      ...mapping,
+      memory_attachments: [...mapping.memory_attachments],
+      filtered_personal_store_count: 0,
+    };
+  }
+  const memoryAttachments = mapping.memory_attachments.filter(
+    (a) => !personalIds.has(a.memory_store_id),
+  );
+  return {
+    ...mapping,
+    memory_attachments: memoryAttachments,
+    filtered_personal_store_count:
+      mapping.memory_attachments.length - memoryAttachments.length,
+  };
 }
 
 /**

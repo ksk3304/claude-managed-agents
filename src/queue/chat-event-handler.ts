@@ -282,6 +282,7 @@ export async function handleChatEvent(
     env.MAKOTO_KV,
     senderEmail,
     env.DEFAULT_USER_SLUG,
+    spaceType,
   );
   if (!mappingResolution) {
     // Scrub sender email through PII redactor before logging — Cloudflare
@@ -297,6 +298,12 @@ export async function handleChatEvent(
     console.info(
       `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
         `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
+    );
+  }
+  if ((userMapping.filtered_personal_store_count ?? 0) > 0) {
+    console.log(
+      `[chat-event] personal memory filtered eventKey=${eventKey} ` +
+        `space_type=${spaceType} count=${userMapping.filtered_personal_store_count}`,
     );
   }
 
