@@ -1566,6 +1566,9 @@ async function dispatchScheduleActionMarkers(
       project,
       location,
     };
+    if (env.SCHEDULER_TOPIC_NAME) {
+      managerDeps.schedulerTopicName = env.SCHEDULER_TOPIC_NAME;
+    }
     if (env.SCHEDULER_HANDLER_TOPIC_PREFIX) {
       managerDeps.handlerTopicPrefix = env.SCHEDULER_HANDLER_TOPIC_PREFIX;
     }

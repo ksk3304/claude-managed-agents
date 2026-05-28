@@ -152,10 +152,13 @@ declare namespace Cloudflare {
      */
     GCP_SCHEDULER_LOCATION?: string;
     /**
-     * handler 名 → Pub/Sub topic 名 の組み立て prefix。`cma-scheduler-`
-     * 既定。`<prefix><handler>` で topic 名を生成する (= Cloud Run 側の
-     * 単一 topic `cma-scheduled-jobs` モデルとは別に、Cloudflare 側は
-     * handler 別 topic モデルで分けて運用する)。
+     * Scheduler job が publish する Pub/Sub topic。未設定時は既存本番と
+     * 同じ単一 topic `cma-scheduled-jobs` を使う。
+     */
+    SCHEDULER_TOPIC_NAME?: string;
+    /**
+     * Legacy override: handler 名 → Pub/Sub topic 名 の組み立て prefix。
+     * 指定時のみ `<prefix><handler>` で topic 名を生成する。
      */
     SCHEDULER_HANDLER_TOPIC_PREFIX?: string;
     /**
