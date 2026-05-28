@@ -135,4 +135,22 @@ describe('handleNaturalScheduleCommand', () => {
     expect(result.text).toBe('✅ `morning_ai_news_seto` 削除');
     expect(manager.delete_job).toHaveBeenCalledWith('morning_ai_news_seto');
   });
+
+  it('treats delete fallback for an absent job as already deleted', async () => {
+    const manager = makeManager([]);
+
+    const result = await handleNaturalScheduleCommand(
+      'このスケジュールってどのスケジュールかしらちょっとよくわかんないけど削除して削除ね',
+      manager,
+      { fallbackJobId: 'morning_ai_news_seto' },
+    );
+
+    expect(result).toMatchObject({
+      handled: true,
+      action: 'delete',
+      job_id: 'morning_ai_news_seto',
+      text: '✅ `morning_ai_news_seto` は登録一覧にありません（既に削除済み）',
+    });
+    expect(manager.delete_job).not.toHaveBeenCalled();
+  });
 });

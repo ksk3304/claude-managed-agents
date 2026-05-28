@@ -44,6 +44,14 @@ export async function handleNaturalScheduleCommand(
     target.kind === 'none' && options.fallbackJobId
       ? jobs.find((job) => job.job_id === options.fallbackJobId)
       : null;
+  if (target.kind === 'none' && options.fallbackJobId && !resolved && parsed.action === 'delete') {
+    return {
+      handled: true,
+      action: parsed.action,
+      job_id: options.fallbackJobId,
+      text: `✅ \`${options.fallbackJobId}\` は登録一覧にありません（既に削除済み）`,
+    };
+  }
   if (target.kind === 'none' && !resolved) {
     return {
       handled: true,
