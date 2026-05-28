@@ -106,7 +106,10 @@ import {
 } from '../lib/intent-detector';
 import { readUserMappingWithDefault } from '../lib/memory-attach';
 import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
-import { handleNaturalScheduleCommand } from '../lib/schedule-natural-command';
+import {
+  handleNaturalScheduleCommand,
+  isDeicticScheduleReference,
+} from '../lib/schedule-natural-command';
 import {
   buildAnthropicClient,
   chatThreadSessionKey,
@@ -371,6 +374,11 @@ export async function handleChatEvent(
   const naturalScheduleResult = await dispatchNaturalScheduleCommand(
     env,
     bodyText,
+    {
+      eventKey,
+      messageId: message.name,
+      threadName,
+    },
   );
   if (naturalScheduleResult !== null) {
     await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
@@ -1240,6 +1248,8 @@ export async function handleChatEvent(
   const scheduleResult = await dispatchScheduleActionMarkers(
     env,
     eventKey,
+    message.name,
+    threadName,
     chatPostResult.cleanedText,
   );
 
@@ -1871,6 +1881,8 @@ interface ScheduleDispatchResult {
 async function dispatchScheduleActionMarkers(
   env: Env,
   eventKey: string,
+  messageId: string,
+  threadName: string | null,
   inputText: string,
 ): Promise<ScheduleDispatchResult> {
   const saKey = env.CHAT_SA_KEY_JSON;
@@ -1896,6 +1908,29 @@ async function dispatchScheduleActionMarkers(
     const manager = createCloudSchedulerManager(managerDeps);
     const result = await handleScheduleActionMarker(inputText, manager);
     if (result.markerCount > 0) {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId,
+        eventType: 'schedule_action_marker_result',
+        source: 'chat-event-handler',
+        detail: {
+          marker_count: result.markerCount,
+          thread_name_hash: stableHash(threadName),
+          executions: result.executions,
+        },
+      });
+      for (const execution of result.executions) {
+        if (execution.ok && execution.job_id && execution.action !== 'delete') {
+          await recordScheduleCommandContext(env, {
+            eventKey,
+            messageId,
+            threadName,
+            source: 'schedule_action_marker',
+            action: execution.action,
+            jobId: execution.job_id,
+          });
+        }
+      }
       console.log(
         `[chat-event] SCHEDULE_ACTION dispatched eventKey=${eventKey} markers=${result.markerCount}`,
       );
@@ -1913,14 +1948,98 @@ async function dispatchScheduleActionMarkers(
 async function dispatchNaturalScheduleCommand(
   env: Env,
   inputText: string,
+  context: {
+    eventKey: string;
+    messageId: string;
+    threadName: string | null;
+  },
 ): Promise<string | null> {
   const manager = buildScheduleManager(env);
   if (!manager) return null;
   try {
-    const result = await handleNaturalScheduleCommand(inputText, manager);
+    const fallbackJobId = isDeicticScheduleReference(inputText)
+      ? await readLastScheduleCommandJobId(env, context.threadName)
+      : null;
+    const result = await handleNaturalScheduleCommand(inputText, manager, {
+      fallbackJobId,
+    });
+    if (result.handled) {
+      await recordRuntimeEvent(env, {
+        eventKey: context.eventKey,
+        messageId: context.messageId,
+        eventType: 'natural_schedule_command_result',
+        source: 'chat-event-handler',
+        detail: {
+          action: result.action ?? null,
+          job_id: result.job_id ?? null,
+          fallback_job_id: fallbackJobId,
+          thread_name_hash: stableHash(context.threadName),
+          text_chars: result.text.length,
+        },
+      });
+      if (result.job_id && result.action !== 'delete') {
+        await recordScheduleCommandContext(env, {
+          eventKey: context.eventKey,
+          messageId: context.messageId,
+          threadName: context.threadName,
+          source: 'natural_schedule_command',
+          action: result.action ?? 'unknown',
+          jobId: result.job_id,
+        });
+      }
+    }
     return result.handled ? result.text : null;
   } catch (err) {
     return `❌ スケジュール操作失敗: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+async function recordScheduleCommandContext(
+  env: Env,
+  input: {
+    eventKey: string;
+    messageId: string;
+    threadName: string | null;
+    source: string;
+    action: string;
+    jobId: string;
+  },
+): Promise<void> {
+  await recordRuntimeEvent(env, {
+    eventKey: input.eventKey,
+    messageId: input.messageId,
+    eventType: 'schedule_command_context',
+    source: 'chat-event-handler',
+    detail: {
+      thread_name_hash: stableHash(input.threadName),
+      source: input.source,
+      action: input.action,
+      job_id: input.jobId,
+    },
+  });
+}
+
+async function readLastScheduleCommandJobId(
+  env: Env,
+  threadName: string | null,
+): Promise<string | null> {
+  const threadHash = stableHash(threadName);
+  if (!threadHash) return null;
+  const row = await env.DB.prepare(
+    `SELECT detail_json FROM cma_worker_runtime_events
+       WHERE event_type = ?1
+         AND detail_json LIKE ?2
+       ORDER BY created_at_ms DESC
+       LIMIT 1`,
+  )
+    .bind('schedule_command_context', `%"thread_name_hash":"${threadHash}"%`)
+    .first<{ detail_json: string }>();
+  if (!row?.detail_json) return null;
+  try {
+    const detail = JSON.parse(row.detail_json) as { job_id?: unknown };
+    return typeof detail.job_id === 'string' && detail.job_id ? detail.job_id : null;
+  } catch {
+    return null;
   }
 }
 

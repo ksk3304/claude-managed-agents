@@ -244,6 +244,23 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       });
       return { results: [], meta: { changes: 1 } };
     }
+    if (
+      /^SELECT detail_json FROM cma_worker_runtime_events WHERE event_type = \?1 AND detail_json LIKE \?2 ORDER BY created_at_ms DESC LIMIT 1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [eventType, likePattern] = params as [string, string];
+      const needle = likePattern.replace(/^%/, '').replace(/%$/, '');
+      const row = [...tables.cma_worker_runtime_events]
+        .filter(
+          (r) =>
+            r.event_type === eventType &&
+            typeof r.detail_json === 'string' &&
+            r.detail_json.includes(needle),
+        )
+        .sort((a, b) => Number(b.created_at_ms) - Number(a.created_at_ms))[0];
+      return { results: row ? [{ detail_json: row.detail_json }] : [] };
+    }
     if (/^INSERT INTO cma_session_binds/i.test(trimmed)) {
       const [
         created_at_ms,

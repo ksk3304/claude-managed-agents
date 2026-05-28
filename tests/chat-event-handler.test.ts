@@ -1629,6 +1629,55 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts[0]!.text).toBe('✅ `morning_ai_news_seto` 更新 (cron=10 6 * * *)');
   });
 
+  it('natural schedule command: このスケジュール削除は同一threadの直前job_idを使う', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    schedulerMock.jobs = [
+      {
+        job_id: 'morning_ai_news_seto',
+        cron: '45 5 * * 1-5',
+        handler: 'cma_session',
+        description: '毎朝5:45 AIニュース3本 (瀬戸さんDM、平日のみ)',
+      },
+    ];
+    const threadName = 'spaces/AAA/threads/T1';
+    const previous = buildQueueMsg({
+      text: 'morning_ai_news_seto の定期実行を6時10分に変更して',
+      threadName,
+    });
+    await preClaim(env, previous.eventKey, previous.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    await handleChatEvent(env, {} as ExecutionContext, previous);
+    schedulerMock.capturedCalls.length = 0;
+    chatApiMock.posts.length = 0;
+
+    const msg = buildQueueMsg({
+      text: 'このスケジュール自体いらなくなったので削除して',
+      threadName,
+    });
+    msg.eventKey = 'chat:msgname:spaces/AAA/messages/M2';
+    msg.payload.message!.name = 'spaces/AAA/messages/M2';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(schedulerMock.capturedCalls).toContainEqual({
+      method: 'delete_job',
+      args: ['morning_ai_news_seto'],
+    });
+    expect(chatApiMock.posts[0]!.text).toBe('✅ `morning_ai_news_seto` 削除');
+    expect(
+      (env.DB as unknown as ReturnType<typeof makeMakotoDb>)._tables.cma_session_binds,
+    ).toHaveLength(0);
+    const runtimeEvents = (env.DB as unknown as ReturnType<typeof makeMakotoDb>)
+      ._tables.cma_worker_runtime_events;
+    expect(runtimeEvents.some((e) => e.event_type === 'natural_schedule_command_result')).toBe(true);
+  });
+
   it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 未設定 → dispatch skip + 既存 chat 投稿のみ', async () => {
     const env = buildEnv(); // env 未設定 (= 既存挙動)
     const msg = buildQueueMsg({});

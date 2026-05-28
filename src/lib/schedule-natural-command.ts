@@ -24,6 +24,7 @@ interface ParsedNaturalScheduleCommand {
 export async function handleNaturalScheduleCommand(
   text: string,
   manager: ScheduleJobManager,
+  options: { fallbackJobId?: string | null } = {},
 ): Promise<NaturalScheduleResult> {
   const parsed = parseNaturalScheduleCommand(text);
   if (!parsed) return { handled: false, text };
@@ -39,7 +40,11 @@ export async function handleNaturalScheduleCommand(
 
   const jobs = await manager.list_jobs();
   const target = resolveTargetJob(jobs, parsed.targetQuery);
-  if (target.kind === 'none') {
+  const resolved =
+    target.kind === 'none' && options.fallbackJobId
+      ? jobs.find((job) => job.job_id === options.fallbackJobId)
+      : null;
+  if (target.kind === 'none' && !resolved) {
     return {
       handled: true,
       action: parsed.action,
@@ -56,7 +61,7 @@ export async function handleNaturalScheduleCommand(
     };
   }
 
-  const job = target.job;
+  const job = target.kind === 'one' ? target.job : resolved!;
   if (parsed.action === 'delete') {
     await manager.delete_job(job.job_id);
     return { handled: true, action: 'delete', job_id: job.job_id, text: `✅ \`${job.job_id}\` 削除` };
@@ -92,6 +97,23 @@ export async function handleNaturalScheduleCommand(
   }
 
   return { handled: false, text };
+}
+
+export function isDeicticScheduleReference(text: string): boolean {
+  const normalized = normalizeText(text);
+  return hasAny(normalized, [
+    'このスケジュール',
+    'このジョブ',
+    'この定期',
+    'この予定',
+    'このやつ',
+    'これ',
+    'それ',
+    'さっき',
+    '先ほど',
+    '直前',
+    '当該',
+  ]);
 }
 
 export function parseNaturalScheduleCommand(

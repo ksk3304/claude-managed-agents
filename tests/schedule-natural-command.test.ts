@@ -115,4 +115,24 @@ describe('handleNaturalScheduleCommand', () => {
     expect(result.text).toContain('対象ジョブを1件に絞れません');
     expect(manager.delete_job).not.toHaveBeenCalled();
   });
+
+  it('uses fallback job id for このスケジュール references', async () => {
+    const manager = makeManager([
+      {
+        job_id: 'morning_ai_news_seto',
+        cron: '45 5 * * 1-5',
+        handler: 'cma_session',
+        description: '毎朝5:45 AIニュース3本 (瀬戸さんDM、平日のみ)',
+      },
+    ]);
+
+    const result = await handleNaturalScheduleCommand(
+      'このスケジュール自体いらなくなったので削除して',
+      manager,
+      { fallbackJobId: 'morning_ai_news_seto' },
+    );
+
+    expect(result.text).toBe('✅ `morning_ai_news_seto` 削除');
+    expect(manager.delete_job).toHaveBeenCalledWith('morning_ai_news_seto');
+  });
 });

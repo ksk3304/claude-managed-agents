@@ -122,6 +122,15 @@ export interface HandleScheduleActionResult {
   combinedText: string;
   /** 検出 marker 件数 (0 = marker 無し)。 */
   markerCount: number;
+  /** 各 marker の構造化実行結果。observability / 文脈解決用。 */
+  executions: ScheduleActionExecution[];
+}
+
+export interface ScheduleActionExecution {
+  action: string;
+  job_id?: string | undefined;
+  ok: boolean;
+  text: string;
 }
 
 /**
@@ -180,6 +189,7 @@ export async function handleScheduleActionMarker(
       results: [],
       combinedText: text,
       markerCount: 0,
+      executions: [],
     };
   }
   // Python l.1165 — 最初の marker 直前を rstrip
@@ -194,23 +204,29 @@ export async function handleScheduleActionMarker(
       results: [],
       combinedText: prefix,
       markerCount: matches.length,
+      executions: [],
     };
   }
 
   const results: string[] = [];
+  const executions: ScheduleActionExecution[] = [];
   for (const m of matches) {
     if (m.parseError) {
-      results.push(`❌ JSON parse error: ${m.parseError}`);
+      const text = `❌ JSON parse error: ${m.parseError}`;
+      results.push(text);
+      executions.push({ action: 'parse_error', ok: false, text });
       continue;
     }
-    results.push(await execScheduleAction(m.data!, manager));
+    const executed = await execScheduleAction(m.data!, manager);
+    results.push(executed.text);
+    executions.push(executed);
   }
 
   const combinedText = prefix
     ? `${prefix}\n${results.join('\n')}`
     : results.join('\n');
 
-  return { prefix, results, combinedText, markerCount: matches.length };
+  return { prefix, results, combinedText, markerCount: matches.length, executions };
 }
 
 /**
@@ -221,44 +237,56 @@ export async function handleScheduleActionMarker(
 async function execScheduleAction(
   data: ScheduleActionData,
   manager: ScheduleJobManager,
-): Promise<string> {
+): Promise<ScheduleActionExecution> {
   const action = data.action ?? '';
   const jobId = data.job_id ?? '';
+  const ok = (text: string): ScheduleActionExecution => ({
+    action: String(action),
+    job_id: jobId || undefined,
+    ok: true,
+    text,
+  });
+  const fail = (text: string): ScheduleActionExecution => ({
+    action: String(action),
+    job_id: jobId || undefined,
+    ok: false,
+    text,
+  });
   try {
     if (action === 'list') {
       const jobs = await manager.list_jobs();
-      return `✅ 定期実行ジョブ一覧:\n${manager.format_job_list(jobs)}`;
+      return ok(`✅ 定期実行ジョブ一覧:\n${manager.format_job_list(jobs)}`);
     }
     if (!jobId) {
-      return `❌ スケジュール操作失敗: job_id が未指定 (action=${action})`;
+      return fail(`❌ スケジュール操作失敗: job_id が未指定 (action=${action})`);
     }
     if (action === 'create') {
       const cron = data.cron ?? '';
       const handler = data.handler ?? 'cma_session';
       const payload = data.payload ?? {};
       const description = data.description ?? '';
-      if (!cron) return `❌ \`${jobId}\`: cron が未指定`;
+      if (!cron) return fail(`❌ \`${jobId}\`: cron が未指定`);
       if (await manager.get_job(jobId)) {
-        return `❌ \`${jobId}\`: 既に存在 (削除してから再作成 or update で更新)`;
+        return fail(`❌ \`${jobId}\`: 既に存在 (削除してから再作成 or update で更新)`);
       }
       await manager.create_job(jobId, cron, handler, payload, { description });
-      return `✅ \`${jobId}\` 登録 (${cron}, ${description})`;
+      return ok(`✅ \`${jobId}\` 登録 (${cron}, ${description})`);
     }
     if (action === 'pause') {
       await manager.pause_job(jobId);
-      return `✅ \`${jobId}\` 一時停止`;
+      return ok(`✅ \`${jobId}\` 一時停止`);
     }
     if (action === 'resume') {
       await manager.resume_job(jobId);
-      return `✅ \`${jobId}\` 再開`;
+      return ok(`✅ \`${jobId}\` 再開`);
     }
     if (action === 'delete') {
       await manager.delete_job(jobId);
-      return `✅ \`${jobId}\` 削除`;
+      return ok(`✅ \`${jobId}\` 削除`);
     }
     if (action === 'run_once') {
       await manager.run_job_once(jobId);
-      return `✅ \`${jobId}\` 即時実行`;
+      return ok(`✅ \`${jobId}\` 即時実行`);
     }
     if (action === 'update') {
       const patch: {
@@ -277,12 +305,12 @@ async function execScheduleAction(
       if (patch.description) updated.push(`desc=${patch.description}`);
       if (patch.payload) updated.push('payload更新');
       if (patch.handler) updated.push(`handler=${patch.handler}`);
-      return `✅ \`${jobId}\` 更新 (${updated.join(', ')})`;
+      return ok(`✅ \`${jobId}\` 更新 (${updated.join(', ')})`);
     }
-    return `❌ 不明なアクション: ${action}`;
+    return fail(`❌ 不明なアクション: ${action}`);
   } catch (exc) {
     const errName = (exc as Error).name ?? 'Error';
     const errMsg = (exc as Error).message ?? String(exc);
-    return `❌ \`${jobId || action}\`: ${errName}: ${errMsg}`;
+    return fail(`❌ \`${jobId || action}\`: ${errName}: ${errMsg}`);
   }
 }
