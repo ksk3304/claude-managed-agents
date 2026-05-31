@@ -431,28 +431,24 @@ export async function handleChatEvent(
     }
 
   // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
-  // shared space + thread reply、または DM の mail confirmation reply 時のみ
+  // shared space / DM とも thread reply なら
   // thread の過去 message を fetch して
   // envelope の history 層に渡す (= mutating bodyText せず、orchestrator 側
   // `buildUserMessageEnvelope({history})` で Python l.4195 と byte 等価に連結)。
-  // DM は通常 skip (= 1 対 1 session memory でカバー) だが、
-  // 「はい、お願いします」だけでは mail intent が出ないため、mail draft
-  // confirmation らしい短文の時だけ history を渡す。fetch failure は WARN +
-  // 空 fallback で従来挙動を破壊しない。permanent failure (連続 3 回失敗)
-  // 後は KV mark で skip。
+  // DM も人間からは同じ Chat thread として見えるため、CMA session 継続だけに
+  // 頼らず、共有スペース同様に履歴を渡す。fetch failure は WARN + 空 fallback
+  // で従来挙動を破壊しない。permanent failure (連続 3 回失敗) 後は KV mark で skip。
   //
   // Issue #186 既知 #6 (speaker-gate 完全実装): 履歴に未登録 chat_user_id が
   // 存在した場合は `hasUnresolvedSpeakers=true` を立て、後段 7b の
   // CHAT_POST dispatch を gate する (= Python `_compute_chat_post_gate` +
   // `_strip_chat_post_on_unresolved` 等価)。fetch 失敗時は false を維持し
-  // 旧挙動 (= 履歴なし → gate しない) を破壊しない。DM では shared space
-  // 履歴自体存在しないため、初期値 false のまま CHAT_POST も自然に通る。
+  // 旧挙動 (= 履歴なし → gate しない) を破壊しない。
   let hasUnresolvedSpeakers = false;
   let historyBlock = '';
   const shouldFetchHistory =
     threadName !== null &&
-    canFetchThreadHistory(env) &&
-    (!isDm || isMailSendApprovalText(bodyText));
+    canFetchThreadHistory(env);
   if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {

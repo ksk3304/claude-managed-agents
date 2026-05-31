@@ -498,6 +498,12 @@ describe('handleChatEvent', () => {
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
       }
+      if (url.startsWith('https://chat.googleapis.com/v1/spaces/AAA/messages')) {
+        return new Response(JSON.stringify({ messages: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (url.startsWith('https://chat.googleapis.com/v1/media/')) {
         return new Response(fakePdf, {
           status: 200,
@@ -528,10 +534,9 @@ describe('handleChatEvent', () => {
       expect(runtimeEvents).toContain('pdf_preflight_result');
       expect(runtimeEvents).not.toContain('prompt_envelope_built');
       expect(runtimeEvents).not.toContain('cma_session_created');
-      expect(fetchMock.calls.map((c) => c.url)).toEqual([
-        'https://oauth2.googleapis.com/token',
+      expect(fetchMock.calls.map((c) => c.url)).toContain(
         'https://chat.googleapis.com/v1/media/spaces/AAA/messages/M1/attachments/A1?alt=media',
-      ]);
+      );
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -588,6 +593,12 @@ describe('handleChatEvent', () => {
           JSON.stringify({ access_token: 'test-token', expires_in: 3600, token_type: 'Bearer' }),
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/spaces/AAA/messages')) {
+        return new Response(JSON.stringify({ messages: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       }
       if (url.startsWith('https://chat.googleapis.com/v1/media/')) {
         return new Response(fakePdf, {
@@ -725,6 +736,86 @@ describe('handleChatEvent', () => {
       expect(payloadText).toContain('「こんにちはメール」は件名「こんにちは」、本文「こんにちは」で足りる');
       expect(amCalls).toHaveLength(1);
       expect(chatApiMock.patches.at(-1)?.text).toContain('✅ メール送信完了');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('DM thread history is fetched and included like shared space history', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCHAT_OAUTH_REFRESH_TOKEN_SEED: 'seed-refresh-token',
+        GCHAT_OAUTH_CLIENT_ID: 'chat-client-id.apps.googleusercontent.com',
+        GCHAT_OAUTH_CLIENT_SECRET: 'chat-client-secret',
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      },
+    });
+    const msg = buildQueueMsg({
+      spaceType: 'DM',
+      spaceName: 'spaces/DM1',
+      threadName: 'spaces/DM1/threads/T1',
+      text: '適当に返しといて',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_dm_history',
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: '履歴を見て返信します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const calls: Array<{ url: string; auth?: string; body?: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      calls.push({
+        url,
+        auth: (init.headers as Record<string, string> | undefined)?.Authorization,
+        body: typeof init.body === 'string' ? init.body : undefined,
+      });
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({
+            access_token: 'user-oauth-access-token',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('https://chat.googleapis.com/v1/spaces/DM1/messages')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                name: 'spaces/DM1/messages/BOT_NOTICE',
+                text: '📨 新規問い合わせ (cold inbound)\nFrom: Keisuke Seto <k.seto@makotoprime.com>\n件名: test06010820\n本文 preview:\ntest',
+                sender: { name: 'users/BOT', type: 'BOT' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      const historyCall = calls.find((c) =>
+        c.url.startsWith('https://chat.googleapis.com/v1/spaces/DM1/messages'),
+      );
+      expect(historyCall?.auth).toBe('Bearer user-oauth-access-token');
+      expect(payloads).toHaveLength(1);
+      const payloadText = JSON.stringify(payloads[0]);
+      expect(payloadText).toContain('## スレッド過去履歴');
+      expect(payloadText).toContain('📨 新規問い合わせ (cold inbound)');
+      expect(payloadText).toContain('test06010820');
+      expect(payloadText).toContain('適当に返しといて');
     } finally {
       globalThis.fetch = origFetch;
     }
