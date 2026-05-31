@@ -148,6 +148,15 @@ export interface BuildUserMessageEnvelopeOptions {
 // internal helpers
 // ---------------------------------------------------------------------------
 
+export const MAIL_INTENT_INSTRUCTIONS =
+  '<mail_intent_instructions>\n' +
+  'このターンはメール送信意図として扱う。\n' +
+  '- 宛先・件名・本文が揃う、または宛先と明確な内容名がある場合は、送信前確認を挟まず EMAIL_SEND マーカーを1つ出す。\n' +
+  '- 「こんにちはメール」「お礼メール」「確認メール」などの短い内容名は、件名と本文の素材として使う。「こんにちはメール」は件名「こんにちは」、本文「こんにちは」で足りる。\n' +
+  '- 宛先が無い場合、または件名/内容/本文の素材が何も無い場合だけ、不足項目を聞き返す。\n' +
+  '- 宛先・cc・bcc は推測しない。\n' +
+  '</mail_intent_instructions>';
+
 /**
  * speaker block を最小 `<context>...</context>` で組み立てる。
  *
@@ -183,6 +192,11 @@ function buildIntentSegment(intent: IntentEnvelopeOption | undefined): string {
   const source = intent.source ? ` source=${intent.source}` : '';
   const actionSkill = intent.isActionSkill ? ` action_skill=true` : '';
   return `<intent>command=${command}${source}${actionSkill}</intent>`;
+}
+
+function buildMailIntentInstructionSegment(intent: IntentEnvelopeOption | undefined): string {
+  if ((intent?.command || '').trim() !== '/mail') return '';
+  return MAIL_INTENT_INSTRUCTIONS;
 }
 
 /**
@@ -265,6 +279,11 @@ export function buildUserMessageEnvelope(
   const intentSeg = buildIntentSegment(opts.intent);
   if (intentSeg) {
     segments.push(intentSeg);
+  }
+
+  const mailIntentInstructions = buildMailIntentInstructionSegment(opts.intent);
+  if (mailIntentInstructions) {
+    segments.push(mailIntentInstructions);
   }
 
   // 3. speaker context (= 旧 `<context>` 等価 + Python `_build_space_context_block`)
