@@ -358,6 +358,8 @@ function buildQueueMsg(overrides: {
   threadName?: string | null;
   text?: string;
   senderEmail?: string;
+  senderName?: string;
+  senderDisplayName?: string;
   senderType?: string;
   annotations?: Array<{
     type?: string;
@@ -380,12 +382,13 @@ function buildQueueMsg(overrides: {
       message: {
         name: 'spaces/AAA/messages/M1',
         sender: {
-          name: 'users/U1',
+          name: overrides.senderName ?? 'users/U1',
           ...(overrides.senderEmail !== undefined
             ? { email: overrides.senderEmail }
             : { email: 'alice@example.com' }),
+          ...(overrides.senderDisplayName ? { displayName: overrides.senderDisplayName } : {}),
           ...(overrides.senderType ? { type: overrides.senderType } : {}),
-        } as { name: string; email?: string; type?: string },
+        } as { name: string; email?: string; displayName?: string; type?: string },
         text: overrides.text ?? 'お疲れさまです',
         ...(overrides.threadName !== undefined && overrides.threadName !== null
           ? { thread: { name: overrides.threadName } }
@@ -1595,6 +1598,76 @@ describe('handleChatEvent', () => {
       .map((row) => JSON.parse(String(row.detail_json)).tool_family)
       .sort();
     expect(families).toEqual(['CHAT_POST', 'EMAIL_SEND', 'SCHEDULE_ACTION']);
+  });
+
+  it('auto pending sender mapping は chat 専用 prefix に作成し外部ツールを gate する', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        DEFAULT_USER_SLUG: 'guest',
+        CHAT_AUTO_PENDING_USER_MAPPING_ENABLED: '1',
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({
+      senderEmail: 'Intern@Example.com',
+      senderName: 'users/777',
+      senderDisplayName: 'Intern User',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await env.MAKOTO_KV.put(
+      'user_mapping:guest',
+      JSON.stringify({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        memory_attachments: [],
+      }),
+    );
+
+    installFakeAnthropic({
+      sessionId: 'sesn_auto_pending',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '初回ユーザーにも応答します。\n' +
+            'EMAIL_SEND:{"to":"a@example.com","subject":"s","body":"b"}\n' +
+            'CHAT_POST:{"space":"spaces/OTHER","text":"別投稿"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    const kv = env.MAKOTO_KV as unknown as {
+      _store: Map<string, { value: string; metadata?: unknown }>;
+    };
+    expect(kv._store.has('user_mapping:intern@example.com')).toBe(false);
+    expect(kv._store.has('chat_pending_user_mapping:email:intern@example.com')).toBe(true);
+    expect(kv._store.has('chat_pending_user_mapping:user:users%2F777')).toBe(true);
+    const pending = JSON.parse(
+      kv._store.get('chat_pending_user_mapping:email:intern@example.com')!.value,
+    );
+    expect(pending).toMatchObject({
+      user_slug: 'guest',
+      agent_id: 'agent_default',
+      auto_registered: true,
+      actor_trusted: false,
+      chat_user_id: 'users/777',
+      display_name: 'Intern User',
+      mapping_source: 'chat_auto_pending',
+    });
+    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(false);
+    expect(chatApiMock.patches[0]!.text).toContain('初回ユーザーにも応答します');
+    expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
+
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    expect(runtimeEvents.some((row) => row.event_type === 'chat_auto_pending_user_mapping')).toBe(
+      true,
+    );
   });
 
   it('Case 14c: user_mapping 不在 + DEFAULT_USER_SLUG 未設定 → 従来の unknown_sender skip (回帰防止)', async () => {
