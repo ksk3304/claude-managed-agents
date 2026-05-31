@@ -128,18 +128,8 @@ import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
 import { recordRuntimeEvent, stableHash } from '../lib/observability';
+import { postChatPlaceholder } from '../lib/chat-placeholder';
 
-/**
- * Placeholder text — Cloud Run `cma_lib.py:send_placeholder:l.3718` /
- * `cma_gchat_bot.py:l.3921` で hard-coded された `"... MAKOTOくんが入力中"`
- * を byte 等価で port (env / config 由来ではない hard-coded literal)。
- *
- * 役割: session.create + LLM stream (= 24-45 秒) の前に短い ack を Chat
- * に POST し、Google Chat client の「MAKOTOくん から応答ありません」
- * timeout 表示を抑止する。完了後に `updateChatMessage` で書き換え、
- * 失敗時に `deleteChatMessage` で残骸 cleanup する (#186 UX 致命傷)。
- */
-const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 
 /**
@@ -192,6 +182,7 @@ export async function handleChatEvent(
   void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
 
   const { eventKey, claim, payload } = body;
+  const ingressPlaceholderName = body.placeholderName ?? '';
   await recordRuntimeEvent(env, {
     eventKey,
     messageId: payload.message?.name ?? null,
@@ -206,6 +197,7 @@ export async function handleChatEvent(
     console.warn(
       `[chat-event] lost_claim eventKey=${eventKey} owner=${claim.owner} version=${claim.version}`,
     );
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     return { kind: 'skipped', reason: 'lost_claim' };
   }
 
@@ -213,6 +205,7 @@ export async function handleChatEvent(
   const message = payload.message;
   if (!message) {
     console.warn(`[chat-event] no message field eventKey=${eventKey}`);
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_message' };
   }
@@ -222,6 +215,7 @@ export async function handleChatEvent(
   if (senderType === 'BOT') {
     // bot 自身の投稿 (= echo 防止)
     console.log(`[chat-event] skip BOT sender eventKey=${eventKey}`);
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'bot_sender' };
   }
@@ -243,6 +237,7 @@ export async function handleChatEvent(
     console.log(
       `[chat-event] skip non-mention eventKey=${eventKey} space=${spaceName} type=${spaceType}`,
     );
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'not_for_bot' };
   }
@@ -258,7 +253,7 @@ export async function handleChatEvent(
         '（メンションのみで本文がありません。直前のスレッドの文脈に沿って応答してください）';
     } else {
       // Cloud Run l.3895-3902 同等: 空メッセージはその旨を投稿して終了
-      await safePost(env, spaceName, '（空メッセージ）', threadName, eventKey);
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, '（空メッセージ）', threadName, eventKey);
       await safeCommit(env, eventKey, claim);
       return { kind: 'committed' };
     }
@@ -268,6 +263,7 @@ export async function handleChatEvent(
   const senderEmail = ((sender as { email?: string }).email || '').trim().toLowerCase();
   if (!senderEmail) {
     console.warn(`[chat-event] no sender email eventKey=${eventKey}`);
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_sender_email' };
   }
@@ -288,6 +284,7 @@ export async function handleChatEvent(
     console.warn(
       `[chat-event] unknown_sender eventKey=${eventKey} email=${redactPiiInText(senderEmail)}`,
     );
+    if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
@@ -310,7 +307,7 @@ export async function handleChatEvent(
         guardDeps: { kv: env.MAKOTO_KV },
       },
     );
-    await safePost(env, spaceName, cgText, threadName, eventKey);
+    await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, cgText, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
     console.log(
       `[chat-event] /costguard handled eventKey=${eventKey} sub=${cgCommand.subcommand}`,
@@ -328,7 +325,7 @@ export async function handleChatEvent(
       console.log(
         `[chat-event] slash decided eventKey=${eventKey} source=${slashOutcome.source} chars=${slashOutcome.text.length}`,
       );
-      await safePost(env, spaceName, slashOutcome.text, threadName, eventKey);
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, slashOutcome.text, threadName, eventKey);
       await safeCommit(env, eventKey, claim);
       return { kind: 'committed' };
     }
@@ -372,7 +369,7 @@ export async function handleChatEvent(
       { threadSessionKey, text: bodyText },
     );
     if (pendingCostApproval.kind === 'reply') {
-      await safePost(env, spaceName, pendingCostApproval.text, threadName, eventKey);
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, pendingCostApproval.text, threadName, eventKey);
       await safeCommit(env, eventKey, claim);
       console.log(
         `[chat-event] cost_guard_session_approval handled eventKey=${eventKey} ` +
@@ -648,7 +645,16 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey, claim);
+  const placeholderName =
+    ingressPlaceholderName ||
+    await postChatPlaceholder(env, {
+      spaceName,
+      threadName,
+      eventKey,
+      messageId: message.name,
+      claim,
+      source: 'chat-event-handler',
+    });
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -1694,96 +1700,19 @@ async function safePost(
   }
 }
 
-/**
- * placeholder POST helper (#186 UX 致命傷 fix)。Cloud Run
- * `cma_lib.py:send_placeholder:l.3674-3720` の Worker port (Firestore 連動
- * の dedupe state commit は省略 — Workers 側 dedupe は `confirmOwner` /
- * `commitDone` が別軸で担保するため、placeholder POST 結果の `name` だけ
- * 取れれば PATCH update / DELETE cleanup には十分)。
- *
- * 戻り値: 成功時 message resource name (`spaces/.../messages/...`)、失敗時
- * 空文字。caller 側は空文字なら従来の新規 POST 経路に fallback する。
- */
-async function safePostPlaceholder(
+async function replyToCurrentSpace(
   env: Env,
+  placeholderName: string,
   spaceName: string,
+  text: string,
   threadName: string | null,
   eventKey: string,
-  claim: { owner: string; version: number },
-): Promise<string> {
-  const saKey = env.CHAT_SA_KEY_JSON;
-  if (!saKey) {
-    console.warn(
-      `[chat-event] placeholder POST skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
-    );
-    return '';
+): Promise<void> {
+  if (placeholderName) {
+    await safeUpdateOrPost(env, placeholderName, spaceName, text, threadName, eventKey);
+    return;
   }
-  if (!spaceName) {
-    console.warn(`[chat-event] placeholder POST skipped eventKey=${eventKey} empty space`);
-    return '';
-  }
-  try {
-    // 3-stage precheck wrap (Python `cma_lib.py:send_placeholder` 等価)。
-    // 同一 (eventKey, kind='placeholder', target=`${spaceName}:${threadName}`)
-    // 既送信なら ALREADY → 二重 placeholder POST を構造的に防ぐ。
-    const outcome = await executeWithCommit({
-      env,
-      parentEventKey: eventKey,
-      parentOwner: claim.owner,
-      kind: 'placeholder',
-      target: `${spaceName}:${threadName ?? ''}`,
-      sendFn: async () => {
-        // thread reply 時は `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
-        // を必須付与 (= safePost と同様、Python `_reply_to_chat:l.1247-1249` 等価)。
-        return await postChatMessage(
-          { saKeyJson: saKey },
-          spaceName,
-          PLACEHOLDER_TEXT,
-          threadName
-            ? {
-                threadName,
-                threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
-              }
-            : {},
-        );
-      },
-    });
-    if (outcome.outcome === 'sent') {
-      return outcome.result.name;
-    }
-    if (outcome.outcome === 'already') {
-      // 別 worker (or 同 worker のリトライ) が既に placeholder を POST 済。
-      // 既送信 message name は本 wrapper では返せない (= side-effect log には
-      // result を保持していない) ため、PATCH 経路には進めず空文字を返して
-      // 「placeholder なし」扱いで進める (= 旧経路 = 新規 POST fallback)。
-      console.log(
-        `[chat-event] placeholder POST already sent eventKey=${eventKey} space=${spaceName} — skipping`,
-      );
-      return '';
-    }
-    if (outcome.outcome === 'lease_alive') {
-      console.warn(
-        `[chat-event] placeholder POST in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
-      );
-      return '';
-    }
-    // lease_lost: heartbeat dead before send, or commit fence drifted
-    console.warn(
-      `[chat-event] placeholder POST lease lost eventKey=${eventKey} space=${spaceName}`,
-    );
-    return '';
-  } catch (err) {
-    const reason =
-      err instanceof ChatApiError
-        ? `chat_api_${err.status}`
-        : err instanceof Error
-          ? err.message
-          : String(err);
-    console.warn(
-      `[chat-event] placeholder POST fail eventKey=${eventKey} space=${spaceName}: ${reason}`,
-    );
-    return '';
-  }
+  await safePost(env, spaceName, text, threadName, eventKey);
 }
 
 /**

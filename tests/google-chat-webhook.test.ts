@@ -16,7 +16,7 @@
  *     を使って拒否されることを確認する。
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   SignJWT,
   generateKeyPair,
@@ -36,6 +36,29 @@ import { makeFakeQueue, makeMakotoDb } from './makoto-helpers';
 const PROJECT_NUMBER = '192588613210';
 const ISSUER = 'accounts.google.com';
 const JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+
+const chatApiMock = {
+  posts: [] as Array<{ spaceName: string; text: string; opts: unknown }>,
+  deletes: [] as string[],
+};
+vi.mock('../src/lib/chat-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/chat-api')>();
+  return {
+    ...actual,
+    postChatMessage: async (
+      _deps: unknown,
+      spaceName: string,
+      text: string,
+      opts: unknown = {},
+    ) => {
+      chatApiMock.posts.push({ spaceName, text, opts });
+      return { name: `${spaceName}/messages/placeholder_${chatApiMock.posts.length}` };
+    },
+    deleteChatMessage: async (_deps: unknown, messageName: string) => {
+      chatApiMock.deletes.push(messageName);
+    },
+  };
+});
 
 interface KeyFixture {
   kid: string;
@@ -150,6 +173,17 @@ function makeMessageEvent(messageName: string): ChatEventPayload {
   };
 }
 
+function makeDmMessageEvent(messageName: string): ChatEventPayload {
+  return {
+    ...makeMessageEvent(messageName),
+    space: { name: 'spaces/DM_X', type: 'DM', displayName: 'DM' },
+    message: {
+      ...makeMessageEvent(messageName).message,
+      thread: { name: 'spaces/DM_X/threads/THREAD_X' },
+    },
+  };
+}
+
 function buildRequest(body: string, authzValue: string | null): Request {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -166,6 +200,8 @@ describe('google-chat webhook handler', () => {
   let origFetch: typeof fetch;
   beforeEach(() => {
     origFetch = globalThis.fetch;
+    chatApiMock.posts.length = 0;
+    chatApiMock.deletes.length = 0;
     _resetPublicKeyCacheForTesting();
   });
   afterEach(() => {
@@ -195,6 +231,26 @@ describe('google-chat webhook handler', () => {
     // dedupe row exists with no committed_at_ms (= Phase B が confirmOwner で読む)
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, unknown> } })._tables.dedupe;
     expect(dedupe.has('chat:msgname:spaces/A/messages/M1')).toBe(true);
+  });
+
+  it('posts ingress placeholder before Queue enqueue for DM and passes message name', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const env = envWith({ CHAT_SA_KEY_JSON: '{}' });
+    const jwt = await signJwt(fixture);
+    const body = JSON.stringify(makeDmMessageEvent('spaces/DM_X/messages/M1'));
+    const req = buildRequest(body, `Bearer ${jwt}`);
+
+    const resp = await handleGoogleChatWebhook(req, env);
+    expect(resp.status).toBe(200);
+
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.spaceName).toBe('spaces/DM_X');
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+
+    const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.placeholderName).toBe('spaces/DM_X/messages/placeholder_1');
   });
 
   it('200 + skipped on non-MESSAGE event (ADDED_TO_SPACE)', async () => {
@@ -344,6 +400,34 @@ describe('google-chat webhook handler', () => {
       _tables: { dedupe: Map<string, { lease_expires_at_ms: number }> };
     })._tables.dedupe.get('chat:msgname:spaces/A/messages/M1');
     expect(row?.lease_expires_at_ms).toBe(0);
+  });
+
+  it('deletes ingress placeholder when Queue enqueue fails', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const failingQueue = {
+      async send(): Promise<void> {
+        throw new Error('queue down');
+      },
+      async sendBatch(): Promise<void> {
+        throw new Error('queue down');
+      },
+    } as unknown as Queue<ChatQueueMessage>;
+    const env = envWith({
+      CHAT_SA_KEY_JSON: '{}',
+      MAKOTO_CHAT_QUEUE: failingQueue,
+    } as Partial<Env>);
+    const jwt = await signJwt(fixture);
+    const body = JSON.stringify(makeDmMessageEvent('spaces/DM_X/messages/QFAIL'));
+
+    const resp = await handleGoogleChatWebhook(
+      buildRequest(body, `Bearer ${jwt}`),
+      env,
+    );
+
+    expect(resp.status).toBe(500);
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.deletes).toEqual(['spaces/DM_X/messages/placeholder_1']);
   });
 
   it('401 when JWT kid is not present in fetched key set', async () => {

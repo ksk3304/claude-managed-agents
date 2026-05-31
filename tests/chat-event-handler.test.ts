@@ -296,12 +296,14 @@ function buildQueueMsg(overrides: {
     userMention?: { user?: { name?: string; type?: string } };
   }>;
   attachment?: ChatQueueMessage['payload']['message']['attachment'];
+  placeholderName?: string;
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
     eventKey: 'chat:msgname:spaces/AAA/messages/M1',
     receivedAtMs: Date.now(),
     claim: { owner: 'w1-uuid', version: 1 },
+    ...(overrides.placeholderName ? { placeholderName: overrides.placeholderName } : {}),
     payload: {
       type: 'MESSAGE',
       eventTime: '2026-05-26T08:00:00Z',
@@ -1402,6 +1404,29 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).toBe('応答完了テキスト');
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
     // DELETE は呼ばれない (失敗経路ではない)
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('ingress placeholder reuse: queue skips duplicate POST and PATCHes supplied message', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ placeholderName: 'spaces/AAA/messages/ingress_1' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_ph_ingress',
+      events: [
+        { type: 'agent.message.text', text: '先行プレースホルダー再利用OK' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_1');
+    expect(chatApiMock.patches[0]!.text).toBe('先行プレースホルダー再利用OK');
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
