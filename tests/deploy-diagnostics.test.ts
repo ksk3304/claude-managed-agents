@@ -27,4 +27,8 @@ describe("deploy diagnostics", () => {
       "No extra diagnosis matched",
     );
   });
+
+  it("can be imported by tests without running deploy", () => {
+    expect(typeof buildDeployFailureMessage).toBe("function");
+  });
 });
