@@ -109,8 +109,10 @@ declare namespace Cloudflare {
      * Used by `src/lib/cost-guard-command.ts:handleCostGuardCommand`.
      *
      * Provisioned via `wrangler secret put COST_GUARD_ADMIN_EMAILS`.
-     */
+    */
     COST_GUARD_ADMIN_EMAILS?: string;
+    /** Emergency kill-switch. `false` / `0` / `no` / `off` disables Cost Guard regardless of D1 overlay. */
+    COST_GUARD_ENABLED?: string;
     /** Per-session confirmation thresholds in USD CSV. Default: `8,12,16`. */
     COST_GUARD_SESSION_THRESHOLDS_USD?: string;
     /** USD increment after the last explicit threshold. Default: `4`. */

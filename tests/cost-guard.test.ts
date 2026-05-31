@@ -35,6 +35,7 @@ const {
   KIND_CHAT_POST,
   KIND_EXTERNAL_API_CALL,
   PREFIX,
+  resetCostGuardConfigCacheForTest,
 } = _internals;
 
 function fixedNow(iso: string): () => Date {
@@ -51,11 +52,14 @@ function makeDeps(overrides: Partial<CostGuardDeps> = {}): CostGuardDeps {
 
 function makeCostGuardDb(): D1Database & {
   _rows: Map<string, { kind: string; bucket: string; value: number }>;
+  _config: Map<string, Record<string, unknown>>;
 } {
   const rows = new Map<string, { kind: string; bucket: string; value: number }>();
+  const config = new Map<string, Record<string, unknown>>();
   const keyFor = (kind: string, bucket: string) => `${kind}:${bucket}`;
   return {
     _rows: rows,
+    _config: config,
     prepare(sql: string) {
       let params: unknown[] = [];
       const stmt = {
@@ -64,6 +68,10 @@ function makeCostGuardDb(): D1Database & {
           return stmt;
         },
         async first<T>() {
+          if (/^SELECT enabled, paused_until_ms, limits_json/i.test(sql.trim())) {
+            const [id] = params as [string];
+            return (config.get(id) as T) ?? null;
+          }
           if (/^SELECT value FROM cost_guard_counters/i.test(sql.trim())) {
             const [kind, bucket] = params as [string, string];
             const row = rows.get(keyFor(kind, bucket));
@@ -94,6 +102,7 @@ function makeCostGuardDb(): D1Database & {
     dump: async () => new ArrayBuffer(0),
   } as unknown as D1Database & {
     _rows: Map<string, { kind: string; bucket: string; value: number }>;
+    _config: Map<string, Record<string, unknown>>;
   };
 }
 
@@ -286,6 +295,66 @@ describe('checkBudget', () => {
     const status = await checkBudget(deps);
     expect(status.current.externalApiDailyCount).toBe(1);
     expect(status.exceeded).toContain('externalApiDailyCount');
+  });
+
+  it('applies D1 config hard-cap overlay and disabled state', async () => {
+    const db = makeCostGuardDb();
+    db._config.set('global', {
+      enabled: 0,
+      paused_until_ms: null,
+      limits_json: JSON.stringify({ chatDailyCount: 1 }),
+      updated_by: 'admin@example.com',
+      updated_at_ms: 123,
+      change_seq: 4,
+    });
+    const deps = makeDeps({ db });
+    await incrementCounter(deps, KIND_CHAT_POST, 2);
+    const status = await checkBudget(deps);
+    expect(status.limit.chatDailyCount).toBe(1);
+    expect(status.config.enabled).toBe(false);
+    expect(status.config.changeSeq).toBe(4);
+    expect(status.exceeded).toEqual([]);
+  });
+
+  it('falls back to KV/defaults when D1 tables are unavailable', async () => {
+    resetCostGuardConfigCacheForTest();
+    const kv = makeKv();
+    await kv.put(`${PREFIX}:chat_post:2026-05-15`, JSON.stringify({ v: 7 }));
+    const db = {
+      prepare() {
+        throw new Error('no such table');
+      },
+    } as unknown as D1Database;
+    const status = await checkBudget(makeDeps({ db, kv }));
+    expect(status.current.chatDailyCount).toBe(7);
+    expect(status.limit.chatDailyCount).toBe(DEFAULT_LIMITS.chatDailyCount);
+    expect(status.config.source).toBe('default');
+  });
+
+  it('does not honor stale disabled/pause/raised limits after D1 read failure', async () => {
+    resetCostGuardConfigCacheForTest();
+    const kv = makeKv();
+    await kv.put(`${PREFIX}:chat_post:2026-05-15`, JSON.stringify({ v: 1 }));
+    const db = makeCostGuardDb();
+    db._config.set('global', {
+      enabled: 0,
+      paused_until_ms: Date.parse('2026-05-15T13:00:00Z'),
+      limits_json: JSON.stringify({ chatDailyCount: 999 }),
+      updated_by: 'admin@example.com',
+      updated_at_ms: 123,
+      change_seq: 4,
+    });
+    await checkBudget(makeDeps({ db, kv, limits: { chatDailyCount: 1 } }));
+
+    (db as unknown as { prepare: D1Database['prepare'] }).prepare = () => {
+      throw new Error('temporary d1 outage');
+    };
+    const status = await checkBudget(makeDeps({ db, kv, limits: { chatDailyCount: 1 } }));
+    expect(status.config.source).toBe('stale');
+    expect(status.config.enabled).toBe(true);
+    expect(status.config.paused).toBe(false);
+    expect(status.limit.chatDailyCount).toBe(1);
+    expect(status.exceeded).toEqual(['chatDailyCount']);
   });
 });
 

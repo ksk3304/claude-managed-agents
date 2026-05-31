@@ -91,6 +91,8 @@ export interface CostLimits {
   externalApiDailyCount: number;
 }
 
+export type CostLimitKey = keyof CostLimits;
+
 export const DEFAULT_LIMITS: CostLimits = {
   anthropicMonthlyCalls: 10_000,
   anthropicMonthlyUsd: 300,
@@ -111,6 +113,8 @@ export interface CostGuardDeps {
   operatorSpace?: string;
   /** 予算 override (default は DEFAULT_LIMITS)。 */
   limits?: Partial<CostLimits>;
+  /** Emergency kill-switch equivalent to Cloud Run COST_GUARD_ENABLED=false. */
+  enabledEnv?: string;
   /** clock override (tests)。 */
   now?: () => Date;
 }
@@ -128,6 +132,7 @@ export interface SessionCostGuardConfig {
 
 export interface SessionCostGuardDeps {
   kv: KVNamespace;
+  db?: D1Database;
   now?: () => Date;
   config?: Partial<SessionCostGuardConfig>;
 }
@@ -185,6 +190,44 @@ export interface BudgetStatus {
     | 'chatDailyCount'
     | 'externalApiDailyCount'
   >;
+  config: CostGuardConfigStatus;
+}
+
+export interface CostGuardConfigStatus {
+  enabled: boolean;
+  paused: boolean;
+  pausedUntilIso: string | null;
+  source: 'd1' | 'default' | 'stale';
+  changeSeq: number;
+  limitsSource: Partial<Record<CostLimitKey, 'd1' | 'default'>>;
+}
+
+export interface CostGuardConfig {
+  enabled: boolean | null;
+  pausedUntilMs: number | null;
+  limits: Partial<CostLimits>;
+  updatedBy: string | null;
+  updatedAtMs: number | null;
+  changeSeq: number;
+  source: 'd1' | 'default' | 'stale';
+}
+
+export interface CostGuardConfigPatch {
+  enabled?: boolean | null;
+  pausedUntilMs?: number | null;
+  limits?: Partial<CostLimits>;
+}
+
+export interface CostGuardMutationResult {
+  before: CostGuardConfig;
+  after: CostGuardConfig;
+}
+
+export class CostGuardConfigConflictError extends Error {
+  constructor() {
+    super('cost guard config changed; re-run command');
+    this.name = 'CostGuardConfigConflictError';
+  }
 }
 
 /**
@@ -326,7 +369,8 @@ async function readCounterRaw(kv: KVNamespace, key: string): Promise<number> {
  * (`exceeded=[]`)。
  */
 export async function checkBudget(deps: CostGuardDeps): Promise<BudgetStatus> {
-  const limit = resolveLimits(deps.limits);
+  const config = await readCostGuardConfig(deps);
+  const limit = resolveEffectiveLimits(deps.limits, config);
   const [anthropicCalls, costUsd, chatCount, externalApiCount] = await Promise.all([
     readCounter(deps, KIND_ANTHROPIC_CALL),
     readCounter(deps, KIND_ANTHROPIC_COST_USD),
@@ -340,19 +384,169 @@ export async function checkBudget(deps: CostGuardDeps): Promise<BudgetStatus> {
     externalApiDailyCount: externalApiCount,
   };
   const exceeded: BudgetStatus['exceeded'] = [];
-  if (current.anthropicMonthlyCalls >= limit.anthropicMonthlyCalls) {
-    exceeded.push('anthropicMonthlyCalls');
+  const staleConfig = config.source === 'stale';
+  const enabled = !isEnvDisabled(deps.enabledEnv)
+    && (staleConfig ? true : config.enabled !== false);
+  const paused = !staleConfig
+    && config.pausedUntilMs !== null
+    && config.pausedUntilMs > now(deps).getTime();
+  if (enabled && !paused) {
+    if (current.anthropicMonthlyCalls >= limit.anthropicMonthlyCalls) {
+      exceeded.push('anthropicMonthlyCalls');
+    }
+    if (current.anthropicMonthlyUsd >= limit.anthropicMonthlyUsd) {
+      exceeded.push('anthropicMonthlyUsd');
+    }
+    if (current.chatDailyCount >= limit.chatDailyCount) {
+      exceeded.push('chatDailyCount');
+    }
+    if (current.externalApiDailyCount >= limit.externalApiDailyCount) {
+      exceeded.push('externalApiDailyCount');
+    }
   }
-  if (current.anthropicMonthlyUsd >= limit.anthropicMonthlyUsd) {
-    exceeded.push('anthropicMonthlyUsd');
+  return {
+    current,
+    limit,
+    exceeded,
+    config: {
+      enabled,
+      paused,
+      pausedUntilIso: config.pausedUntilMs === null
+        ? null
+        : new Date(config.pausedUntilMs).toISOString(),
+      source: config.source,
+      changeSeq: config.changeSeq,
+      limitsSource: buildLimitsSource(config.limits),
+    },
+  };
+}
+
+// ----------------------------------------------------------------------------
+// 2a. Operator config overlay
+// ----------------------------------------------------------------------------
+
+const CONFIG_ID = 'global';
+
+let lastGoodConfig: CostGuardConfig | null = null;
+
+function resetCostGuardConfigCacheForTest(): void {
+  lastGoodConfig = null;
+}
+
+export async function readCostGuardConfig(
+  deps: Pick<CostGuardDeps, 'db'>,
+): Promise<CostGuardConfig> {
+  if (!deps.db) return defaultCostGuardConfig('default');
+  try {
+    const row = await deps.db
+      .prepare(
+        `SELECT enabled, paused_until_ms, limits_json, updated_by, updated_at_ms, change_seq
+           FROM cost_guard_config WHERE id = ?`,
+      )
+      .bind(CONFIG_ID)
+      .first<{
+        enabled: number | null;
+        paused_until_ms: number | null;
+        limits_json: string | null;
+        updated_by: string | null;
+        updated_at_ms: number | null;
+        change_seq: number | null;
+      }>();
+    const config = normaliseConfigRow(row, 'd1');
+    lastGoodConfig = config;
+    return config;
+  } catch (err) {
+    console.warn(`[cost-guard] config read failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (lastGoodConfig) return { ...lastGoodConfig, source: 'stale' };
+    return defaultCostGuardConfig('default');
   }
-  if (current.chatDailyCount >= limit.chatDailyCount) {
-    exceeded.push('chatDailyCount');
+}
+
+export async function applyCostGuardConfigPatch(
+  deps: Pick<CostGuardDeps, 'db'>,
+  input: {
+    actorEmail: string;
+    action: string;
+    patch: CostGuardConfigPatch;
+    nowMs: number;
+    detail?: string;
+    expectedChangeSeq?: number;
+  },
+): Promise<CostGuardMutationResult> {
+  if (!deps.db) throw new Error('D1 binding is required for /costguard mutation');
+  const before = await readCostGuardConfig({ db: deps.db });
+  const expectedChangeSeq = input.expectedChangeSeq ?? before.changeSeq;
+  if (before.changeSeq !== expectedChangeSeq) {
+    throw new CostGuardConfigConflictError();
   }
-  if (current.externalApiDailyCount >= limit.externalApiDailyCount) {
-    exceeded.push('externalApiDailyCount');
+  const after = mergeConfig(before, input.patch, input.actorEmail, input.nowMs);
+  const oldValue = JSON.stringify(serialiseConfigForAudit(before));
+  const newValue = JSON.stringify(serialiseConfigForAudit(after));
+  const limitsJson = JSON.stringify(after.limits);
+  const result = await deps.db.batch([
+    deps.db
+      .prepare(
+        `INSERT INTO cost_guard_config
+          (id, enabled, paused_until_ms, limits_json, updated_by, updated_at_ms, change_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+          enabled = excluded.enabled,
+          paused_until_ms = excluded.paused_until_ms,
+          limits_json = excluded.limits_json,
+          updated_by = excluded.updated_by,
+          updated_at_ms = excluded.updated_at_ms,
+          change_seq = excluded.change_seq
+         WHERE cost_guard_config.change_seq = ?
+         RETURNING change_seq`,
+      )
+      .bind(
+        CONFIG_ID,
+        after.enabled === null ? null : (after.enabled ? 1 : 0),
+        after.pausedUntilMs,
+        limitsJson,
+        after.updatedBy,
+        after.updatedAtMs,
+        after.changeSeq,
+        expectedChangeSeq,
+      ),
+    deps.db
+      .prepare(
+        `INSERT INTO cost_guard_audit
+          (timestamp_ms, actor_email, action, old_value_json, new_value_json, detail)
+         SELECT ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM cost_guard_config
+            WHERE id = ?
+              AND change_seq = ?
+              AND enabled IS ?
+              AND paused_until_ms IS ?
+              AND limits_json = ?
+              AND updated_by = ?
+              AND updated_at_ms = ?
+         )
+         RETURNING id`,
+      )
+      .bind(
+        input.nowMs,
+        input.actorEmail,
+        input.action,
+        oldValue,
+        newValue,
+        input.detail ?? null,
+        CONFIG_ID,
+        after.changeSeq,
+        after.enabled === null ? null : (after.enabled ? 1 : 0),
+        after.pausedUntilMs,
+        limitsJson,
+        after.updatedBy,
+        after.updatedAtMs,
+      ),
+  ]);
+  if (!d1StatementReturnedRow(result[0]) || !d1StatementReturnedRow(result[1])) {
+    throw new CostGuardConfigConflictError();
   }
-  return { current, limit, exceeded };
+  lastGoodConfig = after;
+  return { before, after };
 }
 
 // ----------------------------------------------------------------------------
@@ -531,7 +725,7 @@ export async function evaluateSessionCostAfterTurn(
   const deltaUsd = Math.max(0, sessionUsd - lastSeenUsd);
   if (deltaUsd > 0) {
     await incrementCounter(
-      { kv: deps.kv, now: deps.now },
+      { kv: deps.kv, db: deps.db, now: deps.now },
       KIND_ANTHROPIC_COST_USD,
       deltaUsd,
     );
@@ -789,6 +983,162 @@ function resolveLimits(override: Partial<CostLimits> | undefined): CostLimits {
     externalApiDailyCount:
       override?.externalApiDailyCount ?? DEFAULT_LIMITS.externalApiDailyCount,
   };
+}
+
+function resolveEffectiveLimits(
+  override: Partial<CostLimits> | undefined,
+  config: CostGuardConfig,
+): CostLimits {
+  const base = resolveLimits(override);
+  const d1Limits = config.limits;
+  if (config.source === 'stale') {
+    return {
+      anthropicMonthlyCalls: stricterLimit(d1Limits.anthropicMonthlyCalls, base.anthropicMonthlyCalls),
+      anthropicMonthlyUsd: stricterLimit(d1Limits.anthropicMonthlyUsd, base.anthropicMonthlyUsd),
+      chatDailyCount: stricterLimit(d1Limits.chatDailyCount, base.chatDailyCount),
+      externalApiDailyCount: stricterLimit(d1Limits.externalApiDailyCount, base.externalApiDailyCount),
+    };
+  }
+  return {
+    anthropicMonthlyCalls:
+      d1Limits.anthropicMonthlyCalls
+      ?? base.anthropicMonthlyCalls,
+    anthropicMonthlyUsd:
+      d1Limits.anthropicMonthlyUsd
+      ?? base.anthropicMonthlyUsd,
+    chatDailyCount:
+      d1Limits.chatDailyCount
+      ?? base.chatDailyCount,
+    externalApiDailyCount:
+      d1Limits.externalApiDailyCount
+      ?? base.externalApiDailyCount,
+  };
+}
+
+function stricterLimit(staleLimit: number | undefined, baseLimit: number): number {
+  return staleLimit === undefined ? baseLimit : Math.min(staleLimit, baseLimit);
+}
+
+function buildLimitsSource(
+  d1Limits: Partial<CostLimits>,
+): Partial<Record<CostLimitKey, 'd1' | 'default'>> {
+  return {
+    anthropicMonthlyCalls: d1Limits.anthropicMonthlyCalls === undefined ? 'default' : 'd1',
+    anthropicMonthlyUsd: d1Limits.anthropicMonthlyUsd === undefined ? 'default' : 'd1',
+    chatDailyCount: d1Limits.chatDailyCount === undefined ? 'default' : 'd1',
+    externalApiDailyCount: d1Limits.externalApiDailyCount === undefined ? 'default' : 'd1',
+  };
+}
+
+function defaultCostGuardConfig(source: CostGuardConfig['source']): CostGuardConfig {
+  return {
+    enabled: null,
+    pausedUntilMs: null,
+    limits: {},
+    updatedBy: null,
+    updatedAtMs: null,
+    changeSeq: 0,
+    source,
+  };
+}
+
+function normaliseConfigRow(
+  row: {
+    enabled: number | null;
+    paused_until_ms: number | null;
+    limits_json: string | null;
+    updated_by: string | null;
+    updated_at_ms: number | null;
+    change_seq: number | null;
+  } | null,
+  source: CostGuardConfig['source'],
+): CostGuardConfig {
+  if (!row) return defaultCostGuardConfig(source);
+  return {
+    enabled: row.enabled === null ? null : row.enabled === 1,
+    pausedUntilMs: finiteNumber(row.paused_until_ms),
+    limits: parseLimitsJson(row.limits_json),
+    updatedBy: row.updated_by,
+    updatedAtMs: finiteNumber(row.updated_at_ms),
+    changeSeq: Math.max(0, Math.trunc(finiteNumber(row.change_seq) ?? 0)),
+    source,
+  };
+}
+
+function parseLimitsJson(raw: string | null): Partial<CostLimits> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as Partial<Record<CostLimitKey, unknown>>;
+    return sanitiseCostLimits(parsed);
+  } catch {
+    return {};
+  }
+}
+
+function sanitiseCostLimits(
+  raw: Partial<Record<CostLimitKey, unknown>>,
+): Partial<CostLimits> {
+  const out: Partial<CostLimits> = {};
+  for (const key of costLimitKeys()) {
+    const value = finiteNumber(raw[key]);
+    if (value !== null && value > 0) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function d1StatementReturnedRow(result: unknown): boolean {
+  const r = result as { results?: unknown[]; meta?: { changes?: unknown } };
+  if (Array.isArray(r.results)) return r.results.length > 0;
+  return Number(r.meta?.changes ?? 0) > 0;
+}
+
+function mergeConfig(
+  before: CostGuardConfig,
+  patch: CostGuardConfigPatch,
+  actorEmail: string,
+  nowMs: number,
+): CostGuardConfig {
+  return {
+    enabled: patch.enabled === undefined ? before.enabled : patch.enabled,
+    pausedUntilMs: patch.pausedUntilMs === undefined
+      ? before.pausedUntilMs
+      : patch.pausedUntilMs,
+    limits: {
+      ...before.limits,
+      ...sanitiseCostLimits(patch.limits ?? {}),
+    },
+    updatedBy: actorEmail,
+    updatedAtMs: nowMs,
+    changeSeq: before.changeSeq + 1,
+    source: 'd1',
+  };
+}
+
+function serialiseConfigForAudit(config: CostGuardConfig): Record<string, unknown> {
+  return {
+    enabled: config.enabled,
+    pausedUntilMs: config.pausedUntilMs,
+    limits: config.limits,
+    updatedBy: config.updatedBy,
+    updatedAtMs: config.updatedAtMs,
+    changeSeq: config.changeSeq,
+  };
+}
+
+function isEnvDisabled(raw: string | undefined): boolean {
+  const value = (raw || '').trim().toLowerCase();
+  return value === '0' || value === 'false' || value === 'no' || value === 'off';
+}
+
+function costLimitKeys(): CostLimitKey[] {
+  return [
+    'anthropicMonthlyCalls',
+    'anthropicMonthlyUsd',
+    'chatDailyCount',
+    'externalApiDailyCount',
+  ];
 }
 
 function resolveConfig(deps: SessionCostGuardDeps): SessionCostGuardConfig {
@@ -1109,4 +1459,5 @@ export const _internals = {
   KIND_EXTERNAL_API_CALL,
   PREFIX,
   COUNTER_TTL_SEC,
+  resetCostGuardConfigCacheForTest,
 };

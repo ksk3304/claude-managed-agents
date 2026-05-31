@@ -338,6 +338,7 @@ export async function handleChatEvent(
           db: env.DB,
           kv: env.MAKOTO_KV,
           operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+          enabledEnv: env.COST_GUARD_ENABLED,
         },
       },
     );
@@ -1129,6 +1130,7 @@ export async function handleChatEvent(
         const costPrompt = await evaluateSessionCostAfterTurn(
           {
             kv: env.MAKOTO_KV,
+            db: env.DB,
             config: resolveSessionCostGuardConfig(env),
           },
           {

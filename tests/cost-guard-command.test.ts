@@ -41,6 +41,162 @@ function envWith(adminEmails?: string): Pick<Env, 'COST_GUARD_ADMIN_EMAILS'> {
   >;
 }
 
+function makeCommandDb(): D1Database & {
+  _config: Map<string, Record<string, unknown>>;
+  _pending: Map<string, Record<string, unknown>>;
+  _audit: Array<Record<string, unknown>>;
+  _hooks: { beforeConfigWrite?: () => void };
+} {
+  const config = new Map<string, Record<string, unknown>>();
+  const pending = new Map<string, Record<string, unknown>>();
+  const audit: Array<Record<string, unknown>> = [];
+  const hooks: { beforeConfigWrite?: () => void } = {};
+  const runSql = (sql: string, params: unknown[]) => {
+    const trimmed = sql.replace(/\s+/g, ' ').trim();
+    if (/^SELECT enabled, paused_until_ms, limits_json/i.test(trimmed)) {
+      const [id] = params as [string];
+      return { results: config.has(id) ? [config.get(id)!] : [] };
+    }
+    if (/^INSERT INTO cost_guard_config/i.test(trimmed)) {
+      const [
+        id,
+        enabled,
+        paused_until_ms,
+        limits_json,
+        updated_by,
+        updated_at_ms,
+        change_seq,
+        expected_change_seq,
+      ] = params;
+      hooks.beforeConfigWrite?.();
+      hooks.beforeConfigWrite = undefined;
+      const current = config.get(String(id));
+      if (current && Number(current.change_seq) !== Number(expected_change_seq)) {
+        return { results: [], meta: { changes: 0 } };
+      }
+      if (!current && Number(expected_change_seq) !== 0) {
+        return { results: [], meta: { changes: 0 } };
+      }
+      config.set(String(id), {
+        enabled,
+        paused_until_ms,
+        limits_json,
+        updated_by,
+        updated_at_ms,
+        change_seq,
+      });
+      return { results: [{ change_seq }], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cost_guard_audit/i.test(trimmed)) {
+      const [
+        timestamp_ms,
+        actor_email,
+        action,
+        old_value_json,
+        new_value_json,
+        detail,
+        config_id,
+        change_seq,
+        enabled,
+        paused_until_ms,
+        limits_json,
+        updated_by,
+        updated_at_ms,
+      ] = params;
+      const current = config.get(String(config_id));
+      if (
+        !current
+        || Number(current.change_seq) !== Number(change_seq)
+        || current.enabled !== enabled
+        || current.paused_until_ms !== paused_until_ms
+        || current.limits_json !== limits_json
+        || current.updated_by !== updated_by
+        || current.updated_at_ms !== updated_at_ms
+      ) {
+        return { results: [], meta: { changes: 0 } };
+      }
+      audit.push({ timestamp_ms, actor_email, action, old_value_json, new_value_json, detail });
+      return { results: [{ id: audit.length }], meta: { changes: 1 } };
+    }
+    if (/^INSERT INTO cost_guard_pending/i.test(trimmed)) {
+      const [
+        actor_email,
+        token_hash,
+        action,
+        patch_json,
+        summary,
+        base_change_seq,
+        created_at_ms,
+        expires_at_ms,
+      ] = params;
+      pending.set(String(actor_email), {
+        actor_email,
+        token_hash,
+        action,
+        patch_json,
+        summary,
+        base_change_seq,
+        created_at_ms,
+        expires_at_ms,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (/^DELETE FROM cost_guard_pending WHERE actor_email = \? AND token_hash = \?/i.test(trimmed)) {
+      const [actor_email, token_hash, nowMs] = params as [string, string, number];
+      const row = pending.get(actor_email);
+      if (row && row.token_hash === token_hash && Number(row.expires_at_ms) > nowMs) {
+        pending.delete(actor_email);
+        return { results: [row], meta: { changes: 1 } };
+      }
+      return { results: [], meta: { changes: 0 } };
+    }
+    if (/^DELETE FROM cost_guard_pending WHERE actor_email = \?/i.test(trimmed)) {
+      const [actor_email] = params as [string];
+      const existed = pending.delete(actor_email);
+      return { results: [], meta: { changes: existed ? 1 : 0 } };
+    }
+    throw new Error(`unexpected SQL: ${trimmed}`);
+  };
+  const db = {
+    _config: config,
+    _pending: pending,
+    _audit: audit,
+    _hooks: hooks,
+    prepare(sql: string) {
+      let params: unknown[] = [];
+      const stmt = {
+        bind(...bound: unknown[]) {
+          params = bound;
+          return stmt;
+        },
+        async first<T>() {
+          const r = runSql(sql, params);
+          return (r.results[0] as T) ?? null;
+        },
+        async run() {
+          return runSql(sql, params);
+        },
+        async all<T>() {
+          const r = runSql(sql, params);
+          return { results: r.results as T[] };
+        },
+      };
+      return stmt;
+    },
+    async batch(stmts: Array<{ run: () => Promise<unknown> }>) {
+      const out = [];
+      for (const stmt of stmts) out.push(await stmt.run());
+      return out;
+    },
+  } as unknown as D1Database & {
+    _config: Map<string, Record<string, unknown>>;
+    _pending: Map<string, Record<string, unknown>>;
+    _audit: Array<Record<string, unknown>>;
+    _hooks: { beforeConfigWrite?: () => void };
+  };
+  return db;
+}
+
 // ---------------------------------------------------------------------------
 // 1. parseCostGuardCommand
 // ---------------------------------------------------------------------------
@@ -151,10 +307,8 @@ describe('handleCostGuardCommand mutation gate', () => {
     expect(text).toContain('Cost Guard 管理者ではありません');
   });
 
-  it('denies known mutation subcommands as "Phase 2 未実装" when sender IS admin', async () => {
+  it('denies mutation when D1 is not wired even if sender IS admin', async () => {
     const env = envWith('admin@example.com');
-    // Phase 2 では mutation 系を意図的に未 port (Worker 側 Firestore overlay
-    // 永続層が未実装 = 値を書いても次回再起動で消えるため safe-by-default)
     for (const sub of [
       'enable',
       'disable',
@@ -173,9 +327,240 @@ describe('handleCostGuardCommand mutation gate', () => {
         },
       );
       expect(text).toContain('Cost Guard コマンド拒否');
-      expect(text).toContain(`subcommand '${sub}'`);
-      expect(text).toContain('Worker 側で未実装');
+      expect(text).toContain('D1 設定ストアが未接続');
     }
+  });
+
+  it('applies enable immediately with audit', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    const text = await handleCostGuardCommand(
+      env,
+      { subcommand: 'enable', restTokens: [] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(text).toContain('Cost Guard 設定を変更しました');
+    expect(db._config.get('global')?.enabled).toBe(1);
+    expect(db._audit[0]?.action).toBe('enable');
+  });
+
+  it('requires confirm for disable and never stores raw token', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    const prompt = await handleCostGuardCommand(
+      env,
+      { subcommand: 'disable', restTokens: [] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(prompt).toContain('Cost Guard 変更確認');
+    const token = /confirm ([0-9a-f]{8})/.exec(prompt)?.[1];
+    expect(token).toBeTruthy();
+    const pending = db._pending.get('admin@example.com')!;
+    expect(pending.token_hash).not.toBe(token);
+    expect(JSON.stringify(pending)).not.toContain(token!);
+
+    const applied = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: [token!] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(applied).toContain('Cost Guard 設定を変更しました');
+    expect(db._config.get('global')?.enabled).toBe(0);
+    expect(db._pending.size).toBe(0);
+    expect(db._audit[0]?.action).toBe('disable');
+
+    const second = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: [token!] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(second).toContain('一致する有効な確認待ち操作がありません');
+  });
+
+  it('rejects wrong-token, expired, and actor-mismatched confirmations', async () => {
+    const env = envWith('admin@example.com,other@example.com');
+    const db = makeCommandDb();
+    await handleCostGuardCommand(
+      env,
+      { subcommand: 'disable', restTokens: [] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    const wrong = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: ['deadbeef'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(wrong).toContain('一致する有効な確認待ち操作がありません');
+    expect(db._pending.size).toBe(1);
+
+    const other = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: ['deadbeef'] },
+      {
+        senderEmail: 'other@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(other).toContain('一致する有効な確認待ち操作がありません');
+
+    db._pending.get('admin@example.com')!.expires_at_ms = 0;
+    const expired = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: ['deadbeef'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(expired).toContain('一致する有効な確認待ち操作がありません');
+  });
+
+  it('returns denied when audit/config batch fails after pending consume', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    const prompt = await handleCostGuardCommand(
+      env,
+      { subcommand: 'disable', restTokens: [] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    const token = /confirm ([0-9a-f]{8})/.exec(prompt)?.[1];
+    (db as unknown as { batch: () => Promise<never> }).batch = async () => {
+      throw new Error('audit down');
+    };
+    const text = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: [token!] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(text).toContain('Cost Guard コマンド拒否');
+    expect(text).toContain('コマンド処理に失敗しました');
+    expect(db._config.size).toBe(0);
+  });
+
+  it('applies hard-cap lowering immediately and hard-cap raising through confirm', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    const lower = await handleCostGuardCommand(
+      env,
+      { subcommand: 'set', restTokens: ['hard-cap', 'chat-daily', '100'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(lower).toContain('Cost Guard 設定を変更しました');
+    expect(JSON.parse(String(db._config.get('global')?.limits_json))).toEqual({
+      chatDailyCount: 100,
+    });
+
+    const raise = await handleCostGuardCommand(
+      env,
+      { subcommand: 'set', restTokens: ['hard-cap', 'month-usd', '500'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(raise).toContain('Cost Guard 変更確認');
+    expect(db._pending.size).toBe(1);
+  });
+
+  it('rejects stale destructive confirmation after config changed', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    const raise = await handleCostGuardCommand(
+      env,
+      { subcommand: 'set', restTokens: ['hard-cap', 'month-usd', '500'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    const token = /confirm ([0-9a-f]{8})/.exec(raise)?.[1];
+    expect(token).toBeTruthy();
+
+    await handleCostGuardCommand(
+      env,
+      { subcommand: 'enable', restTokens: [] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    const stale = await handleCostGuardCommand(
+      env,
+      { subcommand: 'confirm', restTokens: [token!] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(stale).toContain('確認待ち作成後に設定が変更済み');
+    expect(JSON.parse(String(db._config.get('global')?.limits_json))).toEqual({});
+    expect(db._audit.map((row) => row.action)).toEqual(['enable']);
+  });
+
+  it('does not clobber concurrent config changes on optimistic conflict', async () => {
+    const env = envWith('admin@example.com');
+    const db = makeCommandDb();
+    await handleCostGuardCommand(
+      env,
+      { subcommand: 'set', restTokens: ['hard-cap', 'chat-daily', '100'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    db._hooks.beforeConfigWrite = () => {
+      const current = db._config.get('global')!;
+      db._config.set('global', {
+        ...current,
+        limits_json: JSON.stringify({
+          chatDailyCount: 100,
+          externalApiDailyCount: 50,
+        }),
+        change_seq: Number(current.change_seq) + 1,
+      });
+    };
+
+    const text = await handleCostGuardCommand(
+      env,
+      { subcommand: 'set', restTokens: ['hard-cap', 'month-calls', '9000'] },
+      {
+        senderEmail: 'admin@example.com',
+        guardDeps: { ...makeGuardDeps(), db },
+      },
+    );
+    expect(text).toContain('Cost Guard コマンド拒否');
+    expect(JSON.parse(String(db._config.get('global')?.limits_json))).toEqual({
+      chatDailyCount: 100,
+      externalApiDailyCount: 50,
+    });
+    expect(db._audit.map((row) => row.action)).toEqual(['set:chatDailyCount']);
   });
 });
 
