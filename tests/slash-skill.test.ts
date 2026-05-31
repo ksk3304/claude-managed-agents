@@ -78,6 +78,7 @@ describe('formatHelp', () => {
     expect(out).toContain('*利用可能なスキル一覧*');
     expect(out).toContain('• `/help`');
     expect(out).toContain('• `/costguard`');
+    expect(out).toContain('コストガード見せて');
     expect(out).not.toBe('スキルが登録されていません。');
   });
 
