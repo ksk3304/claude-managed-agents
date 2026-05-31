@@ -1470,6 +1470,36 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('skipped');
     if (result.kind === 'skipped') expect(result.reason).toBe('unknown_sender');
     expect(chatApiMock.posts).toHaveLength(0);
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    const skipped = runtimeEvents.find((row) => row.event_type === 'chat_event_skipped');
+    expect(skipped).toBeDefined();
+    expect(JSON.parse(String(skipped!.detail_json))).toMatchObject({
+      reason: 'unknown_sender',
+      default_user_slug_configured: false,
+    });
+  });
+
+  it('sender email 不在 → no_sender_email skip を D1 runtime event に残す', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ senderEmail: '' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('skipped');
+    if (result.kind === 'skipped') expect(result.reason).toBe('no_sender_email');
+    expect(chatApiMock.posts).toHaveLength(0);
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    const skipped = runtimeEvents.find((row) => row.event_type === 'chat_event_skipped');
+    expect(skipped).toBeDefined();
+    expect(JSON.parse(String(skipped!.detail_json))).toMatchObject({
+      reason: 'no_sender_email',
+    });
   });
 
   it('Case 14b: user_mapping 不在 + DEFAULT_USER_SLUG 設定済 + default mapping 存在 → default で resolve + committed (#186 follow-up #8)', async () => {
@@ -1512,6 +1542,59 @@ describe('handleChatEvent', () => {
       ),
     ];
     expect(allTexts.some((t) => t.includes('ゲストモード'))).toBe(true);
+  });
+
+  it('default fallback actor は応答のみ許可し EMAIL/SCHEDULE/CHAT_POST を gate する', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        DEFAULT_USER_SLUG: 'guest',
+        GCP_SCHEDULER_PROJECT: 'test-proj',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({ senderEmail: 'guest-person@example.com' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await env.MAKOTO_KV.put(
+      'user_mapping:guest',
+      JSON.stringify({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        memory_attachments: [],
+      }),
+    );
+
+    installFakeAnthropic({
+      sessionId: 'sesn_default_gate',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '外部操作します。\n' +
+            'EMAIL_SEND:{"to":"a@example.com","subject":"s","body":"b"}\n' +
+            'CHAT_POST:{"space":"spaces/OTHER","text":"別投稿"}\n' +
+            'SCHEDULE_ACTION:{"action":"list"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(false);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
+    expect(chatApiMock.patches[0]!.text).toContain(
+      '外部連携操作は登録済みユーザーの現在発話でのみ実行します',
+    );
+
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+    })._tables.cma_worker_runtime_events;
+    const families = runtimeEvents
+      .filter((row) => row.event_type === 'external_tool_gated')
+      .map((row) => JSON.parse(String(row.detail_json)).tool_family)
+      .sort();
+    expect(families).toEqual(['CHAT_POST', 'EMAIL_SEND', 'SCHEDULE_ACTION']);
   });
 
   it('Case 14c: user_mapping 不在 + DEFAULT_USER_SLUG 未設定 → 従来の unknown_sender skip (回帰防止)', async () => {
