@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Upload or version the MAKOTOくん mail-send Anthropic Skill.
+"""Upload or version the MAKOTOくん Cost Guard Anthropic Skill.
 
 Requires:
   ANTHROPIC_API_KEY=sk-ant-...
 
 Output:
-  MAIL_SEND_SKILL_ID=...
-  MAIL_SEND_SKILL_VERSION=...
+  COST_GUARD_SKILL_ID=...
+  COST_GUARD_SKILL_VERSION=...
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import anthropic
 from anthropic.lib import files_from_dir
 
 
-DISPLAY_TITLE = "MAKOTOくん Mail Send"
-SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "mail-send"
+DISPLAY_TITLE = "MAKOTOくん Cost Guard"
+SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "cost-guard"
 BETA_HEADER = "skills-2025-10-02"
 
 
@@ -80,8 +80,8 @@ def main() -> int:
         versions = client.beta.skills.versions.list(skill_id, betas=[BETA_HEADER])
         version_id = getattr(versions.data[0], "version")
 
-    print(f"MAIL_SEND_SKILL_ID={skill_id}")
-    print(f"MAIL_SEND_SKILL_VERSION={version_id}")
+    print(f"COST_GUARD_SKILL_ID={skill_id}")
+    print(f"COST_GUARD_SKILL_VERSION={version_id}")
     return 0
 
 
