@@ -195,7 +195,7 @@ export async function readChatSenderMappingWithAutoPending(
     }
   }
 
-  const pendingKeys = pendingMappingKeys(email, identity.chatUserId);
+  const pendingKeys = autoCreatePending ? pendingMappingKeys(email, identity.chatUserId) : [];
   for (const key of pendingKeys) {
     const pending = await readPendingChatMapping(kv, key, spaceType);
     if (pending) return pending;

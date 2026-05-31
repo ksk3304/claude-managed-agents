@@ -199,6 +199,40 @@ describe('readChatSenderMappingWithAutoPending', () => {
     expect(r!.actorTrusted).toBe(false);
   });
 
+  it('ignores pending mappings when auto-create flag is off', async () => {
+    const kv = makeKv();
+    await kv.put(
+      'user_mapping:guest',
+      JSON.stringify({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        memory_attachments: [],
+      }),
+    );
+    await kv.put(
+      'chat_pending_user_mapping:email:stranger@example.com',
+      JSON.stringify({
+        user_slug: 'pending',
+        agent_id: 'agent_pending',
+        memory_attachments: [],
+        auto_registered: true,
+        actor_trusted: false,
+      }),
+    );
+
+    const r = await readChatSenderMappingWithAutoPending(
+      kv,
+      { senderEmail: 'stranger@example.com', chatUserId: 'users/999' },
+      'guest',
+      'ROOM',
+      false,
+    );
+
+    expect(r).not.toBeNull();
+    expect(r!.source).toBe('default');
+    expect(r!.mapping.user_slug).toBe('guest');
+  });
+
   it('reuses pending mapping by chat user id when email is missing', async () => {
     const kv = makeKv();
     await kv.put(
