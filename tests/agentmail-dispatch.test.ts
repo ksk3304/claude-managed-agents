@@ -523,6 +523,89 @@ describe('agentmailDispatch', () => {
     }
   });
 
+  it('continuation body-only assistant output is sent as an AgentMail reply', async () => {
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        id: undefined,
+        message_id: '<external-reply-body-only@example.net>',
+        from: 'External User <external@example.net>',
+        subject: 'Re: こんにちは',
+        in_reply_to: '<outbound-rfc822-body-only@example.com>',
+        references: ['<outbound-rfc822-body-only@example.com>'],
+      },
+      event: {
+        id: 'evt_external_body_only',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          id: undefined,
+          message_id: '<external-reply-body-only@example.net>',
+          from: 'External User <external@example.net>',
+          subject: 'Re: こんにちは',
+          in_reply_to: '<outbound-rfc822-body-only@example.com>',
+          references: ['<outbound-rfc822-body-only@example.com>'],
+          inbox_id: 'inbox_main',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:k.seto@makotoprime.com',
+      JSON.stringify({ user_slug: 'k-seto', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+    await ctx.env.DB.prepare(
+      `INSERT OR REPLACE INTO sent_messages
+         (message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid, auto_reply_policy)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+    )
+      .bind(
+        'msg_out_body_only',
+        'sesn_existing_body_only',
+        'agent_001',
+        'external@example.net',
+        Date.now(),
+        'outbound-rfc822-body-only@example.com',
+        'chat_user_requested',
+      )
+      .run();
+
+    installFakeAnthropic({
+      events: [
+        { type: 'agent.message.text', text: 'ご返信ありがとうございます。承知しました。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: Array<{ url: string; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: String(init.body ?? '') });
+      return new Response(
+        JSON.stringify({
+          message_id: 'msg_body_only_auto_reply',
+          rfc822_message_id: '<body-only-auto-reply@example.com>',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      expect(amCalls).toHaveLength(1);
+      expect(amCalls[0]!.url).toContain(
+        '/messages/%3Cexternal-reply-body-only%40example.net%3E/reply',
+      );
+      expect(JSON.parse(amCalls[0]!.body)).toEqual({
+        text: 'ご返信ありがとうございます。承知しました。',
+      });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('SignalB thread self-scan: no Re/header match but thread has bot mail → continuation path', async () => {
     chatApiMock.posts.length = 0;
     const sendCapture: unknown[] = [];

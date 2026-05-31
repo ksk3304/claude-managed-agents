@@ -340,12 +340,20 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   }
 
   // 6. Parse EMAIL_SEND markers + log any failures.
-  const { markers, failures, cleanedText } = parseAssistantText(streamResult.assistantText);
+  const parsedAssistant = parseAssistantText(streamResult.assistantText);
+  let { markers } = parsedAssistant;
+  const { failures, cleanedText } = parsedAssistant;
   if (failures.length > 0) {
     for (const f of failures) {
       console.warn(
         `[agentmail-dispatch] EMAIL_SEND parse failure eventKey=${eventKey} reason=${f.reason} raw=${f.raw.slice(0, 200)}`,
       );
+    }
+  }
+  if (markers.length === 0 && isContinuation && cleanedText.trim().length > 0) {
+    const continuationReply = buildContinuationReplyMarker(message, cleanedText);
+    if (continuationReply) {
+      markers = [continuationReply];
     }
   }
   if (markers.length === 0) {
@@ -388,7 +396,12 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   }
   const amClientOpts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
   const amClient = new AgentMailClient(env.AGENTMAIL_API_KEY, amClientOpts);
-  const parentMessageId = typeof message.id === 'string' ? message.id : '';
+  const parentMessageId =
+    typeof message.id === 'string' && message.id.length > 0
+      ? message.id
+      : typeof message.message_id === 'string' && message.message_id.length > 0
+        ? message.message_id
+        : '';
 
   const successfullySentBodies: string[] = [];
   for (const m of markers) {
@@ -580,6 +593,39 @@ function buildInitialUserMessage(msg: AgentMailMessage, isContinuationByDepth: b
     '本文:',
     body || '(本文なし)',
   ].join('\n');
+}
+
+function buildContinuationReplyMarker(
+  msg: AgentMailMessage,
+  body: string,
+): EmailSendMarker | null {
+  const to = extractEmailAddress(msg.from);
+  if (!to) return null;
+  const subject = normalizeReplySubject(typeof msg.subject === 'string' ? msg.subject : '');
+  const parent =
+    typeof msg.id === 'string' && msg.id.length > 0
+      ? msg.id
+      : typeof msg.message_id === 'string' && msg.message_id.length > 0
+        ? msg.message_id
+        : undefined;
+  return {
+    to,
+    subject,
+    body: body.trim(),
+    ...(parent ? { in_reply_to_message_id: parent } : {}),
+  };
+}
+
+function extractEmailAddress(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const m = raw.match(/<([^>]+)>/);
+  const candidate = (m ? m[1] : raw).trim();
+  return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(candidate) ? candidate : '';
+}
+
+function normalizeReplySubject(subject: string): string {
+  const s = subject.trim() || '(no subject)';
+  return /^\s*re\s*:/i.test(s) ? s : `Re: ${s}`;
 }
 
 /**
