@@ -100,6 +100,8 @@ declare namespace Cloudflare {
      * `src/lib/mention-detection.ts:isMentioningBot`。
      */
     GCHAT_BOT_USER_NAME?: string;
+    /** Enables chat-only pending user mapping auto-create for first-time Chat senders. */
+    CHAT_AUTO_PENDING_USER_MAPPING_ENABLED?: string;
     /**
      * `/costguard` 運用者コマンドの mutation 系 (enable / disable / pause /
      * set / etc.) を実行できる admin email の csv (= Cloud Run 側

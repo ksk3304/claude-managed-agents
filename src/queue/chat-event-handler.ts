@@ -104,7 +104,7 @@ import {
   type ActionSkillIntent,
   type SkillsData,
 } from '../lib/intent-detector';
-import { readUserMappingWithDefault } from '../lib/memory-attach';
+import { readChatSenderMappingWithAutoPending } from '../lib/memory-attach';
 import {
   handleScheduleActionMarker,
   parseScheduleActionMarkers,
@@ -288,39 +288,50 @@ export async function handleChatEvent(
     }
   }
 
-  // ---- 5. sender email + user_mapping resolve ----
+  // ---- 5. sender identity + user_mapping resolve ----
   const senderEmail = ((sender as { email?: string }).email || '').trim().toLowerCase();
-  if (!senderEmail) {
-    console.warn(`[chat-event] no sender email eventKey=${eventKey}`);
-    await recordRuntimeEvent(env, {
-      eventKey,
-      messageId: message.name,
-      eventType: 'chat_event_skipped',
-      level: 'warn',
-      source: 'chat-event-handler',
-      detail: {
-        reason: 'no_sender_email',
-        sender_name_hash: stableHash(sender.name),
-        sender_type: senderType ?? null,
-        space_type: spaceType,
-      },
-    });
-    await safeCommit(env, eventKey, claim);
-    return { kind: 'skipped', reason: 'no_sender_email' };
-  }
-  // Mapping resolve with optional default fallback (Issue #186
-  // follow-up #8). When `env.DEFAULT_USER_SLUG` is set and the direct
-  // lookup misses, fall back to `user_mapping:<DEFAULT_USER_SLUG>` (TS
-  // port of `cma_session_resolver.py:resolve` l.435-446 `default`
-  // entry). Unset / blank / absent default → original
-  // `unknown_sender` skip is preserved (回帰防止).
-  const mappingResolution = await readUserMappingWithDefault(
+  const senderDisplayName =
+    typeof (sender as { displayName?: unknown }).displayName === 'string'
+      ? ((sender as { displayName?: string }).displayName ?? '').trim()
+      : '';
+  // Mapping resolve with optional default fallback and chat-only pending
+  // auto registration. Pending mappings use `chat_pending_user_mapping:*`,
+  // not `user_mapping:*`, so mail/daily-report/onboarding paths cannot
+  // accidentally treat a first-time Chat participant as fully registered.
+  const mappingResolution = await readChatSenderMappingWithAutoPending(
     env.MAKOTO_KV,
-    senderEmail,
+    {
+      senderEmail,
+      chatUserId: sender.name,
+      displayName: senderDisplayName,
+      spaceName,
+    },
     env.DEFAULT_USER_SLUG,
     spaceType,
+    env.CHAT_AUTO_PENDING_USER_MAPPING_ENABLED === '1',
   );
   if (!mappingResolution) {
+    if (!senderEmail) {
+      console.warn(`[chat-event] no sender email eventKey=${eventKey}`);
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        eventType: 'chat_event_skipped',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: {
+          reason: 'no_sender_email',
+          sender_name_hash: stableHash(sender.name),
+          sender_type: senderType ?? null,
+          auto_pending_mapping_enabled:
+            env.CHAT_AUTO_PENDING_USER_MAPPING_ENABLED === '1',
+          default_user_slug_configured: Boolean(env.DEFAULT_USER_SLUG?.trim()),
+          space_type: spaceType,
+        },
+      });
+      await safeCommit(env, eventKey, claim);
+      return { kind: 'skipped', reason: 'no_sender_email' };
+    }
     // Scrub sender email through PII redactor before logging — Cloudflare
     // Logs retains warn lines long-term (Issue #186 D コンプラ対応).
     console.warn(
@@ -336,6 +347,8 @@ export async function handleChatEvent(
         reason: 'unknown_sender',
         sender_email_hash: stableHash(senderEmail),
         default_user_slug_configured: Boolean(env.DEFAULT_USER_SLUG?.trim()),
+        auto_pending_mapping_enabled:
+          env.CHAT_AUTO_PENDING_USER_MAPPING_ENABLED === '1',
         space_type: spaceType,
       },
     });
@@ -343,20 +356,26 @@ export async function handleChatEvent(
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
   const userMapping = mappingResolution.mapping;
-  const actorTrusted = !mappingResolution.isDefault;
-  if (mappingResolution.isDefault) {
+  const actorTrusted = mappingResolution.actorTrusted;
+  if (!actorTrusted) {
     console.info(
-      `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
-        `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
+      `[chat-event] untrusted_actor_fallback eventKey=${eventKey} ` +
+        `source=${mappingResolution.source} email=${redactPiiInText(senderEmail || '<no-email>')} ` +
+        `default_slug=${userMapping.user_slug}`,
     );
     await recordRuntimeEvent(env, {
       eventKey,
       messageId: message.name,
       userSlug: userMapping.user_slug,
-      eventType: 'chat_default_user_fallback',
+      eventType:
+        mappingResolution.source === 'auto_pending'
+          ? 'chat_auto_pending_user_mapping'
+          : 'chat_default_user_fallback',
       source: 'chat-event-handler',
       detail: {
-        sender_email_hash: stableHash(senderEmail),
+        sender_email_hash: senderEmail ? stableHash(senderEmail) : null,
+        sender_name_hash: stableHash(sender.name),
+        mapping_source: mappingResolution.source,
         default_slug: userMapping.user_slug,
         external_tools_allowed: false,
       },
