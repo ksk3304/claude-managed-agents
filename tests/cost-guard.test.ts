@@ -618,6 +618,35 @@ describe('per-session staged approval', () => {
     expect(next?.promptText).toContain('$16 到達時');
   });
 
+  it('records one Anthropic monthly call for each processed usage snapshot', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_usage_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+    });
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_usage_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 150, output_tokens: 30 },
+      },
+    });
+
+    await expect(readCounter(deps, KIND_ANTHROPIC_CALL)).resolves.toBe(2);
+  });
+
   it('projects PDF cost against the current session threshold before sending it to the LLM', async () => {
     const kv = makeKv();
     const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';

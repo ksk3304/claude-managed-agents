@@ -88,6 +88,7 @@ import {
   evaluateSessionCostAfterTurn,
   handlePendingSessionApproval,
   projectSessionCostForPdfPreflight,
+  recordChatPost,
   resolveSessionCostGuardConfig,
 } from '../lib/cost-guard';
 import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
@@ -1820,6 +1821,12 @@ async function dispatchChatPostMarkers(
               ),
           });
           if (cpOutcome.outcome === 'sent') {
+            await recordChatPost({
+              db: env.DB,
+              kv: env.MAKOTO_KV,
+              operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+              enabledEnv: env.COST_GUARD_ENABLED,
+            });
             console.log(
               `[chat-event] CHAT_POST posted eventKey=${eventKey} space=${targetSpace} text_chars=${m.text.length}`,
             );
@@ -2159,6 +2166,12 @@ async function safePost(
           }
         : {},
     );
+    await recordChatPost({
+      db: env.DB,
+      kv: env.MAKOTO_KV,
+      operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+      enabledEnv: env.COST_GUARD_ENABLED,
+    });
   } catch (err) {
     const reason =
       err instanceof ChatApiError
@@ -2285,6 +2298,12 @@ async function safeUpdateOrPost(
   }
   try {
     await updateChatMessage({ saKeyJson: saKey }, messageName, text);
+    await recordChatPost({
+      db: env.DB,
+      kv: env.MAKOTO_KV,
+      operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+      enabledEnv: env.COST_GUARD_ENABLED,
+    });
     return;
   } catch (err) {
     const reason =

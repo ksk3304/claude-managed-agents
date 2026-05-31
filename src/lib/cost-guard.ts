@@ -307,6 +307,14 @@ export async function readCounter(
   }
 }
 
+export async function recordAnthropicCall(deps: CostGuardDeps): Promise<void> {
+  await incrementCounter(deps, KIND_ANTHROPIC_CALL, 1);
+}
+
+export async function recordChatPost(deps: CostGuardDeps): Promise<void> {
+  await incrementCounter(deps, KIND_CHAT_POST, 1);
+}
+
 async function incrementD1Counter(
   db: D1Database,
   kind: CostKind,
@@ -723,6 +731,7 @@ export async function evaluateSessionCostAfterTurn(
   const prev = await readSessionState(deps.kv, input.sessionId);
   const lastSeenUsd = prev?.lastSeenUsd ?? 0;
   const deltaUsd = Math.max(0, sessionUsd - lastSeenUsd);
+  await recordAnthropicCall({ kv: deps.kv, db: deps.db, now: deps.now });
   if (deltaUsd > 0) {
     await incrementCounter(
       { kv: deps.kv, db: deps.db, now: deps.now },

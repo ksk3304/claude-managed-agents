@@ -41,6 +41,7 @@ import {
 } from './makoto-helpers';
 import { getThreadLock } from '../src/durable-objects/thread-lock';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
+import { readCounter, _internals as costGuardInternals } from '../src/lib/cost-guard';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -468,6 +469,25 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('handleChatEvent', () => {
+  it('/costguard status reply increments chat daily counter', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '/costguard status' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('Cost Guard 状態');
+    await expect(
+      readCounter(
+        { db: env.DB, kv: env.MAKOTO_KV },
+        costGuardInternals.KIND_CHAT_POST,
+      ),
+    ).resolves.toBe(1);
+  });
+
   it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
     const env = buildEnv({
       envOverrides: {
@@ -1802,6 +1822,12 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
     // DELETE は呼ばれない (失敗経路ではない)
     expect(chatApiMock.deletes).toHaveLength(0);
+    await expect(
+      readCounter(
+        { db: env.DB, kv: env.MAKOTO_KV },
+        costGuardInternals.KIND_CHAT_POST,
+      ),
+    ).resolves.toBe(1);
   });
 
   it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
