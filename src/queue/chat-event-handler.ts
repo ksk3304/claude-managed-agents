@@ -215,6 +215,19 @@ export async function handleChatEvent(
       `[chat-event] lost_claim eventKey=${eventKey} owner=${claim.owner} version=${claim.version}`,
     );
     if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: payload.message?.name ?? null,
+      eventType: 'chat_event_skipped',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        reason: 'lost_claim',
+        stage: 'claim_confirm',
+        claim_owner: claim.owner,
+        claim_version: claim.version,
+      },
+    });
     return { kind: 'skipped', reason: 'lost_claim' };
   }
 
@@ -223,22 +236,36 @@ export async function handleChatEvent(
   if (!message) {
     console.warn(`[chat-event] no message field eventKey=${eventKey}`);
     if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      reason: 'no_message',
+      stage: 'payload_extract',
+      outcome: 'skipped',
+      level: 'warn',
+    });
     return { kind: 'skipped', reason: 'no_message' };
   }
   const space = payload.space ?? { name: '' };
   const sender = message.sender ?? { name: '' };
+  const spaceName = space.name || '';
+  const spaceType = space.type || 'UNKNOWN';
   const senderType = (sender as { type?: string }).type;
   if (senderType === 'BOT') {
     // bot 自身の投稿 (= echo 防止)
     console.log(`[chat-event] skip BOT sender eventKey=${eventKey}`);
     if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      reason: 'bot_sender',
+      stage: 'sender_filter',
+      outcome: 'skipped',
+      detail: {
+        sender_name_hash: stableHash(sender.name),
+        space_type: spaceType,
+      },
+    });
     return { kind: 'skipped', reason: 'bot_sender' };
   }
 
-  const spaceName = space.name || '';
-  const spaceType = space.type || 'UNKNOWN';
   const threadName = message.thread?.name ?? null;
   const rawText = message.text ?? '';
   const annotations = message.annotations ?? [];
@@ -255,7 +282,18 @@ export async function handleChatEvent(
       `[chat-event] skip non-mention eventKey=${eventKey} space=${spaceName} type=${spaceType}`,
     );
     if (ingressPlaceholderName) await safeDeletePlaceholder(env, ingressPlaceholderName, eventKey);
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      reason: 'not_for_bot',
+      stage: 'bot_mention_filter',
+      outcome: 'skipped',
+      detail: {
+        is_dm: isDm,
+        space_type: spaceType,
+        annotation_count: annotations.length,
+        bot_user_name_configured: Boolean(botUserName),
+      },
+    });
     return { kind: 'skipped', reason: 'not_for_bot' };
   }
 
@@ -271,7 +309,16 @@ export async function handleChatEvent(
     } else {
       // Cloud Run l.3895-3902 同等: 空メッセージはその旨を投稿して終了
       await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, '（空メッセージ）', threadName, eventKey);
-      await safeCommit(env, eventKey, claim);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        reason: 'empty_message_reply_posted',
+        stage: 'mention_strip',
+        outcome: 'committed',
+        detail: {
+          space_type: spaceType,
+          thread_present: Boolean(threadName),
+        },
+      });
       return { kind: 'committed' };
     }
   }
@@ -318,7 +365,21 @@ export async function handleChatEvent(
           space_type: spaceType,
         },
       });
-      await safeCommit(env, eventKey, claim);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        reason: 'no_sender_email',
+        stage: 'sender_mapping_resolve',
+        outcome: 'skipped',
+        level: 'warn',
+        detail: {
+          sender_name_hash: stableHash(sender.name),
+          sender_type: senderType ?? null,
+          auto_pending_mapping_enabled:
+            env.CHAT_AUTO_PENDING_USER_MAPPING_ENABLED === '1',
+          default_user_slug_configured: Boolean(env.DEFAULT_USER_SLUG?.trim()),
+          space_type: spaceType,
+        },
+      });
       return { kind: 'skipped', reason: 'no_sender_email' };
     }
     // Scrub sender email through PII redactor before logging — Cloudflare
@@ -342,7 +403,20 @@ export async function handleChatEvent(
         space_type: spaceType,
       },
     });
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      reason: 'unknown_sender',
+      stage: 'sender_mapping_resolve',
+      outcome: 'skipped',
+      level: 'warn',
+      detail: {
+        sender_email_hash: stableHash(senderEmail),
+        default_user_slug_configured: Boolean(env.DEFAULT_USER_SLUG?.trim()),
+        auto_pending_mapping_enabled:
+          env.CHAT_AUTO_PENDING_USER_MAPPING_ENABLED === '1',
+        space_type: spaceType,
+      },
+    });
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
   const userMapping = mappingResolution.mapping;
@@ -384,7 +458,14 @@ export async function handleChatEvent(
       },
     );
     await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, cgText, threadName, eventKey);
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'costguard_command_handled',
+      stage: 'deterministic_slash_command',
+      outcome: 'committed',
+      detail: { subcommand: cgCommand.subcommand },
+    });
     console.log(
       `[chat-event] /costguard handled eventKey=${eventKey} sub=${cgCommand.subcommand}`,
     );
@@ -402,7 +483,17 @@ export async function handleChatEvent(
         `[chat-event] slash decided eventKey=${eventKey} source=${slashOutcome.source} chars=${slashOutcome.text.length}`,
       );
       await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, slashOutcome.text, threadName, eventKey);
-      await safeCommit(env, eventKey, claim);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'slash_command_decided',
+        stage: 'deterministic_slash_command',
+        outcome: 'committed',
+        detail: {
+          source: slashOutcome.source,
+          text_chars: slashOutcome.text.length,
+        },
+      });
       return { kind: 'committed' };
     }
     if (slashOutcome.kind === 'run') {
@@ -450,7 +541,13 @@ export async function handleChatEvent(
         await deletePendingPdfPreflightApproval(env.MAKOTO_KV, threadSessionKey);
       }
       await safePost(env, spaceName, '了解です。PDF全文読取は中止しました。', threadName, eventKey);
-      await safeCommit(env, eventKey, claim);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'pdf_preflight_rejected',
+        stage: 'pdf_preflight_approval',
+        outcome: 'committed',
+      });
       return { kind: 'committed' };
     }
     if (pendingPdfPreflight && pdfApprovalDecision === 'yes') {
@@ -484,7 +581,18 @@ export async function handleChatEvent(
     );
     if (pendingCostApproval.kind === 'reply') {
       await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, pendingCostApproval.text, threadName, eventKey);
-      await safeCommit(env, eventKey, claim);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'cost_guard_session_approval_reply',
+        stage: 'cost_guard_session_approval',
+        outcome: 'committed',
+        detail: {
+          close_session: pendingCostApproval.closeSession,
+          thread_key_present: Boolean(threadSessionKey),
+          reply_chars: pendingCostApproval.text.length,
+        },
+      });
       console.log(
         `[chat-event] cost_guard_session_approval handled eventKey=${eventKey} ` +
           `decision=${pendingCostApproval.closeSession ? 'no' : 'yes_or_pending'} ` +
@@ -715,7 +823,14 @@ export async function handleChatEvent(
   const client = buildAnthropicClient(env);
   if (client === null) {
     console.error(`[chat-event] no Anthropic API key eventKey=${eventKey}`);
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'no_anthropic_api_key',
+      stage: 'anthropic_client_build',
+      outcome: 'skipped',
+      level: 'error',
+    });
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
 
@@ -788,7 +903,18 @@ export async function handleChatEvent(
             approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
           },
         );
-        await safeCommit(env, eventKey, claim);
+        await safeCommit(env, eventKey, claim, {
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          reason: 'pdf_preflight_missing_fail_closed',
+          stage: 'attachment_processing',
+          outcome: 'committed',
+          level: 'error',
+          detail: {
+            attachment_count: attachmentForProcessing.length,
+            extra_blocks: attachmentBlocks.extraBlocks.length,
+          },
+        });
         return { kind: 'committed' };
       }
       if (attachmentBlocks.pdfPreflight) {
@@ -855,13 +981,30 @@ export async function handleChatEvent(
             );
           }
           await safePost(env, spaceName, pdfCostProjection.promptText, threadName, eventKey);
-          await safeCommit(env, eventKey, claim);
+          await safeCommit(env, eventKey, claim, {
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            reason: 'pdf_preflight_prompt_posted',
+            stage: 'attachment_processing',
+            outcome: 'committed',
+            detail: {
+              crossed_threshold_usd: pdfCostProjection.crossedThresholdUsd,
+              prompt_chars: pdfCostProjection.promptText.length,
+            },
+          });
           return { kind: 'committed' };
         }
       }
       if (attachmentBlocks.deterministicReply) {
         await safePost(env, spaceName, attachmentBlocks.deterministicReply, threadName, eventKey);
-        await safeCommit(env, eventKey, claim);
+        await safeCommit(env, eventKey, claim, {
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          reason: 'attachment_deterministic_reply_posted',
+          stage: 'attachment_processing',
+          outcome: 'committed',
+          detail: { reply_chars: attachmentBlocks.deterministicReply.length },
+        });
         return { kind: 'committed' };
       }
       if (attachmentBlocks.extraBlocks.length > 0) {
@@ -901,7 +1044,15 @@ export async function handleChatEvent(
             approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
           },
         );
-        await safeCommit(env, eventKey, claim);
+        await safeCommit(env, eventKey, claim, {
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          reason: 'attachment_build_failed_pdf_fail_closed',
+          stage: 'attachment_processing',
+          outcome: 'committed',
+          level: 'error',
+          detail: { error: err instanceof Error ? err.message : String(err) },
+        });
         return { kind: 'committed' };
       }
     }
@@ -938,7 +1089,18 @@ export async function handleChatEvent(
         approvedThroughUsd: sessionCostConfig.thresholdsUsd[0] ?? 8,
       },
     );
-    await safeCommit(env, eventKey, claim);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'pdf_preflight_unchecked_fail_closed',
+      stage: 'attachment_processing',
+      outcome: 'committed',
+      level: 'error',
+      detail: {
+        attachment_count: attachmentForProcessing.length,
+        extra_blocks: attachmentBlocks.extraBlocks.length,
+      },
+    });
     return { kind: 'committed' };
   }
   const attachmentNotice = attachmentBlocks.notice;
@@ -1166,7 +1328,15 @@ export async function handleChatEvent(
         }
         // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
         console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
-        await safeCommit(env, eventKey, claim);
+        await safeCommit(env, eventKey, claim, {
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          reason: err.reason,
+          stage: 'orchestrator',
+          outcome: 'skipped',
+          level: 'error',
+          detail: { error: err.message },
+        });
         return { kind: 'skipped', reason: err.reason };
       }
       // Unknown throw — defensive: release & retry
@@ -1401,7 +1571,17 @@ export async function handleChatEvent(
   });
 
   // ---- 9. commit ----
-  await safeCommit(env, eventKey, claim);
+  await safeCommit(env, eventKey, claim, {
+    messageId: message.name,
+    userSlug: userMapping.user_slug,
+    reason: 'normal_chat_turn_completed',
+    stage: 'final_commit',
+    outcome: 'committed',
+    detail: {
+      session_id_present: Boolean(sessionId),
+      final_text_chars: finalText.length,
+    },
+  });
   return { kind: 'committed' };
   } finally {
     try {
@@ -2243,22 +2423,59 @@ function missingChatHistoryOAuthSecrets(env: Env): string[] {
   return missing;
 }
 
+interface SafeCommitEvent {
+  messageId?: string | null;
+  userSlug?: string | null;
+  reason: string;
+  stage: string;
+  outcome: 'committed' | 'skipped';
+  level?: 'debug' | 'info' | 'warn' | 'error';
+  detail?: Record<string, unknown>;
+}
+
 async function safeCommit(
   env: Env,
   eventKey: string,
   claim: { owner: string; version: number },
+  commitEvent?: SafeCommitEvent,
 ): Promise<void> {
+  let commitOk = false;
+  let commitFenceDrift = false;
+  let commitError: string | null = null;
   try {
     const ok = await commitDone(env.DB, eventKey, claim.owner, claim.version);
     if (!ok) {
+      commitFenceDrift = true;
       console.warn(
         `[chat-event] commit-fence-drift eventKey=${eventKey} owner=${claim.owner} version=${claim.version}`,
       );
+    } else {
+      commitOk = true;
     }
   } catch (err) {
+    commitError = err instanceof Error ? err.message : String(err);
     console.warn(
       `[chat-event] commitDone threw eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+  if (commitEvent) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: commitEvent.messageId ?? null,
+      userSlug: commitEvent.userSlug ?? null,
+      eventType: 'chat_event_commit_decision',
+      level: commitEvent.level ?? (commitEvent.outcome === 'skipped' ? 'warn' : 'info'),
+      source: 'chat-event-handler',
+      detail: {
+        reason: commitEvent.reason,
+        stage: commitEvent.stage,
+        outcome: commitEvent.outcome,
+        commit_ok: commitOk,
+        commit_fence_drift: commitFenceDrift,
+        commit_error: commitError,
+        ...(commitEvent.detail ?? {}),
+      },
+    });
   }
 }
 

@@ -326,6 +326,39 @@ export async function readUserMapping(
 }
 
 /**
+ * Reverse lookup a user mapping by agent id. Used by AgentMail
+ * continuation mail: the counterparty may be external and absent from
+ * `user_mapping:<email>`, but the originating sent message already tells
+ * us which MAKOTO agent/session owns the thread.
+ */
+export async function readUserMappingByAgentId(
+  kv: KVNamespace,
+  agentId: string,
+): Promise<{ email: string; mapping: UserMappingValue } | null> {
+  let cursor: string | undefined;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const listResult = await kv.list({
+      prefix: `${KV_USER_MAPPING_PREFIX}:`,
+      cursor,
+    });
+    for (const entry of listResult.keys) {
+      const value = (await kv.get(entry.name, 'json')) as UserMappingValue | null;
+      if (value?.agent_id === agentId) {
+        return {
+          email: entry.name.slice(`${KV_USER_MAPPING_PREFIX}:`.length),
+          mapping: value,
+        };
+      }
+    }
+    if (listResult.list_complete) break;
+    cursor = listResult.cursor;
+    if (!cursor) break;
+  }
+  return null;
+}
+
+/**
  * Full mail-path resolver. Reads the per-user mapping, builds the
  * resources array sessions.create needs, and returns both the raw
  * resolution (for logging) and the wire-format resources list.
