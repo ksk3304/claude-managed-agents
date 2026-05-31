@@ -1,23 +1,23 @@
 ---
 name: cost-guard
-description: Use when a Google Chat user asks MAKOTOくん about Cost Guard, budget guardrails, safety device status, monthly USD/call limits, chat post limits, external API limits, or asks to pause, resume, enable, disable, or change those limits. Also match Japanese natural language such as コストガード, 安全装置, 予算ガード, 月額上限, 投稿数上限, 外部API上限, and the voice typo ポストカード.
+description: Google Chat ユーザーが MAKOTOくん に Cost Guard / コストガード / 安全装置 / 予算ガード / 月額上限 / 投稿数上限 / 外部API上限について聞いた時、または一時停止・再開・有効化・無効化・上限変更を頼んだ時に使う。音声入力の誤認「ポストカード」もコストガードとして扱う。
 ---
 
 # Cost Guard
 
-You help MAKOTOくん recognize and handle Cost Guard requests from Google Chat.
+MAKOTOくん が Google Chat で Cost Guard 関連の依頼を見分けるためのスキル。
 
-Cost Guard is the runtime safety layer that reports and controls budget-related guardrails:
+Cost Guard は、MAKOTOくん の実行コストと投稿量を守る安全装置。
 
-- Anthropic API monthly call limit.
-- Anthropic monthly USD limit.
-- Chat daily post limit.
-- External API daily call limit.
-- Temporary pause / resume / enable / disable.
+- Anthropic API 月次呼び出し上限
+- Anthropic 月次 USD 上限
+- Chat 日次投稿数上限
+- 外部 API 日次呼び出し上限
+- 一時停止 / 再開 / 有効化 / 無効化
 
-## Trigger Phrases
+## 起動する言い方
 
-Treat these as Cost Guard requests:
+以下は Cost Guard 依頼として扱う。
 
 - `コストガード見せて`
 - `コストガードどうなってる？`
@@ -30,34 +30,36 @@ Treat these as Cost Guard requests:
 - `Chat投稿数上限を50に変更`
 - `外部API上限を20にして`
 
-## Routing Rules
+## 処理ルール
 
-- Do not answer Cost Guard status from memory or guess current counters.
-- Status and mutation requests must be handled by the host application's deterministic Cost Guard handler.
-- Slash commands such as `/costguard status` are allowed, but users do not need to know them.
-- Prefer natural-language recognition. A single keyword such as `コストガード`, `安全装置`, or `ポストカード` can be enough when the surrounding message asks for status.
+- Cost Guard の現在値を記憶や推測で答えない。
+- 状態確認と設定変更は、ホストアプリ側の決定論的な Cost Guard handler に任せる。
+- `/costguard status` のような slash command も使えるが、ユーザーが覚える必要はない。
+- 自然文を優先する。`コストガード`、`安全装置`、`ポストカード` など単語だけでも、状態確認の文脈なら Cost Guard として扱う。
 
-## Permission Rules
+## 権限ルール
 
-- Status/read-only requests may be answered for normal Chat users if the host handler allows it.
-- Mutations are admin-only.
-- Dangerous mutations must not be treated as complete until the host handler confirms them.
-- If the host handler reports a confirmation token, tell the user the exact confirmation step it returned.
-- If the user is not an admin, do not suggest bypasses.
+- 状態確認は、ホスト handler が許可する通常ユーザーにも read-only で返してよい。
+- 設定変更は admin のみ。
+- 危険な設定変更は、ホスト handler の確認が終わるまで完了扱いにしない。
+- ホスト handler が確認 token を返したら、その確認手順をそのままユーザーに伝える。
+- ユーザーが admin でない場合、回避策を提案しない。
 
-## Mutation Mapping
+## 自然文から操作への対応
 
-Map natural language to the host operation:
+自然文は以下の操作に寄せる。
 
-- `再開`, `復帰`, `戻して`, `解除` -> resume.
-- `有効化`, `有効に`, `オンに` -> enable.
-- `一時停止`, `10分止めて`, `1時間止めて` -> pause with duration.
-- `無効化`, `無効に`, `オフに`, duration-free `止めて` -> disable.
-- `月額上限`, `予算`, `USD`, `ドル` + number -> set monthly USD hard cap.
-- `呼び数`, `呼び出し数`, `calls` + number -> set monthly Anthropic call hard cap.
-- `Chat投稿数`, `投稿数` + number -> set daily Chat post hard cap.
-- `外部API`, `external API` + number -> set daily external API hard cap.
+- `再開`、`復帰`、`戻して`、`解除` -> resume
+- `有効化`、`有効に`、`オンに` -> enable
+- `一時停止`、`10分止めて`、`1時間止めて` -> pause + duration
+- `無効化`、`無効に`、`オフに`、時間指定なしの `止めて` -> disable
+- `月額上限`、`予算`、`USD`、`ドル` + 数値 -> 月次 USD hard cap 変更
+- `呼び数`、`呼び出し数`、`calls` + 数値 -> 月次 Anthropic call hard cap 変更
+- `Chat投稿数`、`投稿数` + 数値 -> 日次 Chat 投稿数 hard cap 変更
+- `外部API`、`external API` + 数値 -> 日次外部 API hard cap 変更
 
-## Fallback
+## フォールバック
 
-If a Cost Guard request reaches you without a host handler result, respond briefly that the Cost Guard handler did not run and ask the user to retry with a natural phrase such as `コストガード見せて` or `安全装置を10分止めて`.
+Cost Guard 依頼なのにホスト handler の結果が無い場合は、短く「Cost Guard handler が動いていない」ことを伝える。
+
+そのうえで、`コストガード見せて` または `安全装置を10分止めて` のような自然文で再実行するよう案内する。
