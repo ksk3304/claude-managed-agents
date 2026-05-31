@@ -100,7 +100,11 @@ import {
   type SkillsData,
 } from '../lib/intent-detector';
 import { readUserMappingWithDefault } from '../lib/memory-attach';
-import { handleScheduleActionMarker } from '../lib/schedule-action-marker';
+import {
+  handleScheduleActionMarker,
+  parseScheduleActionMarkers,
+  stripScheduleActionMarkers,
+} from '../lib/schedule-action-marker';
 import {
   buildAnthropicClient,
   chatThreadSessionKey,
@@ -268,6 +272,19 @@ export async function handleChatEvent(
   const senderEmail = ((sender as { email?: string }).email || '').trim().toLowerCase();
   if (!senderEmail) {
     console.warn(`[chat-event] no sender email eventKey=${eventKey}`);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'chat_event_skipped',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        reason: 'no_sender_email',
+        sender_name_hash: stableHash(sender.name),
+        sender_type: senderType ?? null,
+        space_type: spaceType,
+      },
+    });
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_sender_email' };
   }
@@ -288,15 +305,41 @@ export async function handleChatEvent(
     console.warn(
       `[chat-event] unknown_sender eventKey=${eventKey} email=${redactPiiInText(senderEmail)}`,
     );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      eventType: 'chat_event_skipped',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        reason: 'unknown_sender',
+        sender_email_hash: stableHash(senderEmail),
+        default_user_slug_configured: Boolean(env.DEFAULT_USER_SLUG?.trim()),
+        space_type: spaceType,
+      },
+    });
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
   const userMapping = mappingResolution.mapping;
+  const actorTrusted = !mappingResolution.isDefault;
   if (mappingResolution.isDefault) {
     console.info(
       `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
         `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
     );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'chat_default_user_fallback',
+      source: 'chat-event-handler',
+      detail: {
+        sender_email_hash: stableHash(senderEmail),
+        default_slug: userMapping.user_slug,
+        external_tools_allowed: false,
+      },
+    });
   }
 
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
@@ -683,12 +726,19 @@ export async function handleChatEvent(
             }
           : {}),
         toolDispatcher: (toolName, toolInput) =>
-          dispatchMakotoTool(toolName, toolInput, {
-            env,
-            userSlug: userMapping.user_slug,
-            boundMessageId: '',
-            callerSessionId: sessionIdRef.current,
-          }),
+          actorTrusted
+            ? dispatchMakotoTool(toolName, toolInput, {
+                env,
+                userSlug: userMapping.user_slug,
+                boundMessageId: '',
+                callerSessionId: sessionIdRef.current,
+              })
+            : gateExternalToolCall(env, {
+                eventKey,
+                messageId: message.name,
+                userSlug: userMapping.user_slug,
+                toolName,
+              }),
         eventKey,
         messageId: message.name,
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
@@ -888,6 +938,7 @@ export async function handleChatEvent(
     sessionId,
     userMapping.agent_id,
     claim,
+    { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
 
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
@@ -903,14 +954,25 @@ export async function handleChatEvent(
   // or DM) は素通し = 旧挙動温存。
   const chatPostGateApplication = applyChatPostGateToText(
     emailParsed.cleanedText,
-    hasUnresolvedSpeakers,
+    hasUnresolvedSpeakers || !actorTrusted,
   );
   if (chatPostGateApplication.decision.gate) {
     console.log(
       `[chat-event] CHAT_POST gated eventKey=${eventKey} ` +
         `reason=${chatPostGateApplication.decision.reason} ` +
-        `(unresolved speakers in history)`,
+        (actorTrusted ? `(unresolved speakers in history)` : `(default actor fallback)`),
     );
+    if (!actorTrusted) {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'external_tool_gated',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { tool_family: 'CHAT_POST', actor_source: 'default_user_fallback' },
+      });
+    }
   }
   const chatPostResult = await dispatchChatPostMarkers(
     env,
@@ -930,6 +992,7 @@ export async function handleChatEvent(
     env,
     eventKey,
     chatPostResult.cleanedText,
+    { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
 
   // 7d. current space 投稿 (clean 後本文)
@@ -1087,6 +1150,44 @@ export async function handleChatEvent(
 // helper: dispatch EMAIL_SEND markers
 // ---------------------------------------------------------------------------
 
+interface ActorGateOptions {
+  actorTrusted: boolean;
+  messageId: string | null;
+  userSlug: string;
+}
+
+async function gateExternalToolCall(
+  env: Env,
+  input: {
+    eventKey: string;
+    messageId: string | null;
+    userSlug: string;
+    toolName: string;
+  },
+): Promise<{ ok: false; payload: { error: string; tool: string; message: string } }> {
+  await recordRuntimeEvent(env, {
+    eventKey: input.eventKey,
+    messageId: input.messageId,
+    userSlug: input.userSlug,
+    eventType: 'external_tool_gated',
+    level: 'warn',
+    source: 'chat-event-handler',
+    detail: {
+      tool_family: 'custom_tool',
+      tool: input.toolName,
+      actor_source: 'default_user_fallback',
+    },
+  });
+  return {
+    ok: false,
+    payload: {
+      error: 'external_tool_gated',
+      tool: input.toolName,
+      message: '外部連携操作は登録済みユーザーの現在発話でのみ実行します。',
+    },
+  };
+}
+
 /**
  * Inline 実装 (= agentmail-dispatch.ts と同等 logic だが import せず別実装)。
  * 理由: agentmail-dispatch.ts は AgentMail webhook 経路専用 (inbox_id を webhook
@@ -1100,8 +1201,31 @@ async function dispatchEmailMarkers(
   sessionId: string,
   agentId: string,
   claim: { owner: string; version: number },
+  gate: ActorGateOptions,
 ): Promise<EmailDispatchSummary[]> {
   if (markers.length === 0) return [];
+  if (!gate.actorTrusted) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: gate.messageId,
+      userSlug: gate.userSlug,
+      eventType: 'external_tool_gated',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        tool_family: 'EMAIL_SEND',
+        marker_count: markers.length,
+        actor_source: 'default_user_fallback',
+      },
+    });
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: '外部連携操作は登録済みユーザーの現在発話でのみ実行します',
+    }));
+  }
   const summaries: EmailDispatchSummary[] = [];
   const apiKey = env.AGENTMAIL_API_KEY;
   const inboxId = env.AGENTMAIL_DEFAULT_INBOX_ID;
@@ -1551,7 +1675,27 @@ async function dispatchScheduleActionMarkers(
   env: Env,
   eventKey: string,
   inputText: string,
+  gate: ActorGateOptions,
 ): Promise<ScheduleDispatchResult> {
+  const gatedMarkers = gate.actorTrusted ? [] : parseScheduleActionMarkers(inputText);
+  if (!gate.actorTrusted && gatedMarkers.length > 0) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: gate.messageId,
+      userSlug: gate.userSlug,
+      eventType: 'external_tool_gated',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        tool_family: 'SCHEDULE_ACTION',
+        marker_count: gatedMarkers.length,
+        actor_source: 'default_user_fallback',
+      },
+    });
+    const prefix = stripScheduleActionMarkers(inputText).trim();
+    const notice = '外部連携操作は登録済みユーザーの現在発話でのみ実行します。';
+    return { cleanedText: prefix ? `${prefix}\n${notice}` : notice };
+  }
   const saKey = env.CHAT_SA_KEY_JSON;
   const project = env.GCP_SCHEDULER_PROJECT;
   const location = env.GCP_SCHEDULER_LOCATION;
