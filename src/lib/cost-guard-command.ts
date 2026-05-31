@@ -138,10 +138,10 @@ function buildStatusText(
     `- Anthropic 月累計 USD: ${status.current.anthropicMonthlyUsd} / ${status.limit.anthropicMonthlyUsd}`,
   );
   lines.push(
-    `- Chat 日次件数: ${status.current.chatDailyCount} / ${status.limit.chatDailyCount}`,
+    `- Chat 日次件数 (この返信直前): ${status.current.chatDailyCount} / ${status.limit.chatDailyCount}`,
   );
   lines.push(
-    `- 外部 API 呼び数 (日次): ${status.current.externalApiDailyCount} / ${status.limit.externalApiDailyCount}`,
+    `- 外部 API 呼び数 (日次): ${status.current.externalApiDailyCount} / ${status.limit.externalApiDailyCount} (一部経路は未計測)`,
   );
   lines.push(`- 超過軸: ${exceededLabel}`);
   lines.push(`- 有効状態: ${status.config.enabled ? 'enabled' : 'disabled'}`);

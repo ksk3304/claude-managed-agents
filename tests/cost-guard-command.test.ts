@@ -256,7 +256,8 @@ describe('handleCostGuardCommand status', () => {
     expect(text).toContain('someone@example.com (read-only)');
     // KV 空 = 現在値 0、default 上限が出る
     expect(text).toContain('Anthropic 月累計 USD: 0 / 300');
-    expect(text).toContain('Chat 日次件数: 0 / 200');
+    expect(text).toContain('Chat 日次件数 (この返信直前): 0 / 200');
+    expect(text).toContain('外部 API 呼び数 (日次): 0 / 1000 (一部経路は未計測)');
     expect(text).toContain('超過軸: なし');
     expect(text).toContain('operator 通知 space: 未設定 (警告は no-op)');
   });
