@@ -75,9 +75,11 @@ import { extractBody, extractThreadRefs, reChainDepth } from '../lib/email-threa
 import { parseAssistantText } from '../lib/email-send-marker';
 import { fetchMailThreadMessages } from '../lib/mail-history';
 import {
+  readUserMappingWithDefault,
   readUserMappingByAgentId,
   resolveSenderToResources,
 } from '../lib/memory-attach';
+import { toResourceParam, type MemoryStoreResourceParam } from '../types/memory';
 import {
   buildAnthropicClient,
   createSessionWithResources,
@@ -130,29 +132,6 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     }
   }
 
-  const senderResolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
-  let userSlug = senderResolution?.user_slug ?? '';
-  let agentId = senderResolution?.agent_id ?? '';
-  const resources = senderResolution?.resources ?? [];
-
-  if (sessionId !== null && sessionAgentId) {
-    const owner = await readUserMappingByAgentId(env.MAKOTO_KV, sessionAgentId);
-    agentId = sessionAgentId;
-    userSlug = owner?.mapping.user_slug ?? userSlug;
-    if (!userSlug) {
-      userSlug = `agent-${sessionAgentId.slice(-8)}`;
-      console.warn(
-        `[agentmail-dispatch] continuation owner mapping missing eventKey=${eventKey} agent=${sessionAgentId}`,
-      );
-    } else if (senderResolution && senderResolution.agent_id !== sessionAgentId) {
-      console.warn(
-        `[agentmail-dispatch] continuation sender mapping differs eventKey=${eventKey} sender_agent=${senderResolution.agent_id} owner_agent=${sessionAgentId}`,
-      );
-    }
-  } else if (!senderResolution) {
-    return { kind: 'skipped', reason: 'unknown_sender' };
-  }
-
   // 2. Anthropic client.
   const client = buildAnthropicClient(env);
   if (!client) {
@@ -193,6 +172,13 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     console.log(
       `[agentmail-dispatch] signalB eventKey=${eventKey} thread_id=${threadId} self=${scan.selfPresent} messages=${scan.messages.length} senders_self=${scan.sendersSelf}`,
     );
+    if (scan.selfPresent && sessionId === null) {
+      const recovered = await findSessionInThreadHistory(env.DB, scan.messages);
+      if (recovered) {
+        sessionId = recovered.sessionId;
+        sessionAgentId = recovered.agentId;
+      }
+    }
   }
   const isContinuation =
     sessionId !== null || signalBHasSelf || reChainDepth(message.subject) >= 1;
@@ -215,6 +201,35 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   ) {
     await tryNotifyInbound(env, message, false, eventKey);
     return { kind: 'committed' };
+  }
+
+  const senderResolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
+  let userSlug = senderResolution?.user_slug ?? '';
+  let agentId = senderResolution?.agent_id ?? '';
+  let resources: MemoryStoreResourceParam[] = senderResolution?.resources ?? [];
+
+  if (sessionId !== null && sessionAgentId) {
+    const owner = await readUserMappingByAgentId(env.MAKOTO_KV, sessionAgentId);
+    agentId = sessionAgentId;
+    userSlug = owner?.mapping.user_slug ?? userSlug;
+    if (!userSlug) {
+      userSlug = `agent-${sessionAgentId.slice(-8)}`;
+      console.warn(
+        `[agentmail-dispatch] continuation owner mapping missing eventKey=${eventKey} agent=${sessionAgentId}`,
+      );
+    } else if (senderResolution && senderResolution.agent_id !== sessionAgentId) {
+      console.warn(
+        `[agentmail-dispatch] continuation sender mapping differs eventKey=${eventKey} sender_agent=${senderResolution.agent_id} owner_agent=${sessionAgentId}`,
+      );
+    }
+  } else if (!senderResolution) {
+    const fallback = await resolveDefaultMailOwner(env);
+    if (!fallback) {
+      return { kind: 'skipped', reason: 'no_mail_owner_mapping' };
+    }
+    userSlug = fallback.userSlug;
+    agentId = fallback.agentId;
+    resources = fallback.resources;
   }
 
   let userMessage: string;
@@ -610,6 +625,49 @@ async function fetchAgentMailThread(
   }
   const text = await resp.text();
   return text.length === 0 ? {} : (JSON.parse(text) as AgentMailThread);
+}
+
+async function findSessionInThreadHistory(
+  db: D1Database,
+  messages: AgentMailMessage[],
+): Promise<{ sessionId: string; agentId: string } | null> {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    const refs = extractThreadRefs(msg);
+    const candidates = [
+      ...(typeof msg.message_id === 'string' ? [msg.message_id] : []),
+      ...(typeof msg.rfc822_message_id === 'string' ? [msg.rfc822_message_id] : []),
+      ...refs.references,
+    ];
+    for (const candidate of candidates) {
+      const found = await findSessionByRfc822MessageId(db, envNormalizeMessageId(candidate));
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function resolveDefaultMailOwner(
+  env: AgentMailDispatchContext['env'],
+): Promise<{
+  userSlug: string;
+  agentId: string;
+  resources: MemoryStoreResourceParam[];
+} | null> {
+  const r = await readUserMappingWithDefault(env.MAKOTO_KV, '', env.DEFAULT_USER_SLUG);
+  if (!r) return null;
+  return {
+    userSlug: r.mapping.user_slug,
+    agentId: r.mapping.agent_id,
+    resources: r.mapping.memory_attachments.map(toResourceParam),
+  };
+}
+
+function envNormalizeMessageId(raw: string): string {
+  let s = raw.trim();
+  if (s.startsWith('<') && s.endsWith('>')) s = s.slice(1, -1).trim();
+  return s.toLowerCase();
 }
 
 /**

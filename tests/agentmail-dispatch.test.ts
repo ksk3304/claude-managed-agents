@@ -179,7 +179,7 @@ describe('agentmailDispatch', () => {
     installFakeAnthropic({ events: [] });
     const result = await agentmailDispatch(ctx);
     expect(result.kind).toBe('skipped');
-    if (result.kind === 'skipped') expect(result.reason).toBe('unknown_sender');
+    if (result.kind === 'skipped') expect(result.reason).toBe('no_mail_owner_mapping');
   });
 
   it('happy path: fresh session → EMAIL_SEND marker → AgentMail send', async () => {
@@ -334,6 +334,30 @@ describe('agentmailDispatch', () => {
       ctx.env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } }
     )._tables.sent_messages;
     expect(sent.size).toBe(0);
+  });
+
+  it('cold inbound notify-only does not require sender user_mapping', async () => {
+    chatApiMock.posts.length = 0;
+    const ctx = makeDispatchContext({
+      env: {
+        MAKOTO_NOTIFY_SPACE: 'spaces/ABCNotify',
+        CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
+      },
+      message: {
+        ...INBOUND_MSG,
+        from: 'external@example.net',
+        subject: '新規問い合わせ',
+        in_reply_to: undefined,
+        references: undefined,
+      },
+    });
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+    installFakeAnthropic({ events: [] });
+
+    const result = await agentmailDispatch(ctx);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('📨 新規問い合わせ (cold inbound)');
   });
 
   // ---------------------------------------------------------------------------
