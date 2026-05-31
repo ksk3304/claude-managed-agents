@@ -452,6 +452,20 @@ async function putMapping(env: Env, email: string, opts: { withSessionLog?: bool
   );
 }
 
+function runtimeEvents(env: Env): Array<Record<string, unknown>> {
+  return (env.DB as unknown as {
+    _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+  })._tables.cma_worker_runtime_events;
+}
+
+function commitDecision(env: Env, reason: string): Record<string, unknown> | undefined {
+  return runtimeEvents(env).find((row) => {
+    if (row.event_type !== 'chat_event_commit_decision') return false;
+    const detail = JSON.parse(String(row.detail_json));
+    return detail.reason === reason;
+  });
+}
+
 beforeEach(() => {
   _resetChatOAuthCacheForTests();
   chatApiMock.posts.length = 0;
@@ -987,6 +1001,13 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('skipped');
     if (result.kind === 'skipped') expect(result.reason).toBe('not_for_bot');
     expect(chatApiMock.posts).toHaveLength(0);
+    const decision = commitDecision(env, 'not_for_bot');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'bot_mention_filter',
+      outcome: 'skipped',
+      commit_ok: true,
+    });
   });
 
   it('Case 4: BOT sender → skip + commit', async () => {
@@ -1000,6 +1021,31 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('skipped');
     if (result.kind === 'skipped') expect(result.reason).toBe('bot_sender');
     expect(chatApiMock.posts).toHaveLength(0);
+    const decision = commitDecision(env, 'bot_sender');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'sender_filter',
+      outcome: 'skipped',
+      commit_ok: true,
+    });
+  });
+
+  it('message field 不在 → no_message skip + commit 理由を D1 に残す', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    (msg.payload as { message?: unknown }).message = undefined;
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('skipped');
+    if (result.kind === 'skipped') expect(result.reason).toBe('no_message');
+    const decision = commitDecision(env, 'no_message');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'payload_extract',
+      outcome: 'skipped',
+      commit_ok: true,
+    });
   });
 
   it('Case 5: body 空 + thread あり → mention-only 指示文で agent に渡し継続', async () => {
@@ -1054,6 +1100,13 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('（空メッセージ）');
+    const decision = commitDecision(env, 'empty_message_reply_posted');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'mention_strip',
+      outcome: 'committed',
+      commit_ok: true,
+    });
   });
 
   it('Case 7: CHAT_POST marker → 別 space に投稿 + current space に clean 後本文', async () => {
@@ -1445,6 +1498,13 @@ describe('handleChatEvent', () => {
       reason: 'unknown_sender',
       default_user_slug_configured: false,
     });
+    const decision = commitDecision(env, 'unknown_sender');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'sender_mapping_resolve',
+      outcome: 'skipped',
+      commit_ok: true,
+    });
   });
 
   it('sender email 不在 → no_sender_email skip を D1 runtime event に残す', async () => {
@@ -1465,6 +1525,13 @@ describe('handleChatEvent', () => {
     expect(skipped).toBeDefined();
     expect(JSON.parse(String(skipped!.detail_json))).toMatchObject({
       reason: 'no_sender_email',
+    });
+    const decision = commitDecision(env, 'no_sender_email');
+    expect(decision).toBeDefined();
+    expect(JSON.parse(String(decision!.detail_json))).toMatchObject({
+      stage: 'sender_mapping_resolve',
+      outcome: 'skipped',
+      commit_ok: true,
     });
   });
 
