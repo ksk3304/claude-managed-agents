@@ -23,6 +23,19 @@ For all limits and quotas, retrieve from the product's `/platform/limits/` page.
 
 Run `wrangler types` after changing bindings in wrangler.jsonc.
 
+## Production Change Safety
+
+For production Cloudflare Worker changes, use the same safety pattern a real
+production team would use:
+
+- Start from the current deployed/recovery base in a dedicated clean worktree and branch. Do not deploy from an old dirty branch or a branch that contains unrelated issue commits.
+- Before editing, classify the touched path as isolated or hot path. Treat Google Chat, AgentMail, scheduled jobs, queues, D1/KV access, tool dispatch, and `src/queue/chat-event-handler.ts` as hot paths.
+- For hot path behavior changes, prefer a feature flag or kill switch with the current production behavior as the default. If a flag is not practical, state why and get explicit approval before deploy.
+- Preserve neighboring behavior with regression tests. A chat handler change must cover normal reply, `EMAIL_SEND`, `CHAT_POST`, schedule action, unknown sender/default fallback, and any touched queue/cron path.
+- Separate code deploy from state changes. Do not combine Worker code deploy with D1 migrations, KV writes/deletes, secrets changes, binding changes, or rollback unless each state change is listed and approved separately.
+- Before deploy, show `git log <base>..HEAD`, changed files, test results, deploy command, expected side effects, and rollback target/version.
+- After deploy, read back the active Worker version and relevant logs/events. Do not claim "no side effects" until production readback or smoke coverage supports it; say what remains unverified.
+
 ## Node.js Compatibility
 
 https://developers.cloudflare.com/workers/runtime-apis/nodejs/
