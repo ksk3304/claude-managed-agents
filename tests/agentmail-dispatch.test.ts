@@ -36,6 +36,10 @@ interface FakeAnthOpts {
   events: Array<Record<string, unknown>>;
   /** Capture all events.send payloads. */
   sendCapture?: Array<unknown>;
+  /** Capture the session id passed to events.send. */
+  sendSessionCapture?: Array<string>;
+  /** Capture sessions.create calls. */
+  createCapture?: Array<unknown>;
   /** Pre-allocated session id `sessions.create` returns. */
   sessionId?: string;
 }
@@ -48,10 +52,12 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
     beta: {
       sessions: {
         async create(_args: unknown) {
+          opts.createCapture?.push(_args);
           return { id: opts.sessionId ?? 'sesn_new' };
         },
         events: {
           async send(_sessionId: string, payload: unknown): Promise<void> {
+            opts.sendSessionCapture?.push(_sessionId);
             opts.sendCapture?.push(payload);
           },
           async stream(_sessionId: string, _o: unknown): Promise<AsyncIterable<Record<string, unknown>>> {
@@ -399,6 +405,95 @@ describe('agentmailDispatch', () => {
       expect(
         (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
       ).toBe('agentmail_auto_reply');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('continuation via sent_messages does not require counterparty user_mapping', async () => {
+    chatApiMock.posts.length = 0;
+    const sendSessionCapture: string[] = [];
+    const createCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        id: 'msg_external_reply',
+        from: 'external@example.net',
+        subject: 'Re: こんにちは',
+        in_reply_to: '<outbound-rfc822@example.com>',
+        references: ['<outbound-rfc822@example.com>'],
+        message_id: '<external-reply@example.net>',
+      },
+      event: {
+        id: 'evt_external_reply',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          id: 'msg_external_reply',
+          from: 'external@example.net',
+          subject: 'Re: こんにちは',
+          in_reply_to: '<outbound-rfc822@example.com>',
+          references: ['<outbound-rfc822@example.com>'],
+          message_id: '<external-reply@example.net>',
+          inbox_id: 'inbox_main',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:k.seto@makotoprime.com',
+      JSON.stringify({ user_slug: 'k-seto', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+    await ctx.env.DB.prepare(
+      `INSERT OR REPLACE INTO sent_messages
+         (message_id, session_id, agent_id, to_addr, sent_at_ms, rfc822_msgid, auto_reply_policy)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+    )
+      .bind(
+        'msg_out_original',
+        'sesn_existing_mail',
+        'agent_001',
+        'external@example.net',
+        Date.now(),
+        'outbound-rfc822@example.com',
+        'chat_user_requested',
+      )
+      .run();
+
+    const replyBody = '外部返信にも自動返信します。';
+    installFakeAnthropic({
+      sendSessionCapture,
+      createCapture,
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            `EMAIL_SEND:{"to":"external@example.net","subject":"Re: こんにちは","body":"${replyBody}"}`,
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: unknown[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: init.body });
+      return new Response(
+        JSON.stringify({
+          message_id: 'msg_external_auto_reply',
+          rfc822_message_id: '<auto-reply@example.com>',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      expect(createCapture).toHaveLength(0);
+      expect(sendSessionCapture).toEqual(['sesn_existing_mail']);
+      expect(amCalls).toHaveLength(1);
     } finally {
       globalThis.fetch = origFetch;
     }

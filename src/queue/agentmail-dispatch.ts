@@ -74,7 +74,10 @@ import {
 import { extractBody, extractThreadRefs, reChainDepth } from '../lib/email-thread';
 import { parseAssistantText } from '../lib/email-send-marker';
 import { fetchMailThreadMessages } from '../lib/mail-history';
-import { resolveSenderToResources } from '../lib/memory-attach';
+import {
+  readUserMappingByAgentId,
+  resolveSenderToResources,
+} from '../lib/memory-attach';
 import {
   buildAnthropicClient,
   createSessionWithResources,
@@ -102,17 +105,53 @@ const SESSION_STREAM_TIMEOUT_MS = 110_000;
  * the claim + DO lock are acquired.
  */
 export const agentmailDispatch: AgentMailDispatcher = async (context) => {
-  // 1. Sender resolution.
+  // 1. Sender + thread identity.
   const { env, event, message, rfc822MsgId, claim, eventKey } = context;
   const sender = typeof message.from === 'string' ? message.from : '';
   if (!sender) {
     return { kind: 'skipped', reason: 'no_sender' };
   }
-  const resolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
-  if (!resolution) {
+
+  // RFC 822 thread resolve must run before sender mapping. External
+  // counterparties replying to MAKOTO-sent mail are often absent from
+  // `user_mapping:<email>`; the sent_messages row is the authority for
+  // continuation routing.
+  const refs = extractThreadRefs(message);
+  let sessionId: string | null = null;
+  let sessionAgentId: string | null = null;
+  for (let i = refs.references.length - 1; i >= 0; i--) {
+    const candidate = refs.references[i];
+    if (!candidate) continue;
+    const found = await findSessionByRfc822MessageId(env.DB, candidate);
+    if (found) {
+      sessionId = found.sessionId;
+      sessionAgentId = found.agentId;
+      break;
+    }
+  }
+
+  const senderResolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
+  let userSlug = senderResolution?.user_slug ?? '';
+  let agentId = senderResolution?.agent_id ?? '';
+  const resources = senderResolution?.resources ?? [];
+
+  if (sessionId !== null && sessionAgentId) {
+    const owner = await readUserMappingByAgentId(env.MAKOTO_KV, sessionAgentId);
+    agentId = sessionAgentId;
+    userSlug = owner?.mapping.user_slug ?? userSlug;
+    if (!userSlug) {
+      userSlug = `agent-${sessionAgentId.slice(-8)}`;
+      console.warn(
+        `[agentmail-dispatch] continuation owner mapping missing eventKey=${eventKey} agent=${sessionAgentId}`,
+      );
+    } else if (senderResolution && senderResolution.agent_id !== sessionAgentId) {
+      console.warn(
+        `[agentmail-dispatch] continuation sender mapping differs eventKey=${eventKey} sender_agent=${senderResolution.agent_id} owner_agent=${sessionAgentId}`,
+      );
+    }
+  } else if (!senderResolution) {
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
-  const { user_slug: userSlug, agent_id: agentId, resources } = resolution;
 
   // 2. Anthropic client.
   const client = buildAnthropicClient(env);
@@ -123,22 +162,6 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       `[agentmail-dispatch] skip eventKey=${eventKey} reason=no_anthropic_api_key`,
     );
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
-  }
-
-  // 3. Thread resolve via In-Reply-To / References. The references
-  // array is oldest-first; we scan in reverse so the most-recent
-  // ancestor matches first (= least chance of routing into a
-  // long-stale session).
-  const refs = extractThreadRefs(message);
-  let sessionId: string | null = null;
-  for (let i = refs.references.length - 1; i >= 0; i--) {
-    const candidate = refs.references[i];
-    if (!candidate) continue;
-    const found = await findSessionByRfc822MessageId(env.DB, candidate);
-    if (found && found.agentId === agentId) {
-      sessionId = found.sessionId;
-      break;
-    }
   }
 
   const inboxIdForThread = extractInboxId(event);
