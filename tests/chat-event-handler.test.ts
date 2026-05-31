@@ -488,6 +488,25 @@ describe('handleChatEvent', () => {
     ).resolves.toBe(1);
   });
 
+  it('natural Cost Guard wording short-circuits to deterministic status handler', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '安全装置どうなってる？' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('Cost Guard 状態');
+    await expect(
+      readCounter(
+        { db: env.DB, kv: env.MAKOTO_KV },
+        costGuardInternals.KIND_CHAT_POST,
+      ),
+    ).resolves.toBe(1);
+  });
+
   it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
     const env = buildEnv({
       envOverrides: {

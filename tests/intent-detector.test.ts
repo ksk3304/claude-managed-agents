@@ -215,6 +215,7 @@ const SKILLS_DATA: SkillsData = {
   skills: {
     '/mail': { attach_memory: false }, // action skill = ephemeral
     '/schedule': { attach_memory: false }, // action skill
+    '/costguard': { attach_memory: false }, // deterministic action skill
     '/help': { attach_memory: true }, // 通常 skill = 既存セッション継続
     '/notes': {}, // attach_memory 未指定 = 既定 true 扱い → 通常 skill
   },
@@ -233,6 +234,13 @@ describe('detectActionSkillIntent', () => {
     const r = detectActionSkillIntent('/help', SKILLS_DATA);
     expect(r!.command).toBe('/help');
     expect(r!.isActionSkill).toBe(false);
+  });
+
+  it('detects /costguard slash command as action skill', () => {
+    const r = detectActionSkillIntent('/costguard status', SKILLS_DATA);
+    expect(r!.command).toBe('/costguard');
+    expect(r!.isActionSkill).toBe(true);
+    expect(r!.source).toBe('slash_command');
   });
 
   it('detects /notes (attach_memory unspecified) as non-action', () => {

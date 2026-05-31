@@ -83,6 +83,7 @@ import {
   parseCostGuardCommand,
   handleCostGuardCommand,
 } from '../lib/cost-guard-command';
+import { parseNaturalCostGuardCommand } from '../lib/cost-guard-natural-command';
 import { extractFinalMarkerText } from '../lib/final-marker';
 import {
   evaluateSessionCostAfterTurn,
@@ -177,6 +178,7 @@ export const ACTION_SKILL_INTENT_TABLE: SkillsData = {
   skills: {
     '/mail': { attach_memory: false },
     '/schedule': { attach_memory: false },
+    '/costguard': { attach_memory: false },
   },
 };
 
@@ -328,7 +330,7 @@ export async function handleChatEvent(
   }
 
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
-  const cgCommand = parseCostGuardCommand(bodyText);
+  const cgCommand = parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
   if (cgCommand) {
     const cgText = await handleCostGuardCommand(
       env,
