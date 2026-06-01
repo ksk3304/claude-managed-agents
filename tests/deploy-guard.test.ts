@@ -6,8 +6,10 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   checkRequiredMarkers,
+  collectGitContext,
   evaluateBranchPolicy,
   evaluateDeployGuard,
+  evaluateRunContextPolicy,
   readDeployTarget,
   renderReport,
   REQUIRED_MARKERS,
@@ -148,6 +150,48 @@ describe("deploy guard", () => {
     ).toBe(true);
   });
 
+  it("requires GitHub Actions or an explicit reason for emergency local deploy", () => {
+    expect(evaluateRunContextPolicy({}).ok).toBe(false);
+
+    expect(
+      evaluateRunContextPolicy({
+        DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY: "1",
+      }).ok,
+    ).toBe(false);
+
+    expect(
+      evaluateRunContextPolicy({
+        DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY: "1",
+        DEPLOY_GUARD_LOCAL_DEPLOY_REASON: "production incident rollback",
+      }).localOverrideAccepted,
+    ).toBe(true);
+  });
+
+  it("allows GitHub Actions deploy from main when fresh and markers exist", () => {
+    const root = makeGitRoot();
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("uses origin/main as the production freshness baseline even from feature branches", () => {
+    const root = makeGitRoot();
+    git(root, ["checkout", "-b", "codex/feature"]);
+    git(root, ["branch", "origin/codex/feature"]);
+    git(root, ["branch", "--set-upstream-to", "origin/codex/feature"]);
+
+    const context = collectGitContext(root, { fetchRemote: false });
+
+    expect(context.upstream).toBe("origin/main");
+  });
+
   it("fails closed when HEAD does not contain origin/main", () => {
     const root = makeGitRoot();
     git(root, ["checkout", "-b", "codex/stale-worktree"]);
@@ -164,6 +208,8 @@ describe("deploy guard", () => {
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
       env: {
+        DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY: "1",
+        DEPLOY_GUARD_LOCAL_DEPLOY_REASON: "test stale branch local deploy",
         DEPLOY_GUARD_ALLOW_NON_MAIN: "1",
         DEPLOY_GUARD_OVERRIDE_REASON: "test stale branch override still needs freshness",
       },

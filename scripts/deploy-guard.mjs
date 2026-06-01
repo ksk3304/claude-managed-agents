@@ -83,8 +83,7 @@ export function collectGitContext(root, options = {}) {
   const headShort = runGit(root, ['rev-parse', '--short=12', 'HEAD']);
   const status = runGit(root, ['status', '--porcelain']);
   const statusCount = status === '' ? 0 : status.split('\n').filter(Boolean).length;
-  let upstream = tryGit(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
-  if (!upstream) upstream = 'origin/main';
+  const upstream = options.upstreamRef ?? process.env.DEPLOY_GUARD_UPSTREAM_REF ?? 'origin/main';
 
   let fetchError = '';
   if (options.fetchRemote !== false) {
@@ -143,13 +142,35 @@ export function evaluateBranchPolicy(git, env = process.env) {
   };
 }
 
+export function evaluateRunContextPolicy(env = process.env) {
+  const inGitHubActions = env.GITHUB_ACTIONS === 'true';
+  const localOverrideEnabled = env.DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY === '1';
+  const localOverrideReason = (env.DEPLOY_GUARD_LOCAL_DEPLOY_REASON || '').trim();
+  const localOverrideAccepted = !inGitHubActions && localOverrideEnabled && localOverrideReason.length > 0;
+
+  return {
+    inGitHubActions,
+    localOverrideEnabled,
+    localOverrideReason,
+    localOverrideAccepted,
+    ok: inGitHubActions || localOverrideAccepted,
+  };
+}
+
 export function evaluateDeployGuard(root, options = {}) {
   const target = readDeployTarget(root);
   const git = collectGitContext(root, options);
-  const branchPolicy = evaluateBranchPolicy(git, options.env ?? process.env);
+  const env = options.env ?? process.env;
+  const branchPolicy = evaluateBranchPolicy(git, env);
+  const runContextPolicy = evaluateRunContextPolicy(env);
   const markerChecks = checkRequiredMarkers(root, options.requirements ?? REQUIRED_MARKERS);
   const failures = [];
 
+  if (!runContextPolicy.ok) {
+    failures.push(
+      'production deploys normally run from GitHub Actions; set DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY=1 and DEPLOY_GUARD_LOCAL_DEPLOY_REASON for emergency local deploy',
+    );
+  }
   if (!branchPolicy.ok) {
     failures.push(
       `production deploys are allowed only from ${PRODUCTION_BRANCHES.join('/')} (current: ${branchPolicy.effectiveBranch}); merge via PR first`,
@@ -174,6 +195,7 @@ export function evaluateDeployGuard(root, options = {}) {
     target,
     git,
     branchPolicy,
+    runContextPolicy,
     markerChecks,
     failures,
   };
@@ -194,6 +216,14 @@ export function renderReport(result) {
       lines.push(`[deploy-guard] OVERRIDE non-main deploy allowed: ${result.branchPolicy.overrideReason}`);
     }
   }
+  if (result.runContextPolicy) {
+    lines.push(
+      `[deploy-guard] deploy_runner=${result.runContextPolicy.inGitHubActions ? 'github_actions' : 'local'}`,
+    );
+    if (result.runContextPolicy.localOverrideAccepted) {
+      lines.push(`[deploy-guard] OVERRIDE local deploy allowed: ${result.runContextPolicy.localOverrideReason}`);
+    }
+  }
   lines.push(
     `[deploy-guard] upstream=${result.git.upstream}` +
       (result.git.upstreamShort ? `@${result.git.upstreamShort}` : '@(missing)'),
@@ -209,6 +239,9 @@ export function renderReport(result) {
   }
   if (result.branchPolicy?.isProductionBranch) {
     lines.push(`[deploy-guard] OK production branch: ${result.branchPolicy.effectiveBranch}`);
+  }
+  if (result.runContextPolicy?.inGitHubActions) {
+    lines.push('[deploy-guard] OK deploy runner: GitHub Actions');
   }
   for (const check of result.markerChecks) {
     if (check.ok) {
