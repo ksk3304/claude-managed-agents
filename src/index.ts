@@ -50,6 +50,7 @@ import {
   handleWorkspaceOAuthStart,
 } from "./lib/workspace-oauth-flow";
 import { ensureMakotoAgentCustomTools } from "./lib/makoto-agent-tools";
+import { dispatchMakotoTool } from "./dispatch/makoto-tool-dispatcher";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -145,6 +146,13 @@ export default {
       request.method === "POST"
     ) {
       return handleEnsureMakotoAgentTools(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/admin/makoto-tool" &&
+      request.method === "POST"
+    ) {
+      return handleAdminMakotoTool(request, env);
     }
 
     return new Response("not found", { status: 404 });
@@ -477,6 +485,36 @@ async function handleEnsureMakotoAgentTools(request: Request, env: Env): Promise
     added: ensured.added,
     present: ensured.present,
   });
+}
+
+async function handleAdminMakotoTool(request: Request, env: Env): Promise<Response> {
+  const expected = (
+    env.MAKOTO_DEBUG_TOKEN ||
+    env.MAKOTO_WORKSPACE_OAUTH_ADMIN_TOKEN ||
+    ""
+  ).trim();
+  if (!expected) return new Response("not found", { status: 404 });
+  const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
+  if (got !== expected) return new Response("not found", { status: 404 });
+
+  let body: { user_slug?: string; tool?: string; input?: unknown };
+  try {
+    body = (await request.json()) as { user_slug?: string; tool?: string; input?: unknown };
+  } catch {
+    return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  const userSlug = (body.user_slug || "").trim();
+  const tool = (body.tool || "").trim();
+  if (!userSlug || !tool) {
+    return Response.json({ ok: false, error: "user_slug and tool required" }, { status: 400 });
+  }
+  const result = await dispatchMakotoTool(tool, body.input ?? {}, {
+    env,
+    userSlug,
+    boundMessageId: "admin-makoto-tool",
+    callerSessionId: "admin-makoto-tool",
+  });
+  return Response.json(result);
 }
 
 function safeDebugId(value: string): string {
