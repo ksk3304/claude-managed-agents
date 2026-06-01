@@ -1,10 +1,13 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   checkRequiredMarkers,
+  evaluateBranchPolicy,
+  evaluateDeployGuard,
   readDeployTarget,
   renderReport,
   REQUIRED_MARKERS,
@@ -25,6 +28,33 @@ function makeRoot() {
     path.join(root, "wrangler.jsonc"),
     '{\n  // JSONC comments are allowed here\n  "name": "claude-managed-agents-control-plane"\n}\n',
   );
+  return root;
+}
+
+function git(root: string, args: string[]) {
+  return execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function makeGitRoot() {
+  const root = makeRoot();
+  writeFileSync(
+    path.join(root, "src/queue/chat-event-handler.ts"),
+    "const eventType = 'pdf_preflight_result';\nfunction pendingPdfPreflightApprovalKey() {}\n",
+  );
+  writeFileSync(
+    path.join(root, "tests/chat-event-handler.test.ts"),
+    "expect(runtimeEvents).toContain('pdf_preflight_result');\n",
+  );
+  git(root, ["init", "-b", "main"]);
+  git(root, ["config", "user.email", "test@example.com"]);
+  git(root, ["config", "user.name", "Deploy Guard Test"]);
+  git(root, ["add", "."]);
+  git(root, ["commit", "-m", "initial"]);
+  git(root, ["branch", "origin/main"]);
   return root;
 }
 
@@ -87,5 +117,61 @@ describe("deploy guard", () => {
       expect(report).toContain(marker);
     }
     expect(report).toContain("BLOCKED production deploy refused");
+  });
+
+  it("blocks non-main production deploys by default", () => {
+    const result = evaluateBranchPolicy(
+      { branch: "codex/stale-worktree" },
+      {},
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.effectiveBranch).toBe("codex/stale-worktree");
+  });
+
+  it("requires an explicit reason for non-main emergency deploy override", () => {
+    expect(
+      evaluateBranchPolicy(
+        { branch: "codex/hotfix" },
+        { DEPLOY_GUARD_ALLOW_NON_MAIN: "1" },
+      ).ok,
+    ).toBe(false);
+
+    expect(
+      evaluateBranchPolicy(
+        { branch: "codex/hotfix" },
+        {
+          DEPLOY_GUARD_ALLOW_NON_MAIN: "1",
+          DEPLOY_GUARD_OVERRIDE_REASON: "production incident rollback",
+        },
+      ).overrideAccepted,
+    ).toBe(true);
+  });
+
+  it("fails closed when HEAD does not contain origin/main", () => {
+    const root = makeGitRoot();
+    git(root, ["checkout", "-b", "codex/stale-worktree"]);
+    writeFileSync(path.join(root, "feature.txt"), "feature\n");
+    git(root, ["add", "feature.txt"]);
+    git(root, ["commit", "-m", "feature"]);
+    git(root, ["checkout", "main"]);
+    writeFileSync(path.join(root, "main.txt"), "main\n");
+    git(root, ["add", "main.txt"]);
+    git(root, ["commit", "-m", "main update"]);
+    git(root, ["branch", "-f", "origin/main", "main"]);
+    git(root, ["checkout", "codex/stale-worktree"]);
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        DEPLOY_GUARD_ALLOW_NON_MAIN: "1",
+        DEPLOY_GUARD_OVERRIDE_REASON: "test stale branch override still needs freshness",
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("HEAD does not contain origin/main"),
+    );
   });
 });

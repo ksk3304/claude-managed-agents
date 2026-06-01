@@ -17,6 +17,8 @@ export const REQUIRED_MARKERS = [
   },
 ];
 
+export const PRODUCTION_BRANCHES = ['main', 'master'];
+
 function readText(file) {
   return readFileSync(file, 'utf8');
 }
@@ -123,12 +125,36 @@ export function collectGitContext(root, options = {}) {
   };
 }
 
+export function evaluateBranchPolicy(git, env = process.env) {
+  const githubRefName = env.GITHUB_REF_NAME || '';
+  const effectiveBranch = git.branch === '(detached HEAD)' && githubRefName ? githubRefName : git.branch;
+  const isProductionBranch = PRODUCTION_BRANCHES.includes(effectiveBranch);
+  const overrideEnabled = env.DEPLOY_GUARD_ALLOW_NON_MAIN === '1';
+  const overrideReason = (env.DEPLOY_GUARD_OVERRIDE_REASON || '').trim();
+  const overrideAccepted = !isProductionBranch && overrideEnabled && overrideReason.length > 0;
+
+  return {
+    effectiveBranch,
+    isProductionBranch,
+    overrideEnabled,
+    overrideReason,
+    overrideAccepted,
+    ok: isProductionBranch || overrideAccepted,
+  };
+}
+
 export function evaluateDeployGuard(root, options = {}) {
   const target = readDeployTarget(root);
   const git = collectGitContext(root, options);
+  const branchPolicy = evaluateBranchPolicy(git, options.env ?? process.env);
   const markerChecks = checkRequiredMarkers(root, options.requirements ?? REQUIRED_MARKERS);
   const failures = [];
 
+  if (!branchPolicy.ok) {
+    failures.push(
+      `production deploys are allowed only from ${PRODUCTION_BRANCHES.join('/')} (current: ${branchPolicy.effectiveBranch}); merge via PR first`,
+    );
+  }
   if (git.fetchError) {
     failures.push(`could not refresh ${git.upstream}; branch freshness unknown`);
   }
@@ -147,6 +173,7 @@ export function evaluateDeployGuard(root, options = {}) {
     ok: failures.length === 0,
     target,
     git,
+    branchPolicy,
     markerChecks,
     failures,
   };
@@ -158,6 +185,15 @@ export function renderReport(result) {
   lines.push(`[deploy-guard] worker=${result.target.workerName} package=${result.target.packageName}@${result.target.packageVersion}`);
   lines.push(`[deploy-guard] worktree=${result.git.worktree}`);
   lines.push(`[deploy-guard] branch=${result.git.branch} head=${result.git.headShort}`);
+  if (result.branchPolicy) {
+    lines.push(
+      `[deploy-guard] deploy_branch=${result.branchPolicy.effectiveBranch}` +
+        (result.branchPolicy.isProductionBranch ? ' (production)' : ' (non-production)'),
+    );
+    if (result.branchPolicy.overrideAccepted) {
+      lines.push(`[deploy-guard] OVERRIDE non-main deploy allowed: ${result.branchPolicy.overrideReason}`);
+    }
+  }
   lines.push(
     `[deploy-guard] upstream=${result.git.upstream}` +
       (result.git.upstreamShort ? `@${result.git.upstreamShort}` : '@(missing)'),
@@ -170,6 +206,9 @@ export function renderReport(result) {
   }
   if (result.git.containsUpstream) {
     lines.push(`[deploy-guard] OK branch contains ${result.git.upstream}`);
+  }
+  if (result.branchPolicy?.isProductionBranch) {
+    lines.push(`[deploy-guard] OK production branch: ${result.branchPolicy.effectiveBranch}`);
   }
   for (const check of result.markerChecks) {
     if (check.ok) {
