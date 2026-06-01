@@ -29,6 +29,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
+import { buildAllManagedAgentSkills } from '../src/lib/attached-skills';
+import { skillsHash } from '../src/lib/agent-cache';
+import { chatThreadSessionKey } from '../src/lib/session-orchestrator';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { makeFetchMock, makeKv, makeMakotoDb } from './makoto-helpers';
 
@@ -671,10 +674,15 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this thread.
-    const sessionKey =
-      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
-    await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
+    // pre-populate KV with existing session for this thread + current skills set.
+    const sessionKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/ROOM10',
+      'spaces/ROOM10/threads/T10',
+      await skillsHash(buildAllManagedAgentSkills(env)),
+    );
+    expect(sessionKey).not.toBeNull();
+    await env.MAKOTO_KV.put(sessionKey!, 'sesn_existing');
 
     const created: unknown[] = [];
     const sends: string[] = [];
