@@ -78,14 +78,16 @@ export default {
     const url = new URL(request.url);
 
     if (
-      url.pathname === "/oauth/google/workspace/start" &&
+      (url.pathname === "/oauth/google/workspace/start" ||
+        url.pathname === "/webhooks/oauth/google/workspace/start") &&
       request.method === "GET"
     ) {
       return handleWorkspaceOAuthStart(request, env);
     }
 
     if (
-      url.pathname === "/oauth/google/workspace/callback" &&
+      (url.pathname === "/oauth/google/workspace/callback" ||
+        url.pathname === "/webhooks/oauth/google/workspace/callback") &&
       request.method === "GET"
     ) {
       return handleWorkspaceOAuthCallback(request, env);

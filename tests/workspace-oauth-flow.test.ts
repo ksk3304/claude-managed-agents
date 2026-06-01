@@ -102,4 +102,19 @@ describe('workspace OAuth flow', () => {
       ]),
     );
   });
+
+  it('uses the Access-bypassed webhooks callback when started under /webhooks', async () => {
+    const env = makeEnv();
+    const res = await handleWorkspaceOAuthStart(
+      new Request(
+        'https://worker.example/webhooks/oauth/google/workspace/start?token=operator-token&user_slug=k-seto',
+      ),
+      env,
+    );
+    expect(res.status).toBe(302);
+    const google = new URL(res.headers.get('location')!);
+    expect(google.searchParams.get('redirect_uri')).toBe(
+      'https://worker.example/webhooks/oauth/google/workspace/callback',
+    );
+  });
 });

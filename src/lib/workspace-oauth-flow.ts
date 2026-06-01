@@ -48,7 +48,7 @@ export async function handleWorkspaceOAuthStart(
   }
   const scopes = resolveWorkspaceOAuthScopes(env);
   const state = crypto.randomUUID();
-  const redirectUri = `${url.origin}/oauth/google/workspace/callback`;
+  const redirectUri = `${url.origin}${workspaceOAuthCallbackPath(url.pathname)}`;
   const entry: WorkspaceOAuthState = {
     state,
     user_slug: userSlug,
@@ -213,6 +213,12 @@ function stateKey(state: string): string {
 
 function isValidUserSlug(value: string): boolean {
   return /^[a-z0-9_-]{1,64}$/.test(value);
+}
+
+function workspaceOAuthCallbackPath(startPath: string): string {
+  return startPath.startsWith('/webhooks/')
+    ? '/webhooks/oauth/google/workspace/callback'
+    : '/oauth/google/workspace/callback';
 }
 
 function oauthHtml(message: string, status: number): Response {
