@@ -42,6 +42,8 @@ import {
 import { getThreadLock } from '../src/durable-objects/thread-lock';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 import { readCounter, _internals as costGuardInternals } from '../src/lib/cost-guard';
+import { PERSONA_SPEC_SHA256_HEX12 } from '../src/data/persona-spec';
+import { TOOLS_SPEC_SHA256_HEX12 } from '../src/data/tools-spec';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -56,6 +58,10 @@ vi.mock('../src/lib/session-orchestrator', async (importOriginal) => {
       (globalThis as unknown as { __makotoFakeAnth: Anthropic | null }).__makotoFakeAnth,
   };
 });
+
+function promptSessionKey(baseKey: string): string {
+  return `${baseKey}:prompt:${PERSONA_SPEC_SHA256_HEX12}:${TOOLS_SPEC_SHA256_HEX12}`;
+}
 
 // Capture postChatMessage / updateChatMessage / deleteChatMessage calls.
 // `updateThrow` / `deleteThrow` で個別 test ケースから fail 経路を発火可能。
@@ -104,14 +110,26 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
   };
 });
 
-// Stub dispatchMakotoTool so tool calls (if any agent emits one) don't
-// hit real workspace-oauth. The reactive tests don't drive tool use;
-// this is defensive.
+interface MakotoToolMockState {
+  calls: Array<{ toolName: string; input: unknown }>;
+  handler: ((toolName: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>) | null;
+}
+const makotoToolMock: MakotoToolMockState = {
+  calls: [],
+  handler: null,
+};
+
+// Stub dispatchMakotoTool so deterministic workspace commands do not hit
+// real workspace-oauth.
 vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async () => ({ ok: false, payload: { error: 'mocked' } }),
+    dispatchMakotoTool: async (toolName: string, input: unknown) => {
+      makotoToolMock.calls.push({ toolName, input });
+      if (makotoToolMock.handler) return makotoToolMock.handler(toolName, input);
+      return { ok: false, payload: { error: 'mocked' } };
+    },
   };
 });
 
@@ -482,6 +500,8 @@ beforeEach(() => {
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
   schedulerMock.jobs = [];
+  makotoToolMock.calls.length = 0;
+  makotoToolMock.handler = null;
   installFakeAnthropic(null);
 });
 
@@ -490,6 +510,239 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('handleChatEvent', () => {
+  it('natural Calendar title update short-circuits through MAKOTO tool dispatcher', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'タイトルを適当な違うタイトルに書き換えてください',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'MAKOTOくん Google連携CRUDテスト 更新済み',
+                start: { dateTime: '2026-06-02T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T23:45:00+09:00', timeZone: 'Asia/Tokyo' },
+                htmlLink: 'https://calendar.example/evt-1',
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          start: { dateTime: '2026-06-02T23:30:00+09:00' },
+          end: { dateTime: '2026-06-02T23:45:00+09:00' },
+          send_updates: 'none',
+        });
+        expect((input as { summary?: string }).summary).toContain('MAKOTOくん Calendarタイトル変更確認');
+        return {
+          ok: true,
+          payload: {
+            id: 'evt-1',
+            summary: (input as { summary: string }).summary,
+            htmlLink: 'https://calendar.example/evt-1',
+          },
+        };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(makotoToolMock.calls.map((c) => c.toolName)).toEqual([
+      'calendar_list_events',
+      'calendar_update_event',
+    ]);
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました');
+    expect(commitDecision(env, 'calendar_natural_update_done')).toBeTruthy();
+  });
+
+  it('natural Calendar update preserves explicit title and can update time', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'タイトルは”テスト”にせよ。予定時刻は6月1日の23時30分から24時に変えろ',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'MAKOTOくん Calendarタイトル変更確認',
+                start: { dateTime: '2026-06-02T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T23:45:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト',
+          start: { dateTime: '2026-06-01T23:30:00+09:00' },
+          end: { dateTime: '2026-06-02T00:00:00+09:00' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(makotoToolMock.calls.map((c) => c.toolName)).toEqual([
+      'calendar_list_events',
+      'calendar_update_event',
+    ]);
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト');
+  });
+
+  it('natural Calendar update applies same-day time changes from the target event date', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'その予定のタイトルをテスト2に変更して。時間を同日の22時から23時に変更して',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'テスト',
+                start: { dateTime: '2026-06-01T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T00:00:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト2' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト2');
+  });
+
+  it('natural Calendar time-only update can target a test-titled event', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: '時間を22時から23時に変更して',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'テスト2',
+                start: { dateTime: '2026-06-01T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T00:00:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト2' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト2');
+  });
+
+  it('natural Calendar title update extracts Japanese title phrase without fallback', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'タイトルをテストっていうタイトルに変えろ',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'MAKOTOくん Google連携CRUDテスト 更新済み',
+                start: { dateTime: '2026-06-02T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T23:45:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト',
+          start: { dateTime: '2026-06-02T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+          end: { dateTime: '2026-06-02T23:45:00+09:00', timeZone: 'Asia/Tokyo' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト');
+  });
+
   it('/costguard status reply increments chat daily counter', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({ text: '/costguard status' });
@@ -1364,7 +1617,7 @@ describe('handleChatEvent', () => {
     }
   });
 
-  it('Case 9: 内部状態漏洩語 → scrubInternalStateForChat で redaction', async () => {
+  it('Case 9: legacy internal-state wording passes through when no patterns are registered', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1374,7 +1627,6 @@ describe('handleChatEvent', () => {
       sessionId: 'sesn_9',
       events: [
         {
-          // 「memory store が未 attach」は internal_state_patterns.json の literal HIT
           type: 'agent.message.text',
           text: 'memory store が未 attach のため対応できません',
         },
@@ -1384,16 +1636,15 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    // placeholder POST 1 件 → 最終 redaction 結果は PATCH で書き換え。
+    // placeholder POST 1 件 → 最終 reply は元テキストで PATCH。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
     expect(post!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
-    expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
+    expect(chatApiMock.patches[0]!.text).toBe('memory store が未 attach のため対応できません');
   });
 
-  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+  it('Case 9b: action marker wording passes through when no marker was parsed', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1414,10 +1665,33 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe(
-      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+      '前のメッセージですでに `EMAIL_SEND` マーカーを出しています。bot 側で処理中です。',
     );
-    expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
-    expect(chatApiMock.patches[0]!.text).not.toContain('bot');
+  });
+
+  it('Case 9c: benign runtime path mention passes through unchanged', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: 'まず `/mnt/memory/` を確認し、調査プロセスを説明しました。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('/mnt/memory');
+    expect(chatApiMock.patches[0]!.text).toContain('調査プロセス');
+    expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
@@ -1439,8 +1713,9 @@ describe('handleChatEvent', () => {
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
     // pre-populate KV with existing session for this sender + space + thread.
-    const sessionKey =
+    const baseSessionKey =
       'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
+    const sessionKey = promptSessionKey(baseSessionKey);
     await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
 
     const created: unknown[] = [];
@@ -1501,9 +1776,53 @@ describe('handleChatEvent', () => {
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_old_scope');
     expect(
       await env.MAKOTO_KV.get(
-        'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+        promptSessionKey(
+          'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+        ),
       ),
     ).toBe('sesn_new_thread');
+  });
+
+  it('Case 10c: prompt hash なしの旧 thread session は無視し、新規 session に移行する', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10',
+      text: '@MAKOTOくん 続きの質問',
+      threadName: 'spaces/ROOM10/threads/T12',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const oldThreadKey =
+      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T12';
+    await env.MAKOTO_KV.put(oldThreadKey, 'sesn_stale_prompt');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_prompt_migrated',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '新しい能力で応答します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_prompt_migrated']);
+    expect(await env.MAKOTO_KV.get(oldThreadKey)).toBe('sesn_stale_prompt');
+    expect(await env.MAKOTO_KV.get(promptSessionKey(oldThreadKey))).toBe('sesn_prompt_migrated');
   });
 
   it('attachment turn follows Chat thread session and ignores broad DM scope session', async () => {
@@ -1513,8 +1832,9 @@ describe('handleChatEvent', () => {
       } as Partial<Env>,
     });
     const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
-    const threadKey =
+    const baseThreadKey =
       'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TATT';
+    const threadKey = promptSessionKey(baseThreadKey);
     await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
     await env.MAKOTO_KV.put(threadKey, 'sesn_thread_existing');
     const msg = buildQueueMsg({

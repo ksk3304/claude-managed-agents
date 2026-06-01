@@ -42,7 +42,7 @@ import {
 export const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
 export const DRIVE_UPLOAD_API_BASE = 'https://www.googleapis.com/upload/drive/v3';
 
-/** Deps shared by all 5 Drive tools. The dispatcher provides these. */
+/** Deps shared by all Drive tools. The dispatcher provides these. */
 export interface DriveToolDeps {
   accessToken: string;
   refreshAccessToken?: () => Promise<string>;
@@ -490,7 +490,172 @@ export async function driveCreateFile(
 }
 
 // ============================================================================
-// 5. drive_delete (destructive 2-step with TTL + fingerprint + Issue #126)
+// 5. drive_update_file_metadata
+// ============================================================================
+
+const DRIVE_UPDATE_METADATA_KNOWN_KEYS = new Set([
+  'file_id',
+  'name',
+  'description',
+  'starred',
+]);
+
+export interface DriveUpdateFileMetadataResult {
+  id?: string;
+  name?: string;
+  mimeType?: string;
+  modifiedTime?: string;
+  description?: string;
+  starred?: boolean;
+  webViewLink?: string;
+  parents?: string[];
+  [extra: string]: unknown;
+}
+
+const DRIVE_UPDATE_CONTENT_KNOWN_KEYS = new Set(['file_id', 'content', 'mime_type']);
+const DRIVE_UPDATE_CONTENT_MAX_BYTES = 200_000;
+
+export interface DriveUpdateFileContentResult {
+  id?: string;
+  name?: string;
+  mimeType?: string;
+  modifiedTime?: string;
+  webViewLink?: string;
+  [extra: string]: unknown;
+}
+
+export async function driveUpdateFileContent(
+  input: Record<string, unknown>,
+  deps: DriveToolDeps,
+): Promise<DriveUpdateFileContentResult> {
+  rejectUnknownKeys(input, DRIVE_UPDATE_CONTENT_KNOWN_KEYS, 'drive_update_file_content');
+  const fileId = validateDriveFileId(input.file_id, 'drive_update_file_content');
+  if (typeof input.content !== 'string') {
+    throw new ToolSchemaError('drive_update_file_content: content (string) is required');
+  }
+  const content = input.content;
+  const contentBytes = utf8ByteLength(content);
+  if (contentBytes > DRIVE_UPDATE_CONTENT_MAX_BYTES) {
+    throw new ToolSchemaError(
+      `drive_update_file_content: content too large (${contentBytes} bytes > ${DRIVE_UPDATE_CONTENT_MAX_BYTES})`,
+    );
+  }
+
+  const meta = await driveGetFileMetadata(
+    { file_id: fileId, fields: 'id,name,mimeType,webViewLink' },
+    deps,
+  );
+  const existingMimeType = typeof meta.mimeType === 'string' ? meta.mimeType : '';
+  if (existingMimeType.startsWith('application/vnd.google-apps.')) {
+    throw new ToolSchemaError(
+      'drive_update_file_content: Google-native files must be edited with their dedicated tool',
+    );
+  }
+  if (DRIVE_BINARY_PREFIXES.some((p) => existingMimeType.startsWith(p))) {
+    throw new ToolSchemaError(
+      `drive_update_file_content: binary content update is not allowed for mimeType=${existingMimeType}`,
+    );
+  }
+  const mimeType =
+    typeof input.mime_type === 'string' && input.mime_type.trim().length > 0
+      ? input.mime_type.trim()
+      : existingMimeType || 'text/plain';
+
+  const params = new URLSearchParams({
+    uploadType: 'media',
+    fields: 'id,name,mimeType,modifiedTime,webViewLink',
+    supportsAllDrives: 'true',
+  });
+  const url = `${DRIVE_UPLOAD_API_BASE}/files/${encodeURIComponent(fileId)}?${params.toString()}`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': `${mimeType}; charset=UTF-8` },
+      body: content,
+    },
+    fetchOpts(deps),
+  );
+  if (resp.status === 404) {
+    throw new GoogleApiToolError(
+      `drive_update_file_content not_found: file_id=${fileId}`,
+      { status: 404 },
+    );
+  }
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    throw new GoogleApiToolError(
+      `drive_update_file_content HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  return (await resp.json()) as DriveUpdateFileContentResult;
+}
+
+// ============================================================================
+// 6. drive_update_file_metadata
+// ============================================================================
+
+export async function driveUpdateFileMetadata(
+  input: Record<string, unknown>,
+  deps: DriveToolDeps,
+): Promise<DriveUpdateFileMetadataResult> {
+  rejectUnknownKeys(input, DRIVE_UPDATE_METADATA_KNOWN_KEYS, 'drive_update_file_metadata');
+  const fileId = validateDriveFileId(input.file_id, 'drive_update_file_metadata');
+  const patch: Record<string, unknown> = {};
+  if (input.name !== undefined) {
+    patch.name = requireNonEmptyString(input.name, 'name', 'drive_update_file_metadata');
+  }
+  if (input.description !== undefined) {
+    if (typeof input.description !== 'string') {
+      throw new ToolSchemaError('drive_update_file_metadata: description must be string');
+    }
+    patch.description = input.description;
+  }
+  if (input.starred !== undefined) {
+    if (typeof input.starred !== 'boolean') {
+      throw new ToolSchemaError('drive_update_file_metadata: starred must be boolean');
+    }
+    patch.starred = input.starred;
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new ToolSchemaError(
+      'drive_update_file_metadata: at least one of name, description, starred is required',
+    );
+  }
+
+  const params = new URLSearchParams({
+    fields: 'id,name,mimeType,modifiedTime,description,starred,webViewLink,parents',
+    supportsAllDrives: 'true',
+  });
+  const url = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params.toString()}`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+    fetchOpts(deps),
+  );
+  if (resp.status === 404) {
+    throw new GoogleApiToolError(
+      `drive_update_file_metadata not_found: file_id=${fileId}`,
+      { status: 404 },
+    );
+  }
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    throw new GoogleApiToolError(
+      `drive_update_file_metadata HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  return (await resp.json()) as DriveUpdateFileMetadataResult;
+}
+
+// ============================================================================
+// 6. drive_delete (destructive 2-step with TTL + fingerprint + Issue #126)
 // ============================================================================
 
 const DRIVE_DELETE_KNOWN_KEYS = new Set(['file_id', 'confirmation_token']);

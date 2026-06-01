@@ -43,6 +43,14 @@ import {
   recordRuntimeEvent,
   pruneObservability,
 } from "./lib/observability";
+import {
+  handleWorkspaceOAuthCallback,
+  handleWorkspaceOAuthDevicePoll,
+  handleWorkspaceOAuthDeviceStart,
+  handleWorkspaceOAuthStart,
+} from "./lib/workspace-oauth-flow";
+import { ensureMakotoAgentCustomTools } from "./lib/makoto-agent-tools";
+import { dispatchMakotoTool } from "./dispatch/makoto-tool-dispatcher";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -72,6 +80,36 @@ export default {
     _ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    if (
+      (url.pathname === "/oauth/google/workspace/start" ||
+        url.pathname === "/webhooks/oauth/google/workspace/start") &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthStart(request, env);
+    }
+
+    if (
+      (url.pathname === "/oauth/google/workspace/callback" ||
+        url.pathname === "/webhooks/oauth/google/workspace/callback") &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthCallback(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/oauth/google/workspace/device/start" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthDeviceStart(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/oauth/google/workspace/device/poll" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthDevicePoll(request, env);
+    }
 
     // AgentMail inbound webhook (svix protocol).
     if (
@@ -103,13 +141,28 @@ export default {
       return handleIssue206ChatObserve(request, env);
     }
 
+    if (
+      url.pathname === "/webhooks/admin/ensure-makoto-agent-tools" &&
+      request.method === "POST"
+    ) {
+      return handleEnsureMakotoAgentTools(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/admin/makoto-tool" &&
+      request.method === "POST"
+    ) {
+      return handleAdminMakotoTool(request, env);
+    }
+
     return new Response("not found", { status: 404 });
   },
 
   // Cron dispatcher — wrangler.jsonc `triggers.crons` 経由で複数 schedule を
   // 受ける. `controller.cron` で経路を分岐する:
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
-  //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
+  //   - `45 5 * * *` (temporary #192 smoke, 05:45 UTC = 14:45 JST)
+  //     → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
@@ -118,7 +171,7 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    if (controller.cron === "30 15 * * *") {
+    if (controller.cron === "45 5 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
       return;
     }
@@ -369,6 +422,101 @@ async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Re
     return Response.json({ ok: false, eventKey, error: "queue send failed" }, { status: 500 });
   }
   return Response.json({ ok: true, eventKey, sessionLookup: { spaceName, threadName, senderEmail } });
+}
+
+async function handleEnsureMakotoAgentTools(request: Request, env: Env): Promise<Response> {
+  const expected = (
+    env.MAKOTO_DEBUG_TOKEN ||
+    env.MAKOTO_WORKSPACE_OAUTH_ADMIN_TOKEN ||
+    ""
+  ).trim();
+  if (!expected) return new Response("not found", { status: 404 });
+  const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
+  if (got !== expected) return new Response("not found", { status: 404 });
+
+  let body: { email?: string; agent_id?: string };
+  try {
+    body = (await request.json()) as { email?: string; agent_id?: string };
+  } catch {
+    return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  let agentId = (body.agent_id || "").trim();
+  const email = (body.email || "").trim().toLowerCase();
+  if (!agentId) {
+    if (!email) return Response.json({ ok: false, error: "email or agent_id required" }, { status: 400 });
+    const raw = await env.MAKOTO_KV.get(`user_mapping:${email}`);
+    if (!raw) return Response.json({ ok: false, error: "user_mapping not found" }, { status: 404 });
+    const parsed = JSON.parse(raw) as { agent_id?: unknown };
+    if (typeof parsed.agent_id !== "string" || !parsed.agent_id.trim()) {
+      return Response.json({ ok: false, error: "agent_id missing in user_mapping" }, { status: 500 });
+    }
+    agentId = parsed.agent_id.trim();
+  }
+  const client = buildAnthropicClient(env);
+  if (client === null) {
+    return Response.json({ ok: false, error: "anthropic client unavailable" }, { status: 500 });
+  }
+  const agent = await client.beta.agents.retrieve(agentId);
+  const version = typeof agent.version === "number" ? agent.version : null;
+  if (version === null) {
+    return Response.json({ ok: false, error: "agent version missing" }, { status: 500 });
+  }
+  const currentTools = (agent as { tools?: unknown }).tools;
+  const ensured = ensureMakotoAgentCustomTools(currentTools);
+  if (ensured.added.length === 0 && ensured.removed.length === 0) {
+    return Response.json({
+      ok: true,
+      agent_id: agentId,
+      changed: false,
+      version,
+      removed: ensured.removed,
+      present: ensured.present,
+    });
+  }
+  const updated = await client.beta.agents.update(agentId, {
+    version,
+    tools: ensured.tools as Parameters<typeof client.beta.agents.update>[1]["tools"],
+  });
+  return Response.json({
+    ok: true,
+    agent_id: agentId,
+    changed: true,
+    before_version: version,
+    after_version: updated.version,
+    added: ensured.added,
+    removed: ensured.removed,
+    present: ensured.present,
+  });
+}
+
+async function handleAdminMakotoTool(request: Request, env: Env): Promise<Response> {
+  const expected = (
+    env.MAKOTO_DEBUG_TOKEN ||
+    env.MAKOTO_WORKSPACE_OAUTH_ADMIN_TOKEN ||
+    ""
+  ).trim();
+  if (!expected) return new Response("not found", { status: 404 });
+  const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
+  if (got !== expected) return new Response("not found", { status: 404 });
+
+  let body: { user_slug?: string; tool?: string; input?: unknown; bound_message_id?: string };
+  try {
+    body = (await request.json()) as { user_slug?: string; tool?: string; input?: unknown; bound_message_id?: string };
+  } catch {
+    return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  const userSlug = (body.user_slug || "").trim();
+  const tool = (body.tool || "").trim();
+  if (!userSlug || !tool) {
+    return Response.json({ ok: false, error: "user_slug and tool required" }, { status: 400 });
+  }
+  const result = await dispatchMakotoTool(tool, body.input ?? {}, {
+    env,
+    userSlug,
+    boundMessageId: (body.bound_message_id || "admin-makoto-tool").trim(),
+    callerSessionId: "admin-makoto-tool",
+  });
+  return Response.json(result);
 }
 
 function safeDebugId(value: string): string {

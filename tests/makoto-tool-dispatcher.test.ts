@@ -1,6 +1,6 @@
 /**
  * Unit tests for `src/dispatch/makoto-tool-dispatcher.ts` — wraps the
- * 10 layer-6 tool functions with per-user OAuth resolution + error
+ * layer-6 tool functions with per-user OAuth resolution + error
  * envelope encoding.
  */
 
@@ -38,11 +38,15 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
-  it('covers all 10 tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(10);
+  it('covers all registered tools', () => {
+    expect(MAKOTO_TOOL_NAMES.length).toBe(17);
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('drive_update_file_metadata')).toBe(true);
+    expect(isMakotoToolName('drive_update_file_content')).toBe(true);
+    expect(isMakotoToolName('drive_delete')).toBe(false);
+    expect(isMakotoToolName('calendar_delete_event')).toBe(false);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
   });
 });
@@ -151,6 +155,184 @@ describe('dispatchMakotoTool happy paths', () => {
     );
     expect(r.ok).toBe(true);
     expect((r.payload as { count: number }).count).toBe(0);
+  });
+
+  it('drive_update_file_content verifies by reading back content', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    let metadataReads = 0;
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (url.includes('/upload/drive/v3/files/abc')) {
+        expect(init.method).toBe('PATCH');
+        expect(String(init.body)).toBe('CRU-Uのテスト');
+        return jsonResponse(200, { id: 'abc', name: 'doc.txt', mimeType: 'text/plain' });
+      }
+      if (url.includes('/drive/v3/files/abc') && url.includes('alt=media')) {
+        expect(init.method).toBe('GET');
+        return new Response('CRU-Uのテスト', { status: 200 });
+      }
+      if (url.includes('/drive/v3/files/abc')) {
+        metadataReads++;
+        expect(init.method).toBe('GET');
+        return jsonResponse(200, { id: 'abc', name: 'doc.txt', mimeType: 'text/plain' });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'drive_update_file_content',
+      { file_id: 'abc', content: 'CRU-Uのテスト' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    expect(metadataReads).toBe(2);
+    const payload = r.payload as { verified: boolean; readback: { content: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.readback.content).toBe('CRU-Uのテスト');
+  });
+
+  it('calendar_create_event resolves OAuth then proxies', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (init.method === 'POST') {
+        expect(url).toContain('/calendar/v3/calendars/primary/events?sendUpdates=all');
+        return jsonResponse(200, {
+          id: 'evt-1',
+          summary: '予定',
+          start: { dateTime: '2026-06-02T10:00:00+09:00' },
+          end: { dateTime: '2026-06-02T11:00:00+09:00' },
+        });
+      }
+      expect(init.method).toBe('GET');
+      expect(url).toContain('/calendar/v3/calendars/primary/events/evt-1');
+      return jsonResponse(200, {
+        id: 'evt-1',
+        summary: '予定',
+        start: { dateTime: '2026-06-02T10:00:00+09:00' },
+        end: { dateTime: '2026-06-02T11:00:00+09:00' },
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'calendar_create_event',
+      {
+        summary: '予定',
+        start: { dateTime: '2026-06-02T10:00:00+09:00' },
+        end: { dateTime: '2026-06-02T11:00:00+09:00' },
+      },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    const payload = r.payload as { verified: boolean; readback: { id: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.readback.id).toBe('evt-1');
+  });
+
+  it('calendar_update_event fails closed when readback differs', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (init.method === 'PUT') {
+        return jsonResponse(200, {
+          id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+        });
+      }
+      expect(url).toContain('/calendar/v3/calendars/primary/events/evt-1');
+      return jsonResponse(200, {
+        id: 'evt-1',
+        summary: 'テスト2',
+        start: { dateTime: '2026-06-01T23:30:00+09:00' },
+        end: { dateTime: '2026-06-02T00:00:00+09:00' },
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'calendar_update_event',
+      {
+        event_id: 'evt-1',
+        summary: 'テスト2',
+        start: { dateTime: '2026-06-01T22:00:00+09:00' },
+        end: { dateTime: '2026-06-01T23:00:00+09:00' },
+      },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(false);
+    const payload = r.payload as { error: string; verification: { mismatches: string[] } };
+    expect(payload.error).toBe('verification_failed');
+    expect(payload.verification.mismatches).toContain('start');
+    expect(payload.verification.mismatches).toContain('end');
+  });
+
+  it('docs_create resolves OAuth then proxies', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (init.method === 'POST') {
+        expect(url).toContain('/documents');
+        return jsonResponse(200, { documentId: 'doc-1', title: 'Doc' });
+      }
+      expect(init.method).toBe('GET');
+      expect(url).toContain('/documents/doc-1');
+      return jsonResponse(200, {
+        documentId: 'doc-1',
+        title: 'Doc',
+        body: { content: [] },
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'docs_create',
+      { title: 'Doc' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    const payload = r.payload as { verified: boolean; result: { document_url: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.result.document_url).toContain('/document/d/doc-1');
   });
 
   it('schema error from tool → ok:false / error:schema with tool name', async () => {

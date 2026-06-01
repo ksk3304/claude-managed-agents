@@ -81,6 +81,18 @@ export function chatThreadSessionKey(
   return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}`;
 }
 
+export function chatThreadSessionPromptKey(
+  senderEmail: string,
+  spaceName: string,
+  threadName: string | null | undefined,
+  personaSha256: string,
+  toolsSha256: string,
+): string | null {
+  const base = chatThreadSessionKey(senderEmail, spaceName, threadName);
+  if (base === null) return null;
+  return `${base}:prompt:${personaSha256}:${toolsSha256}`;
+}
+
 /**
  * Grill Me 正本の session key。社員 agent を owner とし、DM / space scope
  * 単位で継続する。DM の user_id は現入力では email までしか来ないため、
@@ -311,10 +323,12 @@ export async function orchestrateChatTurn(
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
     ? null
-    : chatThreadSessionKey(
+    : chatThreadSessionPromptKey(
         input.senderEmail,
         input.spaceName,
         input.threadName,
+        systemPromptInfo.personaSha256,
+        systemPromptInfo.toolsSha256,
       );
   let sessionId: string | null = null;
   if (sessionKey !== null) {
@@ -406,6 +420,8 @@ export async function orchestrateChatTurn(
         session_key_kind: sessionKey === null ? 'none' : 'chat_thread',
         thread_name_present: Boolean(input.threadName),
         has_thread_session_key: sessionKey !== null,
+        persona_sha256: systemPromptInfo.personaSha256,
+        tools_sha256: systemPromptInfo.toolsSha256,
       },
     });
   }

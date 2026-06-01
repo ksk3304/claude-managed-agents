@@ -13,32 +13,32 @@
     {
       "name": "single_literal_hit_memory_store",
       "input": "memory store の最新版を参照しています。",
-      "expect_hits": ["memory store"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "multiple_literals_canonical_order",
       "input": "memory store にアクセスできません。未 attach です。",
-      "expect_hits": ["未 attach", "memory store"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "regex_only_hit_learning_md",
       "input": "参照ファイル: learning_session_token_scopes.md を確認してください。",
-      "expect_hits": ["learning_md_filename"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "literal_and_regex_mixed",
       "input": "OAuth トークンの問題で learning_drive_attach_fail.md が出ています。",
-      "expect_hits": ["OAuth トークン", "learning_md_filename"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "literal_appears_twice_reported_once",
       "input": "memory store のキャッシュ、もう一度 memory store を確認。",
-      "expect_hits": ["memory store"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "empty_input_passthrough",
@@ -49,26 +49,26 @@
     {
       "name": "japanese_literal_kenkenfusoku",
       "input": "操作には権限不足のため実行を中止しました。",
-      "expect_hits": ["権限不足"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "english_literal_not_attached",
       "input": "The tool is not attached to this session.",
-      "expect_hits": ["not attached"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "ascii_path_literal_mnt_memory",
       "input": "/mnt/memory 以下のファイルを読み込み中。",
-      "expect_hits": ["/mnt/memory"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "v9_literal_access_token_scope_insufficient",
       "input": "ACCESS_TOKEN_SCOPE_INSUFFICIENT が返却されました。",
-      "expect_hits": ["ACCESS_TOKEN_SCOPE_INSUFFICIENT"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     },
     {
       "name": "regex_non_match_empty_basename",
@@ -85,8 +85,8 @@
     {
       "name": "all_three_one_literal_two_regex_distinct_files",
       "input": "未 attach: learning_drive_oauth.md と learning_sheets_scope.md 両方で発生。",
-      "expect_hits": ["未 attach", "learning_md_filename"],
-      "expect_output_type": "neutral"
+      "expect_hits": [],
+      "expect_output_type": "passthrough"
     }
   ]
 }

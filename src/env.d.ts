@@ -75,6 +75,10 @@ declare namespace Cloudflare {
     OAUTH_CLIENT_ID?: string;
     /** Google OAuth client secret. */
     OAUTH_CLIENT_SECRET?: string;
+    /** Secret token that enables operator-only Workspace OAuth bootstrap start URL. */
+    MAKOTO_WORKSPACE_OAUTH_ADMIN_TOKEN?: string;
+    /** Optional comma/space separated Google Workspace scopes for OAuth bootstrap. */
+    WORKSPACE_OAUTH_SCOPES?: string;
     /**
      * Stable identifier for this Worker instance, used to disambiguate
      * `claim_owner` values across deployments / regions. Optional —
