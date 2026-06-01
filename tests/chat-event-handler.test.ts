@@ -37,11 +37,13 @@ import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
 import { buildSideEffectKey } from '../src/lib/three-stage-precheck';
 import {
   makeFakeThreadLockNamespace,
+  makeFakeOAuthLeaseNamespace,
   makeFetchMock,
   makeKv,
   makeMakotoDb,
   TEST_VAULT_KEY_B64,
 } from './makoto-helpers';
+import { putRefreshToken } from '../src/lib/oauth-vault';
 import { getThreadLock } from '../src/durable-objects/thread-lock';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 import { readCounter, _internals as costGuardInternals } from '../src/lib/cost-guard';
@@ -1085,6 +1087,99 @@ describe('handleChatEvent', () => {
     );
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
+  });
+
+  it('uploads session output xlsx to Drive and removes sandbox path from Chat reply', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+        OAUTH_CLIENT_ID: 'cid',
+        OAUTH_CLIENT_SECRET: 'csec',
+        MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      },
+    });
+    await putRefreshToken(env.MAKOTO_KV, TEST_VAULT_KEY_B64, 'alice', 'refresh-token');
+    const msg = buildQueueMsg({
+      text: 'xlsx skillで issue247.xlsx を作って',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_output_xlsx',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            'できました。\n出力先: /mnt/session/outputs/issue247.xlsx',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const uploadCalls: Array<{ auth: string | null; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      if (url === 'https://api.anthropic.com/v1/files?scope_id=sesn_output_xlsx&limit=20') {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: 'file_xlsx_1',
+                filename: 'issue247.xlsx',
+                mime_type:
+                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                size_bytes: 4830,
+                downloadable: true,
+                created_at: new Date().toISOString(),
+                scope: { type: 'session', id: 'sesn_output_xlsx' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(JSON.stringify({ access_token: 'drive-access', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === 'https://api.anthropic.com/v1/files/file_xlsx_1/content') {
+        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), { status: 200 });
+      }
+      if (url.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+        const body = init.body as Blob;
+        uploadCalls.push({
+          auth: (init.headers as Headers).get('Authorization'),
+          body: await body.text(),
+        });
+        return new Response(
+          JSON.stringify({
+            id: 'drive-file-1',
+            name: 'issue247.xlsx',
+            webViewLink: 'https://docs.google.com/spreadsheets/d/drive-file-1/edit',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(uploadCalls).toHaveLength(1);
+      expect(uploadCalls[0]!.auth).toBe('Bearer drive-access');
+      expect(uploadCalls[0]!.body).toContain('issue247.xlsx');
+      const finalReply = chatApiMock.patches.at(-1)?.text ?? chatApiMock.posts.at(-1)?.text ?? '';
+      expect(finalReply).toContain('*Driveに保存しました*');
+      expect(finalReply).toContain('https://docs.google.com/spreadsheets/d/drive-file-1/edit');
+      expect(finalReply).toContain('issue247.xlsx');
+      expect(finalReply).not.toContain('/mnt/session/outputs');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('Case 2b: shared thread history uses User OAuth token instead of service account', async () => {

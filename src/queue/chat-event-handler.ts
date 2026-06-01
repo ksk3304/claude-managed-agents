@@ -137,7 +137,12 @@ import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
 import { executeWithCommit, LeaseHeartbeat } from '../lib/three-stage-precheck';
 import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat';
-import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
+import {
+  dispatchMakotoTool,
+  makeMakotoWorkspaceRefreshAccessToken,
+  resolveMakotoWorkspaceAccessToken,
+} from '../dispatch/makoto-tool-dispatcher';
+import { deliverSessionOutputsToDrive } from '../lib/session-output-files';
 import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
@@ -1202,6 +1207,7 @@ export async function handleChatEvent(
   let sessionId: string;
   let assistantText: string;
   let sessionCostPrompt = '';
+  const sessionOutputMinCreatedAtMs = Date.now() - 60_000;
   try {
     try {
       const orchestrated = await orchestrateChatTurn({
@@ -1532,7 +1538,41 @@ export async function handleChatEvent(
         `reason=${markerLeakScrubbed.reason}`,
     );
   }
-  const scrubbed = scrubInternalStateForChat(markerLeakScrubbed.text, `chat:${sessionId}`);
+  const outputDelivery = await deliverSessionOutputsToDrive({
+    env,
+    sessionId,
+    sourceText: markerLeakScrubbed.text,
+    minCreatedAtMs: sessionOutputMinCreatedAtMs,
+    eventKey,
+    resolveDriveDeps: async () => {
+      const ctx = {
+        env,
+        userSlug: userMapping.user_slug,
+        boundMessageId: message.name,
+        callerSessionId: sessionId,
+      };
+      const token = await resolveMakotoWorkspaceAccessToken(ctx);
+      if (token.kind === 'fail') {
+        throw new Error(token.error);
+      }
+      return {
+        accessToken: token.access_token,
+        refreshAccessToken: makeMakotoWorkspaceRefreshAccessToken(ctx),
+      };
+    },
+  });
+  if (
+    outputDelivery.uploaded.length > 0 ||
+    outputDelivery.failures.length > 0 ||
+    outputDelivery.sanitizedPathCount > 0
+  ) {
+    console.log(
+      `[chat-event] session_outputs delivered eventKey=${eventKey} session=${sessionId} ` +
+        `uploaded=${outputDelivery.uploaded.length} failures=${outputDelivery.failures.length} ` +
+        `skipped=${outputDelivery.skipped.length} sanitized_paths=${outputDelivery.sanitizedPathCount}`,
+    );
+  }
+  const scrubbed = scrubInternalStateForChat(outputDelivery.text, `chat:${sessionId}`);
   if (scrubbed.hits.length > 0) {
     console.warn(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,

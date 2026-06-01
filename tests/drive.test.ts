@@ -14,6 +14,7 @@ import {
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveUploadBinaryFile,
   type DriveToolDeps,
 } from '../src/tools/drive';
 import { createKvConfirmTokenStore } from '../src/tools/tool-common';
@@ -123,6 +124,32 @@ describe('driveCreateFile', () => {
     await expect(
       driveCreateFile({ name: 'x', content: big }, baseDeps(fetcher)),
     ).rejects.toThrow();
+  });
+});
+
+describe('driveUploadBinaryFile', () => {
+  it('uploads binary content via multipart', async () => {
+    const fetcher = makeFetchMock(async (url, init) => {
+      expect(url).toContain('/upload/drive/v3');
+      expect((init.headers as Headers).get('Content-Type')).toMatch(/multipart\/related/);
+      const bodyText = await (init.body as Blob).text();
+      expect(bodyText).toContain('artifact.xlsx');
+      return jsonResponse(200, {
+        id: 'bin-id',
+        name: 'artifact.xlsx',
+        webViewLink: 'https://drive.test/bin-id',
+      });
+    });
+    const r = await driveUploadBinaryFile(
+      {
+        name: 'artifact.xlsx',
+        content: new Uint8Array([0x50, 0x4b]).buffer,
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      },
+      baseDeps(fetcher),
+    );
+    expect(r.id).toBe('bin-id');
+    expect(r.webViewLink).toBe('https://drive.test/bin-id');
   });
 });
 
