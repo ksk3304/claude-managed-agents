@@ -110,14 +110,26 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
   };
 });
 
-// Stub dispatchMakotoTool so tool calls (if any agent emits one) don't
-// hit real workspace-oauth. The reactive tests don't drive tool use;
-// this is defensive.
+interface MakotoToolMockState {
+  calls: Array<{ toolName: string; input: unknown }>;
+  handler: ((toolName: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>) | null;
+}
+const makotoToolMock: MakotoToolMockState = {
+  calls: [],
+  handler: null,
+};
+
+// Stub dispatchMakotoTool so deterministic workspace commands do not hit
+// real workspace-oauth.
 vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async () => ({ ok: false, payload: { error: 'mocked' } }),
+    dispatchMakotoTool: async (toolName: string, input: unknown) => {
+      makotoToolMock.calls.push({ toolName, input });
+      if (makotoToolMock.handler) return makotoToolMock.handler(toolName, input);
+      return { ok: false, payload: { error: 'mocked' } };
+    },
   };
 });
 
@@ -488,6 +500,8 @@ beforeEach(() => {
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
   schedulerMock.jobs = [];
+  makotoToolMock.calls.length = 0;
+  makotoToolMock.handler = null;
   installFakeAnthropic(null);
 });
 
@@ -496,6 +510,63 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('handleChatEvent', () => {
+  it('natural Calendar title update short-circuits through MAKOTO tool dispatcher', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'タイトルを適当な違うタイトルに書き換えてください',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'MAKOTOくん Google連携CRUDテスト 更新済み',
+                start: { dateTime: '2026-06-02T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T23:45:00+09:00', timeZone: 'Asia/Tokyo' },
+                htmlLink: 'https://calendar.example/evt-1',
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          start: { dateTime: '2026-06-02T23:30:00+09:00' },
+          end: { dateTime: '2026-06-02T23:45:00+09:00' },
+          send_updates: 'none',
+        });
+        expect((input as { summary?: string }).summary).toContain('MAKOTOくん Calendarタイトル変更確認');
+        return {
+          ok: true,
+          payload: {
+            id: 'evt-1',
+            summary: (input as { summary: string }).summary,
+            htmlLink: 'https://calendar.example/evt-1',
+          },
+        };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(makotoToolMock.calls.map((c) => c.toolName)).toEqual([
+      'calendar_list_events',
+      'calendar_update_event',
+    ]);
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました');
+    expect(commitDecision(env, 'calendar_natural_update_done')).toBeTruthy();
+  });
+
   it('/costguard status reply increments chat daily counter', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({ text: '/costguard status' });

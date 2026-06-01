@@ -209,6 +209,10 @@ interface NaturalCalendarCreateInput {
   send_updates: 'all';
 }
 
+interface NaturalCalendarTitleUpdateInput {
+  summary: string;
+}
+
 function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | null {
   if (!/カレンダー/.test(text)) return null;
   if (!/(入れて|登録|作って|予定作成|予定を作)/.test(text)) return null;
@@ -233,6 +237,32 @@ function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | 
   };
 }
 
+function parseNaturalCalendarTitleUpdate(text: string): NaturalCalendarTitleUpdateInput | null {
+  if (!/(タイトル|件名|予定名)/.test(text)) return null;
+  if (!/(書き換え|変更|変えて|更新|直して|リネーム)/.test(text)) return null;
+  if (/(削除|消して|キャンセル)/.test(text)) return null;
+
+  const quoted = text.match(/[「『"]([^」』"]{1,80})[」』"]/);
+  let summary = (quoted?.[1] ?? '').trim();
+  if (!summary) {
+    const explicit = text.match(
+      /(?:タイトル|件名|予定名)(?:を|は)?\s*(.+?)(?:に|へ)(?:書き換え|変更|変えて|更新|直して|リネーム)/,
+    );
+    summary = (explicit?.[1] ?? '').trim();
+  }
+  if (!summary || /(適当|違うタイトル|別タイトル)/.test(summary)) {
+    summary = `MAKOTOくん Calendarタイトル変更確認 ${formatJstMinuteLabel()}`;
+  }
+  summary = summary.replace(/[。．、,，\s]+$/g, '');
+  if (!summary) return null;
+  return { summary };
+}
+
+function formatJstMinuteLabel(nowMs: number = Date.now()): string {
+  const jst = new Date(nowMs + 9 * 60 * 60 * 1000);
+  return `${pad2(jst.getUTCMonth() + 1)}/${pad2(jst.getUTCDate())} ${pad2(jst.getUTCHours())}:${pad2(jst.getUTCMinutes())}`;
+}
+
 function parseJapaneseDateToken(text: string): string | null {
   const explicit = text.match(/(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/);
   if (explicit) {
@@ -252,6 +282,35 @@ function validClock(hour: number, minute: number): boolean {
 
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
+}
+
+function jstDayWindow(offsetStartDays: number, offsetEndDays: number): { time_min: string; time_max: string } {
+  const jstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const base = new Date(Date.UTC(jstNow.getUTCFullYear(), jstNow.getUTCMonth(), jstNow.getUTCDate()));
+  const start = new Date(base);
+  start.setUTCDate(start.getUTCDate() + offsetStartDays);
+  const end = new Date(base);
+  end.setUTCDate(end.getUTCDate() + offsetEndDays);
+  return {
+    time_min: `${start.getUTCFullYear()}-${pad2(start.getUTCMonth() + 1)}-${pad2(start.getUTCDate())}T00:00:00+09:00`,
+    time_max: `${end.getUTCFullYear()}-${pad2(end.getUTCMonth() + 1)}-${pad2(end.getUTCDate())}T00:00:00+09:00`,
+  };
+}
+
+function isCalendarTitleUpdateCandidate(event: unknown): event is {
+  id: string;
+  summary: string;
+  start: Record<string, unknown>;
+  end: Record<string, unknown>;
+  htmlLink?: string;
+} {
+  if (!event || typeof event !== 'object') return false;
+  const e = event as Record<string, unknown>;
+  if (typeof e.id !== 'string' || !e.id) return false;
+  if (typeof e.summary !== 'string') return false;
+  if (!e.start || typeof e.start !== 'object' || Array.isArray(e.start)) return false;
+  if (!e.end || typeof e.end !== 'object' || Array.isArray(e.end)) return false;
+  return /MAKOTOくん/.test(e.summary) && /(Google連携CRUDテスト|Calendarタイトル変更確認)/.test(e.summary);
 }
 
 /**
@@ -659,6 +718,124 @@ export async function handleChatEvent(
       messageId: message.name,
       userSlug: userMapping.user_slug,
       reason: 'calendar_natural_create_done',
+      stage: 'deterministic_workspace_command',
+      outcome: 'committed',
+    });
+    return { kind: 'committed' };
+  }
+
+  const naturalCalendarTitleUpdate = parseNaturalCalendarTitleUpdate(bodyText);
+  if (naturalCalendarTitleUpdate !== null) {
+    if (!actorTrusted) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_update_untrusted',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const window = jstDayWindow(0, 8);
+    const listResult = await dispatchMakotoTool('calendar_list_events', {
+      time_min: window.time_min,
+      time_max: window.time_max,
+      max_results: 50,
+    }, {
+      env,
+      userSlug: userMapping.user_slug,
+      boundMessageId: '',
+      callerSessionId: '',
+    });
+    const events =
+      listResult.ok &&
+      listResult.payload &&
+      typeof listResult.payload === 'object' &&
+      Array.isArray((listResult.payload as { events?: unknown }).events)
+        ? (listResult.payload as { events: unknown[] }).events
+        : [];
+    const candidates = events.filter(isCalendarTitleUpdateCandidate);
+    if (!listResult.ok || candidates.length !== 1) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'calendar_natural_update_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: {
+          reason: listResult.ok ? 'target_not_unique' : 'list_failed',
+          candidate_count: candidates.length,
+        },
+      });
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_update_failed',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const target = candidates[0]!;
+    const updateResult = await dispatchMakotoTool('calendar_update_event', {
+      event_id: target.id,
+      summary: naturalCalendarTitleUpdate.summary,
+      start: target.start,
+      end: target.end,
+      send_updates: 'none',
+    }, {
+      env,
+      userSlug: userMapping.user_slug,
+      boundMessageId: '',
+      callerSessionId: '',
+    });
+    if (!updateResult.ok) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'calendar_natural_update_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { reason: 'update_failed', payload: updateResult.payload },
+      });
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_update_failed',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const payload = updateResult.payload as { htmlLink?: unknown; summary?: unknown };
+    const summary =
+      typeof payload.summary === 'string' && payload.summary.trim()
+        ? payload.summary.trim()
+        : naturalCalendarTitleUpdate.summary;
+    const link = typeof payload.htmlLink === 'string' ? `: ${payload.htmlLink}` : '';
+    await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, `予定更新しました: ${summary}${link}`, threadName, eventKey);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'calendar_natural_update_done',
+      source: 'chat-event-handler',
+      detail: {
+        event_id: target.id,
+        previous_summary: target.summary,
+        summary,
+        has_link: typeof payload.htmlLink === 'string',
+      },
+    });
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'calendar_natural_update_done',
       stage: 'deterministic_workspace_command',
       outcome: 'committed',
     });
