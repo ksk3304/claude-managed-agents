@@ -15,6 +15,16 @@
 // Outbound message tracking — supports In-Reply-To threading.
 // ---------------------------------------------------------------------------
 
+import { normalizeMessageId } from './lib/email-thread';
+
+function normalizeLikelyRfc822MessageId(raw: string | undefined): string {
+  if (!raw) return '';
+  const normalized = normalizeMessageId(raw);
+  if (!normalized.includes('@')) return '';
+  if (/\s/.test(normalized)) return '';
+  return normalized;
+}
+
 export async function recordSentMessage(
   db: D1Database,
   messageId: string,
@@ -27,7 +37,10 @@ export async function recordSentMessage(
   // `rfc822_msgid` is optional so AgentMail bridge callers pass the
   // normalized RFC 822 Message-ID; inbound In-Reply-To / References
   // routing then finds it through `findSessionByRfc822MessageId`.
-  const rfc822 = rfc822MessageId && rfc822MessageId.length > 0 ? rfc822MessageId : null;
+  const rfc822 =
+    normalizeLikelyRfc822MessageId(rfc822MessageId) ||
+    normalizeLikelyRfc822MessageId(messageId) ||
+    null;
   await db
     .prepare(
       `INSERT OR REPLACE INTO sent_messages
