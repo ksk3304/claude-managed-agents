@@ -109,8 +109,7 @@ export default {
   // Cron dispatcher — wrangler.jsonc `triggers.crons` 経由で複数 schedule を
   // 受ける. `controller.cron` で経路を分岐する:
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
-  //   - `45 5 * * *` (temporary #192 smoke, 05:45 UTC = 14:45 JST)
-  //     → daily-report (前日 JST の
+  //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
@@ -119,7 +118,7 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    if (controller.cron === "45 5 * * *") {
+    if (controller.cron === "30 15 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
       return;
     }
