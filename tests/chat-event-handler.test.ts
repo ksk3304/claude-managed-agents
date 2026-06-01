@@ -42,6 +42,8 @@ import {
 import { getThreadLock } from '../src/durable-objects/thread-lock';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 import { readCounter, _internals as costGuardInternals } from '../src/lib/cost-guard';
+import { PERSONA_SPEC_SHA256_HEX12 } from '../src/data/persona-spec';
+import { TOOLS_SPEC_SHA256_HEX12 } from '../src/data/tools-spec';
 
 // ---------------------------------------------------------------------------
 // Module mocks (same pattern as agentmail-dispatch.test.ts)
@@ -56,6 +58,10 @@ vi.mock('../src/lib/session-orchestrator', async (importOriginal) => {
       (globalThis as unknown as { __makotoFakeAnth: Anthropic | null }).__makotoFakeAnth,
   };
 });
+
+function promptSessionKey(baseKey: string): string {
+  return `${baseKey}:prompt:${PERSONA_SPEC_SHA256_HEX12}:${TOOLS_SPEC_SHA256_HEX12}`;
+}
 
 // Capture postChatMessage / updateChatMessage / deleteChatMessage calls.
 // `updateThrow` / `deleteThrow` で個別 test ケースから fail 経路を発火可能。
@@ -1462,8 +1468,9 @@ describe('handleChatEvent', () => {
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
     // pre-populate KV with existing session for this sender + space + thread.
-    const sessionKey =
+    const baseSessionKey =
       'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
+    const sessionKey = promptSessionKey(baseSessionKey);
     await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
 
     const created: unknown[] = [];
@@ -1524,9 +1531,53 @@ describe('handleChatEvent', () => {
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_old_scope');
     expect(
       await env.MAKOTO_KV.get(
-        'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+        promptSessionKey(
+          'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
+        ),
       ),
     ).toBe('sesn_new_thread');
+  });
+
+  it('Case 10c: prompt hash なしの旧 thread session は無視し、新規 session に移行する', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10',
+      text: '@MAKOTOくん 続きの質問',
+      threadName: 'spaces/ROOM10/threads/T12',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const oldThreadKey =
+      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T12';
+    await env.MAKOTO_KV.put(oldThreadKey, 'sesn_stale_prompt');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_prompt_migrated',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '新しい能力で応答します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_prompt_migrated']);
+    expect(await env.MAKOTO_KV.get(oldThreadKey)).toBe('sesn_stale_prompt');
+    expect(await env.MAKOTO_KV.get(promptSessionKey(oldThreadKey))).toBe('sesn_prompt_migrated');
   });
 
   it('attachment turn follows Chat thread session and ignores broad DM scope session', async () => {
@@ -1536,8 +1587,9 @@ describe('handleChatEvent', () => {
       } as Partial<Env>,
     });
     const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
-    const threadKey =
+    const baseThreadKey =
       'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TATT';
+    const threadKey = promptSessionKey(baseThreadKey);
     await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
     await env.MAKOTO_KV.put(threadKey, 'sesn_thread_existing');
     const msg = buildQueueMsg({
