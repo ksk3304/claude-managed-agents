@@ -687,6 +687,120 @@ describe('agentmailDispatch', () => {
     }
   });
 
+  it('SignalB external Gmail reply uses default owner even when KV is keyed by email', async () => {
+    const sendCapture: unknown[] = [];
+    const createCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      env: {
+        DEFAULT_USER_SLUG: 'k-seto',
+      },
+      message: {
+        ...INBOUND_MSG,
+        id: undefined,
+        message_id: '<CAH5yBfEMx1p32JG_wA0u4qgJT+uVUwjEyaLOpqua67ciQyRafw@mail.gmail.com>',
+        from: 'Keisuke Seto <keisukeseto.89103@gmail.com>',
+        subject: 'Re: [#147 E2E] continuation verify cont-e2e-231f5a523337',
+        in_reply_to:
+          '<0100019e8069d5fa-2bf396ed-ac4a-4178-ab5d-eba3ceb10d28-000000@email.amazonses.com>',
+        references: [
+          '<0100019e8069d5fa-2bf396ed-ac4a-4178-ab5d-eba3ceb10d28-000000@email.amazonses.com>',
+        ],
+        thread_id: 'abac2b2f-321d-406c-8e62-f0dd7ce355bd',
+        extracted_text: 'test',
+      },
+      event: {
+        id: 'evt_gmail_reply_without_sent_row',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          id: undefined,
+          message_id:
+            '<CAH5yBfEMx1p32JG_wA0u4qgJT+uVUwjEyaLOpqua67ciQyRafw@mail.gmail.com>',
+          from: 'Keisuke Seto <keisukeseto.89103@gmail.com>',
+          subject: 'Re: [#147 E2E] continuation verify cont-e2e-231f5a523337',
+          in_reply_to:
+            '<0100019e8069d5fa-2bf396ed-ac4a-4178-ab5d-eba3ceb10d28-000000@email.amazonses.com>',
+          references: [
+            '<0100019e8069d5fa-2bf396ed-ac4a-4178-ab5d-eba3ceb10d28-000000@email.amazonses.com>',
+          ],
+          thread_id: 'abac2b2f-321d-406c-8e62-f0dd7ce355bd',
+          inbox_id: 'makoto@agentmail.to',
+          extracted_text: 'test',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:k.seto@makotoprime.com',
+      JSON.stringify({ user_slug: 'k-seto', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_signal_b_default_owner',
+      sendCapture,
+      createCapture,
+      events: [
+        { type: 'agent.message.text', text: 'テスト返信を受け取りました。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: Array<{ url: string; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: String(init.body ?? '') });
+      if (url.includes('/threads/abac2b2f-321d-406c-8e62-f0dd7ce355bd')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                message_id:
+                  '<0100019e8069d5fa-2bf396ed-ac4a-4178-ab5d-eba3ceb10d28-000000@email.amazonses.com>',
+                from: 'MAKOTOくん（AI社員） <makoto@agentmail.to>',
+                subject: '[#147 E2E] continuation verify cont-e2e-231f5a523337',
+                extracted_text: 'これは #147 continuation 修正の E2E 検証メールです。',
+              },
+              {
+                message_id:
+                  '<CAH5yBfEMx1p32JG_wA0u4qgJT+uVUwjEyaLOpqua67ciQyRafw@mail.gmail.com>',
+                from: 'Keisuke Seto <keisukeseto.89103@gmail.com>',
+                subject: 'Re: [#147 E2E] continuation verify cont-e2e-231f5a523337',
+                extracted_text: 'test',
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          message_id: '<0100019e80700000-auto-reply@example.com>',
+          rfc822_message_id: '<0100019e80700000-auto-reply@example.com>',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      expect(createCapture).toEqual([
+        expect.objectContaining({ agent: 'agent_001', environment_id: 'env_test' }),
+      ]);
+      expect(JSON.stringify(sendCapture)).toContain('MAKOTOくん（AI社員）');
+      expect(JSON.stringify(sendCapture)).toContain('test');
+      expect(amCalls.some((c) => c.url.includes('/threads/abac2b2f-321d-406c-8e62-f0dd7ce355bd'))).toBe(true);
+      expect(amCalls.some((c) => c.url.includes('/messages/%3CCAH5yBfEMx1p32JG_wA0u4qgJT%2BuVUwjEyaLOpqua67ciQyRafw%40mail.gmail.com%3E/reply'))).toBe(true);
+      const replyCall = amCalls.find((c) => c.url.includes('/reply'));
+      expect(replyCall ? JSON.parse(replyCall.body) : null).toEqual({
+        text: 'テスト返信を受け取りました。',
+      });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('no inbox_id in webhook → skipped (cannot deliver)', async () => {
     const ctx = makeDispatchContext({
       event: {

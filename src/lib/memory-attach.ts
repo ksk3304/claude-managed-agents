@@ -96,6 +96,7 @@ export interface UserMappingResolution {
  * Lookup order:
  *   1. `user_mapping:<email>` (exact, normalized email)
  *   2. `user_mapping:<defaultSlug>` (only when `defaultSlug` is set and #1 misses)
+ *   3. any `user_mapping:*` whose JSON `user_slug` equals `defaultSlug`
  *
  * Returns `null` when both miss → caller skips with `unknown_sender`
  * (legacy behaviour preserved when `defaultSlug` is unset / blank or
@@ -123,8 +124,10 @@ export async function readUserMappingWithDefault(
   // (`scripts/cma_memory_init.py` convention). Python keeps `default`
   // inside the same JSON file; the KV port flattens to a dedicated key.
   const raw = await kv.get(`${KV_USER_MAPPING_PREFIX}:${slug}`, 'json');
-  if (raw === null) return null;
-  return { mapping: raw as UserMappingValue, isDefault: true };
+  if (raw !== null) return { mapping: raw as UserMappingValue, isDefault: true };
+  const byStoredSlug = await readUserMappingByUserSlug(kv, slug);
+  if (byStoredSlug === null) return null;
+  return { mapping: byStoredSlug.mapping, isDefault: true };
 }
 
 /**
@@ -165,6 +168,44 @@ export async function readUserMappingByAgentId(
     for (const entry of listResult.keys) {
       const value = (await kv.get(entry.name, 'json')) as UserMappingValue | null;
       if (value?.agent_id === agentId) {
+        return {
+          email: entry.name.slice(`${KV_USER_MAPPING_PREFIX}:`.length),
+          mapping: value,
+        };
+      }
+    }
+    if (listResult.list_complete) break;
+    cursor = listResult.cursor;
+    if (!cursor) break;
+  }
+  return null;
+}
+
+/**
+ * Resolve `DEFAULT_USER_SLUG` against production's actual KV shape.
+ *
+ * The onboarding writer stores mappings under email keys
+ * (`user_mapping:k.seto@...`) and puts the slug inside the JSON
+ * (`user_slug: "k-seto"`). Some callers only know the slug, so the
+ * fallback must scan values rather than require a duplicate
+ * `user_mapping:k-seto` key.
+ */
+export async function readUserMappingByUserSlug(
+  kv: KVNamespace,
+  userSlug: string,
+): Promise<{ email: string; mapping: UserMappingValue } | null> {
+  const slug = userSlug.trim();
+  if (slug.length === 0) return null;
+  let cursor: string | undefined;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const listResult = await kv.list({
+      prefix: `${KV_USER_MAPPING_PREFIX}:`,
+      cursor,
+    });
+    for (const entry of listResult.keys) {
+      const value = (await kv.get(entry.name, 'json')) as UserMappingValue | null;
+      if (value?.user_slug === slug) {
         return {
           email: entry.name.slice(`${KV_USER_MAPPING_PREFIX}:`.length),
           mapping: value,
