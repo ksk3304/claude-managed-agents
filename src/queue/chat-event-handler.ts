@@ -132,7 +132,11 @@ import {
   retrieveSessionUsageSnapshot,
   sendAndStreamWithToolDispatch,
 } from '../lib/session';
-import { scrubInternalStateForChat } from '../redact/internal-state';
+import {
+  maskInternalStateForChat,
+  scrubInternalStateForChat,
+  softenBenignInternalReferencesForChat,
+} from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
 import { executeWithCommit, LeaseHeartbeat } from '../lib/three-stage-precheck';
@@ -1572,20 +1576,39 @@ export async function handleChatEvent(
         `skipped=${outputDelivery.skipped.length} sanitized_paths=${outputDelivery.sanitizedPathCount}`,
     );
   }
-  const scrubbed = scrubInternalStateForChat(outputDelivery.text, `chat:${sessionId}`);
-  if (scrubbed.hits.length > 0) {
+  const softened = softenBenignInternalReferencesForChat(outputDelivery.text);
+  if (softened.replacements.length > 0) {
     console.warn(
-      `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
+      `[chat-event] benign internal references softened eventKey=${eventKey} ` +
+        `replacements=${softened.replacements.join(',')}`,
     );
   }
+  const masked = maskInternalStateForChat(softened.text);
+  if (masked.hits.length > 0) {
+    console.warn(
+      `[chat-event] internal-state redactor masked eventKey=${eventKey} hits=${masked.hits.join(',')}`,
+    );
+  }
+  const visibleText =
+    masked.hits.length > 0
+      ? `${masked.text}\n\n（内部運用表現を一部伏せました。回答本文は表示しています。）`
+      : masked.text;
   // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
   const emailDispatchText = formatEmailDispatchSummaries(emailDispatchSummaries);
-  const finalTextParts = [scrubbed.text, emailDispatchText, attachmentNotice, sessionCostPrompt]
+  const finalTextParts = [visibleText, emailDispatchText, attachmentNotice, sessionCostPrompt]
     .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
   const finalText = finalTextParts.join('\n\n').trim();
-  if (finalText.trim().length > 0) {
+  const chatReplyText =
+    finalText.trim().length > 0
+      ? finalText
+      : 'CMA は処理を完了しましたが、Chat に表示できる本文が空でした。副作用マーカーだけが出力された可能性があります。';
+  if (finalText.trim().length === 0) {
+    console.warn(
+      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting visible notice`,
+    );
+  }
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
     // WARN log + safePost に fallback (= bot 全体は落とさない、Python
@@ -1603,9 +1626,9 @@ export async function handleChatEvent(
       target: `${spaceName}:${threadName ?? ''}`,
       sendFn: async () => {
         if (placeholderName) {
-          await safeUpdateOrPost(env, placeholderName, spaceName, finalText, threadName, eventKey);
+          await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
         } else {
-          await safePost(env, spaceName, finalText, threadName, eventKey);
+          await safePost(env, spaceName, chatReplyText, threadName, eventKey);
         }
         // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
         return undefined as unknown as void;
@@ -1662,21 +1685,10 @@ export async function handleChatEvent(
         detail: {
           outcome: 'sent',
           mode: placeholderName ? 'patch_or_post_fallback' : 'post',
-          final_text_chars: finalText.length,
+          final_text_chars: chatReplyText.length,
         },
       });
     }
-  } else {
-    console.log(
-      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}`,
-    );
-    // 本文空 = 投稿すべきテキスト無し。placeholder 残骸を消す
-    // (Python では placeholder のまま残るが、TS では `_delete_chat_message`
-    // 経路で残骸を出さない方が UX 上素直 = #186 の主旨に沿う)。
-    if (placeholderName) {
-      await safeDeletePlaceholder(env, placeholderName, eventKey);
-    }
-  }
 
   // ---- 8. session-log memory append ----
   await safeAppendSessionLog(env, {
@@ -1690,7 +1702,7 @@ export async function handleChatEvent(
     sender,
     threadName,
     userText: bodyText,
-    finalText,
+    finalText: chatReplyText,
     sessionId,
     messageId: message.name,
   });
@@ -2013,11 +2025,16 @@ function scrubActionMarkerLeakForChat(
     return { text, scrubbed: false, reason: '' };
   }
   const normalized = text.toLowerCase();
+  const rawMarkerSyntax =
+    /\b(email_send|chat_post|schedule_action)\s*:/i.test(text);
+  const botProcessingMarkerTalk =
+    (text.includes('bot 側') || text.includes('bot側')) &&
+    (normalized.includes('email_send') ||
+      normalized.includes('chat_post') ||
+      normalized.includes('schedule_action') ||
+      text.includes('マーカー'));
   const leaks =
-    normalized.includes('email_send') ||
-    text.includes('bot 側') ||
-    text.includes('bot側') ||
-    text.includes('マーカー');
+    rawMarkerSyntax || botProcessingMarkerTalk;
   if (!leaks) return { text, scrubbed: false, reason: '' };
   return {
     text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',

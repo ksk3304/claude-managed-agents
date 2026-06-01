@@ -1462,7 +1462,7 @@ describe('handleChatEvent', () => {
     }
   });
 
-  it('Case 9: 内部状態漏洩語 → scrubInternalStateForChat で redaction', async () => {
+  it('Case 9: 内部状態漏洩語 → maskInternalStateForChat で本文を保持', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1482,12 +1482,14 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    // placeholder POST 1 件 → 最終 redaction 結果は PATCH で書き換え。
+    // placeholder POST 1 件 → 最終回答は固定エラー化せず、該当語だけ伏せて PATCH。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
     expect(post!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
+    expect(chatApiMock.patches[0]!.text).toContain('対応できません');
+    expect(chatApiMock.patches[0]!.text).toContain('内部運用表現を一部伏せました');
+    expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
   });
 
@@ -1516,6 +1518,41 @@ describe('handleChatEvent', () => {
     );
     expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
     expect(chatApiMock.patches[0]!.text).not.toContain('bot');
+  });
+
+  it('Case 9c: architecture explanation may mention marker names without being replaced', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            'わかります！system prompt と memory から答えます。\n\n' +
+            '*僕のアーキテクチャ*\n' +
+            '- `/mnt/memory/` 配下に記憶があります\n' +
+            '- CHAT_POST マーカー（別スペースへの投稿）\n' +
+            '- SCHEDULE_ACTION マーカー（ジョブ登録）',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('僕のアーキテクチャ');
+    expect(chatApiMock.patches[0]!.text).toContain('CHAT_POST マーカー');
+    expect(chatApiMock.patches[0]!.text).toContain('SCHEDULE_ACTION マーカー');
+    expect(chatApiMock.patches[0]!.text).toContain('社内記憶');
+    expect(chatApiMock.patches[0]!.text).not.toContain('/mnt/memory');
+    expect(chatApiMock.patches[0]!.text).not.toContain(
+      '送信処理の状態を確認できませんでした',
+    );
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
@@ -2345,6 +2382,28 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_1');
     expect(chatApiMock.patches[0]!.text).toBe('先行プレースホルダー再利用OK');
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('placeholder empty final text: DELETEせず見える説明へPATCHする', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_empty_text',
+      events: [
+        { type: 'agent.message.text', text: '' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('Chat に表示できる本文が空でした');
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 

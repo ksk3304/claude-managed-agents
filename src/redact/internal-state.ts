@@ -120,6 +120,9 @@ console.log(
 const neutralReplacement = (jobId: string): string =>
   `[${jobId}] 今回のタスクは完了できませんでした。担当者が確認します。`;
 
+const INTERNAL_STATE_MASK = '内部運用情報';
+const INTERNAL_STATE_REGEX_MASK = '内部記憶ファイル';
+
 /**
  * Canonical, ordered pattern-name registry — literals followed by
  * regex names. Parity with Python `INTERNAL_STATE_PATTERNS`.
@@ -132,6 +135,83 @@ export const INTERNAL_STATE_PATTERNS: readonly string[] = [
 export interface ScrubResult {
   text: string;
   hits: string[];
+}
+
+export interface SoftenedInternalReferencesResult {
+  text: string;
+  replacements: string[];
+}
+
+const BENIGN_INTERNAL_REFERENCE_REPLACEMENTS: readonly {
+  name: string;
+  pattern: RegExp;
+  replacement: string;
+}[] = [
+  {
+    name: 'mnt_memory_path',
+    pattern: /`?\/mnt\/memory(?:\/[^\s`"'）)]*)?`?/g,
+    replacement: '社内記憶',
+  },
+];
+
+/**
+ * User-facing softener for benign implementation references.
+ *
+ * The hard redactor below intentionally turns risky failure text into a neutral
+ * error. Before the final Chat guard, this rewrites harmless internal paths so
+ * useful answers are preserved without exposing local runtime details.
+ */
+export function softenBenignInternalReferencesForChat(
+  text: unknown,
+): SoftenedInternalReferencesResult {
+  if (typeof text !== 'string' || text.length === 0) {
+    return { text: typeof text === 'string' ? text : '', replacements: [] };
+  }
+
+  let out = text;
+  const replacements: string[] = [];
+  for (const rule of BENIGN_INTERNAL_REFERENCE_REPLACEMENTS) {
+    let changed = false;
+    out = out.replace(rule.pattern, () => {
+      changed = true;
+      return rule.replacement;
+    });
+    if (changed) replacements.push(rule.name);
+  }
+  return { text: out, replacements };
+}
+
+/**
+ * Chat final-output guard that preserves the agent answer.
+ *
+ * `scrubInternalStateForChat` is still kept for parity with the legacy hard
+ * redactor. Google Chat final replies must not turn a valid CMA answer into a
+ * generic failure just because an internal term matched; they locally mask only
+ * the matched terms.
+ */
+export function maskInternalStateForChat(text: unknown): ScrubResult {
+  if (typeof text !== 'string' || text.length === 0) {
+    return { text: typeof text === 'string' ? text : '', hits: [] };
+  }
+
+  let out = text;
+  const hits: string[] = [];
+  for (const lit of INTERNAL_STATE_LITERALS) {
+    if (out.includes(lit)) {
+      hits.push(lit);
+      out = out.split(lit).join(INTERNAL_STATE_MASK);
+    }
+  }
+  for (const { name, pattern } of INTERNAL_STATE_REGEXES) {
+    let matched = false;
+    out = out.replace(pattern, () => {
+      matched = true;
+      return INTERNAL_STATE_REGEX_MASK;
+    });
+    if (matched) hits.push(name);
+  }
+
+  return { text: out, hits };
 }
 
 /**
