@@ -202,6 +202,58 @@ interface PendingPdfPreflightApproval {
   createdAtMs: number;
 }
 
+interface NaturalCalendarCreateInput {
+  summary: string;
+  start: { dateTime: string };
+  end: { dateTime: string };
+  send_updates: 'all';
+}
+
+function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | null {
+  if (!/カレンダー/.test(text)) return null;
+  if (!/(入れて|登録|作って|予定作成|予定を作)/.test(text)) return null;
+  const date = parseJapaneseDateToken(text);
+  if (date === null) return null;
+  const time = text.match(/(\d{1,2})時(?:(\d{1,2})分)?\s*(?:から|-|〜|~)\s*(\d{1,2})時(?:(\d{1,2})分)?/);
+  if (!time) return null;
+  const startHour = Number(time[1]);
+  const startMinute = time[2] ? Number(time[2]) : 0;
+  const endHour = Number(time[3]);
+  const endMinute = time[4] ? Number(time[4]) : 0;
+  if (!validClock(startHour, startMinute) || !validClock(endHour, endMinute)) return null;
+  const tail = text.slice((time.index ?? 0) + time[0].length);
+  const titleMatch = tail.match(/(?:に|で)?\s*(.+?)(?:と入れて|を入れて|入れて|と登録|を登録|登録|として作って|で作って|作って|予定)/);
+  const summary = (titleMatch?.[1] ?? '').trim().replace(/[。．、,，\s]+$/g, '');
+  if (!summary) return null;
+  return {
+    summary,
+    start: { dateTime: `${date}T${pad2(startHour)}:${pad2(startMinute)}:00+09:00` },
+    end: { dateTime: `${date}T${pad2(endHour)}:${pad2(endMinute)}:00+09:00` },
+    send_updates: 'all',
+  };
+}
+
+function parseJapaneseDateToken(text: string): string | null {
+  const explicit = text.match(/(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/);
+  if (explicit) {
+    return `${explicit[1]}-${pad2(Number(explicit[2]))}-${pad2(Number(explicit[3]))}`;
+  }
+  const jstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const base = new Date(Date.UTC(jstNow.getUTCFullYear(), jstNow.getUTCMonth(), jstNow.getUTCDate()));
+  const offsetDays = text.includes('明日') ? 1 : text.includes('今日') ? 0 : null;
+  if (offsetDays === null) return null;
+  base.setUTCDate(base.getUTCDate() + offsetDays);
+  return `${base.getUTCFullYear()}-${pad2(base.getUTCMonth() + 1)}-${pad2(base.getUTCDate())}`;
+}
+
+function validClock(hour: number, minute: number): boolean {
+  return Number.isInteger(hour) && Number.isInteger(minute) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
 /**
  * Queue consumer entry point。`src/index.ts` の `queue` handler から
  * `makoto-chat-queue` 分岐で呼ばれる。batch 中 1 message ずつ呼び出すこと。
@@ -541,6 +593,75 @@ export async function handleChatEvent(
     await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
     console.log(`[chat-event] natural schedule command handled eventKey=${eventKey}`);
+    return { kind: 'committed' };
+  }
+
+  const naturalCalendarCreate = parseNaturalCalendarCreate(bodyText);
+  if (naturalCalendarCreate !== null) {
+    if (!actorTrusted) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_create_untrusted',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const result = await dispatchMakotoTool('calendar_create_event', naturalCalendarCreate, {
+      env,
+      userSlug: userMapping.user_slug,
+      boundMessageId: '',
+      callerSessionId: '',
+    });
+    if (!result.ok) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'calendar_natural_create_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { payload: result.payload },
+      });
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_create_failed',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const payload = result.payload as { htmlLink?: unknown; summary?: unknown };
+    const summary =
+      typeof payload.summary === 'string' && payload.summary.trim()
+        ? payload.summary.trim()
+        : naturalCalendarCreate.summary;
+    const link = typeof payload.htmlLink === 'string' ? `: ${payload.htmlLink}` : '';
+    await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, `予定作成しました: ${summary}${link}`, threadName, eventKey);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'calendar_natural_create_done',
+      source: 'chat-event-handler',
+      detail: {
+        summary,
+        start: naturalCalendarCreate.start,
+        end: naturalCalendarCreate.end,
+        has_link: typeof payload.htmlLink === 'string',
+      },
+    });
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'calendar_natural_create_done',
+      stage: 'deterministic_workspace_command',
+      outcome: 'committed',
+    });
     return { kind: 'committed' };
   }
 
