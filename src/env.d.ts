@@ -105,6 +105,17 @@ declare namespace Cloudflare {
      * (`memory-attach.ts:resolveSenderToResources` comment).
      */
     DEFAULT_USER_SLUG?: string;
+    /**
+     * When "1", Chat reactive path creates chat-only pending mappings under
+     * `chat_pending_user_mapping:*` for first-time senders that miss
+     * `user_mapping:<email>` but can fall back to `DEFAULT_USER_SLUG`.
+     * Pending mappings are untrusted: normal replies are allowed, external
+     * tools remain gated. Default unset/off preserves current production
+     * behaviour.
+     */
+    CHAT_AUTO_PENDING_USER_MAPPING_ENABLED?: string;
+    /** Operator Google Chat space for Cost Guard warning notifications. */
+    COST_GUARD_OPERATOR_SPACE?: string;
     COST_GUARD_SESSION_THRESHOLDS_USD?: string;
     COST_GUARD_SESSION_STEP_USD?: string;
     COST_GUARD_USD_TO_JPY?: string;

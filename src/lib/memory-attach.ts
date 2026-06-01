@@ -5,9 +5,10 @@
  *
  * The live per-user mapping is written by the parent #177 copy_agent
  * CLI to KV under `user_mapping:<email-lower>`. Mail-path callers
- * read it here. We do not duplicate the write path — anything that
- * needs to register a new user goes through the Python CLI to keep
- * one source of truth.
+ * read it here. Full user registration still goes through the onboarding
+ * CLI. Chat can create separate pending mappings under
+ * `chat_pending_user_mapping:*`; those are intentionally not full
+ * `user_mapping:*` registrations.
  *
  * Mail path is always `space_type='DM'` and
  * `filtered_personal_store_count=0` (mail is inherently per-recipient
@@ -26,6 +27,7 @@ import type {
 import { toResourcesArray } from '../types/memory';
 
 const KV_USER_MAPPING_PREFIX = 'user_mapping';
+const CHAT_PENDING_USER_MAPPING_PREFIX = 'chat_pending_user_mapping';
 
 /**
  * Shape of `user_mapping:<email>` values in KV. Written by the parent
@@ -37,6 +39,8 @@ export interface UserMappingValue {
   user_slug: string;
   /** Anthropic agent id this user is bound to (1 user = 1 agent). */
   agent_id: string;
+  /** Memory store ids that must not be attached in shared spaces. */
+  personal_memory_store_ids?: string[];
   /**
    * Memory Stores to attach for this user's sessions. Each entry
    * becomes one `MemoryStoreResourceParam` at sessions.create time.
@@ -44,6 +48,20 @@ export interface UserMappingValue {
   memory_attachments: MemoryAttachment[];
   /** Optional per-user system-prompt addendum. */
   system_prompt_addendum?: string;
+  /** Observability count added by `filterPersonalMemoryForSpace`. */
+  filtered_personal_store_count?: number;
+  /** False for auto-created chat-only pending mappings. Missing means trusted legacy mapping. */
+  actor_trusted?: boolean;
+  /** True when the mapping was created from a Chat sender event and still needs promotion. */
+  auto_registered?: boolean;
+  /** Stable Google Chat user resource id (`users/<id>`) when known. */
+  chat_user_id?: string;
+  /** Display name observed from Google Chat when known. */
+  display_name?: string;
+  /** Source marker for audit/debugging. */
+  mapping_source?: string;
+  /** Creation timestamp for auto-created mappings. */
+  registered_at_ms?: number;
 }
 
 /**
@@ -85,6 +103,16 @@ export function normalizeSenderEmail(raw: string): string {
 export interface UserMappingResolution {
   mapping: UserMappingValue;
   isDefault: boolean;
+  actorTrusted: boolean;
+  source: 'direct' | 'default' | 'auto_pending';
+}
+
+export interface ChatSenderIdentity {
+  senderEmail?: string;
+  chatUserId?: string;
+  displayName?: string;
+  spaceName?: string;
+  nowMs?: number;
 }
 
 /**
@@ -112,9 +140,17 @@ export async function readUserMappingWithDefault(
   kv: KVNamespace,
   senderEmail: string,
   defaultSlug: string | undefined,
+  spaceType: string = 'DM',
 ): Promise<UserMappingResolution | null> {
   const direct = await readUserMapping(kv, senderEmail);
-  if (direct !== null) return { mapping: direct, isDefault: false };
+  if (direct !== null) {
+    return {
+      mapping: filterPersonalMemoryForSpace(direct, spaceType),
+      isDefault: false,
+      actorTrusted: direct.actor_trusted !== false && direct.auto_registered !== true,
+      source: 'direct',
+    };
+  }
   if (!defaultSlug) return null;
   const slug = defaultSlug.trim();
   if (slug.length === 0) return null;
@@ -124,7 +160,151 @@ export async function readUserMappingWithDefault(
   // inside the same JSON file; the KV port flattens to a dedicated key.
   const raw = await kv.get(`${KV_USER_MAPPING_PREFIX}:${slug}`, 'json');
   if (raw === null) return null;
-  return { mapping: raw as UserMappingValue, isDefault: true };
+  return {
+    mapping: filterPersonalMemoryForSpace(raw as UserMappingValue, spaceType),
+    isDefault: true,
+    actorTrusted: false,
+    source: 'default',
+  };
+}
+
+/**
+ * Chat-path resolver that can create a chat-only pending mapping for an
+ * unknown sender. The pending entry deliberately uses a separate KV prefix
+ * (`chat_pending_user_mapping:*`) so mail, daily reports, and onboarding code
+ * that list/read `user_mapping:*` cannot accidentally treat the person as a
+ * fully registered user.
+ */
+export async function readChatSenderMappingWithAutoPending(
+  kv: KVNamespace,
+  identity: ChatSenderIdentity,
+  defaultSlug: string | undefined,
+  spaceType: string = 'DM',
+  autoCreatePending = false,
+): Promise<UserMappingResolution | null> {
+  const email = identity.senderEmail ? normalizeSenderEmail(identity.senderEmail) : '';
+  if (email) {
+    const direct = await readUserMapping(kv, email);
+    if (direct !== null) {
+      return {
+        mapping: filterPersonalMemoryForSpace(direct, spaceType),
+        isDefault: false,
+        actorTrusted: direct.actor_trusted !== false && direct.auto_registered !== true,
+        source: 'direct',
+      };
+    }
+  }
+
+  const pendingKeys = autoCreatePending ? pendingMappingKeys(email, identity.chatUserId) : [];
+  for (const key of pendingKeys) {
+    const pending = await readPendingChatMapping(kv, key, spaceType);
+    if (pending) return pending;
+  }
+
+  const defaultMapping = await readDefaultMapping(kv, defaultSlug);
+  if (!defaultMapping) return null;
+
+  if (autoCreatePending && pendingKeys.length > 0) {
+    const pendingValue: UserMappingValue = {
+      ...defaultMapping,
+      actor_trusted: false,
+      auto_registered: true,
+      chat_user_id: identity.chatUserId?.trim() || undefined,
+      display_name: identity.displayName?.trim() || undefined,
+      mapping_source: 'chat_auto_pending',
+      registered_at_ms: identity.nowMs ?? Date.now(),
+      system_prompt_addendum: appendPendingAddendum(defaultMapping.system_prompt_addendum),
+    };
+    const serialized = JSON.stringify(pendingValue);
+    for (const key of pendingKeys) {
+      await kv.put(key, serialized);
+    }
+    return {
+      mapping: filterPersonalMemoryForSpace(pendingValue, spaceType),
+      isDefault: true,
+      actorTrusted: false,
+      source: 'auto_pending',
+    };
+  }
+
+  return {
+    mapping: filterPersonalMemoryForSpace(defaultMapping, spaceType),
+    isDefault: true,
+    actorTrusted: false,
+    source: 'default',
+  };
+}
+
+function pendingMappingKeys(email: string, chatUserId: string | undefined): string[] {
+  const keys: string[] = [];
+  if (email) keys.push(`${CHAT_PENDING_USER_MAPPING_PREFIX}:email:${email}`);
+  const userId = chatUserId?.trim();
+  if (userId) {
+    keys.push(`${CHAT_PENDING_USER_MAPPING_PREFIX}:user:${encodeURIComponent(userId)}`);
+  }
+  return [...new Set(keys)];
+}
+
+async function readPendingChatMapping(
+  kv: KVNamespace,
+  key: string,
+  spaceType: string,
+): Promise<UserMappingResolution | null> {
+  const raw = await kv.get(key, 'json');
+  if (raw === null) return null;
+  const mapping = raw as UserMappingValue;
+  return {
+    mapping: filterPersonalMemoryForSpace(mapping, spaceType),
+    isDefault: true,
+    actorTrusted: false,
+    source: 'auto_pending',
+  };
+}
+
+async function readDefaultMapping(
+  kv: KVNamespace,
+  defaultSlug: string | undefined,
+): Promise<UserMappingValue | null> {
+  if (!defaultSlug) return null;
+  const slug = defaultSlug.trim();
+  if (slug.length === 0) return null;
+  const raw = await kv.get(`${KV_USER_MAPPING_PREFIX}:${slug}`, 'json');
+  return raw === null ? null : (raw as UserMappingValue);
+}
+
+function appendPendingAddendum(base: string | undefined): string {
+  const pending =
+    'この発言者は Google Chat から自動検出された未昇格ユーザーです。通常応答のみ行い、メール送信・予定操作・別スペース投稿などの外部副作用は実行しません。';
+  const trimmed = base?.trim();
+  return trimmed ? `${trimmed}\n\n${pending}` : pending;
+}
+
+export function isSharedSpace(spaceType: string): boolean {
+  const normalized = (spaceType || '').trim().toUpperCase();
+  return normalized !== 'DM' && normalized !== 'DIRECT_MESSAGE';
+}
+
+export function filterPersonalMemoryForSpace(
+  mapping: UserMappingValue,
+  spaceType: string,
+): UserMappingValue {
+  const personalIds = new Set(mapping.personal_memory_store_ids ?? []);
+  if (!isSharedSpace(spaceType) || personalIds.size === 0) {
+    return {
+      ...mapping,
+      memory_attachments: [...mapping.memory_attachments],
+      filtered_personal_store_count: 0,
+    };
+  }
+  const memoryAttachments = mapping.memory_attachments.filter(
+    (a) => !personalIds.has(a.memory_store_id),
+  );
+  return {
+    ...mapping,
+    memory_attachments: memoryAttachments,
+    filtered_personal_store_count:
+      mapping.memory_attachments.length - memoryAttachments.length,
+  };
 }
 
 /**
