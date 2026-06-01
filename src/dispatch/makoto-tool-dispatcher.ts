@@ -195,7 +195,7 @@ export async function dispatchMakotoTool(
   // Resolve per-user access token. Fail-close if the vault has no
   // entry — the agent must surface a clear "Workspace not connected"
   // error rather than silently degrading to no-results.
-  const tokenResult = await resolveAccessToken(ctx);
+  const tokenResult = await resolveMakotoWorkspaceAccessToken(ctx);
   if (tokenResult.kind === 'fail') {
     return {
       ok: false,
@@ -211,17 +211,7 @@ export async function dispatchMakotoTool(
   // One-shot refresh callback: invalidate the KV access-token cache and
   // re-resolve. Triggered by `googleApiFetch` on the single 401 retry
   // per call (mirrors Python `cma_lib.py` `auth401Retried` flag).
-  const refreshAccessToken = async (): Promise<string> => {
-    await ctx.env.MAKOTO_KV.delete(`oauth:access:${ctx.userSlug}`);
-    const refreshed = await resolveAccessToken(ctx);
-    if (refreshed.kind === 'fail') {
-      throw new GoogleApiToolError(
-        `workspace_oauth refresh failed for ${ctx.userSlug}: ${refreshed.message}`,
-        { status: 401 },
-      );
-    }
-    return refreshed.access_token;
-  };
+  const refreshAccessToken = makeMakotoWorkspaceRefreshAccessToken(ctx);
 
   try {
     switch (name) {
@@ -313,7 +303,9 @@ type AccessTokenResolution =
   | { kind: 'ok'; access_token: string }
   | { kind: 'fail'; error: string; message: string };
 
-async function resolveAccessToken(
+export type MakotoWorkspaceAccessTokenResolution = AccessTokenResolution;
+
+export async function resolveMakotoWorkspaceAccessToken(
   ctx: MakotoToolDispatchContext,
 ): Promise<AccessTokenResolution> {
   const env = ctx.env;
@@ -362,6 +354,22 @@ async function resolveAccessToken(
     };
   }
   return { kind: 'ok', access_token: token.access_token };
+}
+
+export function makeMakotoWorkspaceRefreshAccessToken(
+  ctx: MakotoToolDispatchContext,
+): () => Promise<string> {
+  return async (): Promise<string> => {
+    await ctx.env.MAKOTO_KV.delete(`oauth:access:${ctx.userSlug}`);
+    const refreshed = await resolveMakotoWorkspaceAccessToken(ctx);
+    if (refreshed.kind === 'fail') {
+      throw new GoogleApiToolError(
+        `workspace_oauth refresh failed for ${ctx.userSlug}: ${refreshed.message}`,
+        { status: 401 },
+      );
+    }
+    return refreshed.access_token;
+  };
 }
 
 function driveDeps(
