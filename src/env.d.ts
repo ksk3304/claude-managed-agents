@@ -94,6 +94,8 @@ declare namespace Cloudflare {
     MAIL_SEND_SKILL_VERSION?: string;
     /** Secret-gated debug endpoint token. Unset means debug endpoints return 404. */
     MAKOTO_DEBUG_TOKEN?: string;
+    /** Temporary smoke token for issue-specific live verification. */
+    MAKOTO_ISSUE250_SMOKE_TOKEN?: string;
 
     /**
      * Optional default user_slug for the Chat reactive path. When set,
