@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageEnvelope,
+  MAIL_INTENT_INSTRUCTIONS,
   MENTION_SECTION_HEADER,
 } from '../src/lib/user-message-envelope';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
@@ -77,11 +78,17 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
       intent: { command: '/mail', source: 'mail_intent', isActionSkill: true },
     });
     expect(out).toContain('<intent>command=/mail source=mail_intent action_skill=true</intent>');
+    expect(out).toContain(MAIL_INTENT_INSTRUCTIONS);
+    expect(out).toContain('こんにちはメール');
+    expect(out).toContain('EMAIL_SEND');
     // intent は context より前、body より前
     const idxIntent = out.indexOf('<intent>');
+    const idxMailInstructions = out.indexOf('<mail_intent_instructions>');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
     expect(idxIntent).toBeLessThan(idxContext);
+    expect(idxIntent).toBeLessThan(idxMailInstructions);
+    expect(idxMailInstructions).toBeLessThan(idxContext);
     expect(idxContext).toBeLessThan(idxBody);
   });
 
@@ -90,6 +97,16 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
       intent: { command: '/help' },
     });
     expect(out).toContain('<intent>command=/help</intent>');
+    expect(out).not.toContain('<mail_intent_instructions>');
+  });
+
+  it('slash /mail でも mail 専用指示を入れる', () => {
+    const out = buildUserMessageEnvelope('/mail k.seto@makotoprime.com にこんにちはメールを送って', {
+      intent: { command: '/mail', source: 'slash_command', isActionSkill: true },
+    });
+    expect(out).toContain('<intent>command=/mail source=slash_command action_skill=true</intent>');
+    expect(out).toContain('<mail_intent_instructions>');
+    expect(out).toContain('「こんにちはメール」は件名「こんにちは」、本文「こんにちは」で足りる');
   });
 });
 

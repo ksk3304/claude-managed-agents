@@ -190,6 +190,7 @@ interface FakeAnthOpts {
   sendCaptureSessionIds?: string[];
   retrieveUsage?: Record<string, unknown>;
   retrieveModel?: string;
+  sendCapturePayloads?: unknown[];
   // Capture memory store list/retrieve/create/update calls for session-log
   memoryListReturns?: AsyncIterable<Record<string, unknown>>;
   memoryRetrieveContent?: string;
@@ -240,8 +241,9 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
           };
         },
         events: {
-          async send(sessionId: string, _payload: unknown): Promise<void> {
+          async send(sessionId: string, payload: unknown): Promise<void> {
             opts.sendCaptureSessionIds?.push(sessionId);
+            opts.sendCapturePayloads?.push(payload);
           },
           async stream(
             _sessionId: string,
@@ -378,12 +380,14 @@ function buildQueueMsg(overrides: {
     userMention?: { user?: { name?: string; type?: string } };
   }>;
   attachment?: ChatQueueMessage['payload']['message']['attachment'];
+  placeholderName?: string;
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
     eventKey: 'chat:msgname:spaces/AAA/messages/M1',
     receivedAtMs: Date.now(),
     claim: { owner: 'w1-uuid', version: 1 },
+    ...(overrides.placeholderName ? { placeholderName: overrides.placeholderName } : {}),
     payload: {
       type: 'MESSAGE',
       eventTime: '2026-05-26T08:00:00Z',
@@ -727,6 +731,53 @@ describe('handleChatEvent', () => {
       expect(
         (Array.from(sent.values())[0] as { auto_reply_policy?: string }).auto_reply_policy,
       ).toBe('chat_user_requested');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('Case 1-mail-intent: short content mail request injects scoped mail instructions', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'k.seto@makotoprime.com にこんにちはメールを送って',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_mail_intent',
+      sendCapturePayloads: payloads,
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送信します。\nEMAIL_SEND:{"to":"k.seto@makotoprime.com","subject":"こんにちは","body":"こんにちは"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: unknown[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: init.body });
+      return new Response(JSON.stringify({ message_id: 'msg_out_mail' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(payloads).toHaveLength(1);
+      const payloadText = JSON.stringify(payloads[0]);
+      expect(payloadText).toContain('<intent>command=/mail source=mail_intent action_skill=true</intent>');
+      expect(payloadText).toContain('<mail_intent_instructions>');
+      expect(payloadText).toContain('「こんにちはメール」は件名「こんにちは」、本文「こんにちは」で足りる');
+      expect(amCalls).toHaveLength(1);
+      expect(chatApiMock.patches.at(-1)?.text).toContain('✅ メール送信完了');
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -1847,6 +1898,29 @@ describe('handleChatEvent', () => {
         costGuardInternals.KIND_CHAT_POST,
       ),
     ).resolves.toBe(1);
+  });
+
+  it('ingress placeholder reuse: queue skips duplicate POST and PATCHes supplied message', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ placeholderName: 'spaces/AAA/messages/ingress_1' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_ph_ingress',
+      events: [
+        { type: 'agent.message.text', text: '先行プレースホルダー再利用OK' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_1');
+    expect(chatApiMock.patches[0]!.text).toBe('先行プレースホルダー再利用OK');
+    expect(chatApiMock.deletes).toHaveLength(0);
   });
 
   it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {

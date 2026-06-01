@@ -109,6 +109,13 @@ The worker won't function until you finish the remaining steps.
 npm run deploy
 ```
 
+Production deploys are guarded. Normal production deploys run from the
+`deploy-production` GitHub Actions workflow after PR merge to `main` or
+`master`; the guard checks runner, branch freshness, and required fix markers
+before `wrangler deploy --strict`. See
+[docs/deploy-guard.md](./docs/deploy-guard.md) for emergency local override and
+stale worktree handling.
+
 `npm run deploy` builds your base sandbox container image (Docker
 required), deploys the Worker, and applies D1 migrations via the
 `postdeploy` hook. The committed `wrangler.jsonc` deliberately leaves
