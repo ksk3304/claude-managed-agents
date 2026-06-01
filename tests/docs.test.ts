@@ -71,18 +71,34 @@ describe('docsBatchUpdate', () => {
       expect(url).toContain('/documents/doc-1:batchUpdate');
       expect(init.method).toBe('POST');
       const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-      expect(body.requests).toEqual([{ deleteContentRange: { range: { startIndex: 1, endIndex: 3 } } }]);
+      expect(body.requests).toEqual([{ insertText: { location: { index: 1 }, text: '追記' } }]);
       expect(body.writeControl).toEqual({ requiredRevisionId: 'rev-1' });
       return jsonResponse(200, { documentId: 'doc-1', replies: [{ ok: true }] });
     });
     const r = await docsBatchUpdate(
       {
         document_id: 'doc-1',
-        requests: [{ deleteContentRange: { range: { startIndex: 1, endIndex: 3 } } }],
+        requests: [{ insertText: { location: { index: 1 }, text: '追記' } }],
         write_control: { requiredRevisionId: 'rev-1' },
       },
       deps(fetcher),
     );
     expect(r.replies).toEqual([{ ok: true }]);
+  });
+
+  it('rejects destructive delete requests', async () => {
+    const fetcher = makeFetchMock(async () => {
+      throw new Error('fetch should not be called');
+    });
+    await expect(
+      docsBatchUpdate(
+        {
+          document_id: 'doc-1',
+          requests: [{ deleteContentRange: { range: { startIndex: 1, endIndex: 3 } } }],
+        },
+        deps(fetcher),
+      ),
+    ).rejects.toThrow('destructive delete requests are not allowed');
+    expect(fetcher.calls).toHaveLength(0);
   });
 });

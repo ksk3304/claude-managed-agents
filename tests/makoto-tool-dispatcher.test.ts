@@ -39,10 +39,11 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all registered tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(15);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(16);
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('drive_update_file_metadata')).toBe(true);
     expect(isMakotoToolName('drive_delete')).toBe(false);
     expect(isMakotoToolName('calendar_delete_event')).toBe(false);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
@@ -162,8 +163,17 @@ describe('dispatchMakotoTool happy paths', () => {
       if (url.includes('oauth2.googleapis.com/token')) {
         return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
       }
-      expect(url).toContain('/calendar/v3/calendars/primary/events?sendUpdates=all');
-      expect(init.method).toBe('POST');
+      if (init.method === 'POST') {
+        expect(url).toContain('/calendar/v3/calendars/primary/events?sendUpdates=all');
+        return jsonResponse(200, {
+          id: 'evt-1',
+          summary: '予定',
+          start: { dateTime: '2026-06-02T10:00:00+09:00' },
+          end: { dateTime: '2026-06-02T11:00:00+09:00' },
+        });
+      }
+      expect(init.method).toBe('GET');
+      expect(url).toContain('/calendar/v3/calendars/primary/events/evt-1');
       return jsonResponse(200, {
         id: 'evt-1',
         summary: '予定',
@@ -189,7 +199,57 @@ describe('dispatchMakotoTool happy paths', () => {
       { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
     );
     expect(r.ok).toBe(true);
-    expect((r.payload as { id: string }).id).toBe('evt-1');
+    const payload = r.payload as { verified: boolean; readback: { id: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.readback.id).toBe('evt-1');
+  });
+
+  it('calendar_update_event fails closed when readback differs', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (init.method === 'PUT') {
+        return jsonResponse(200, {
+          id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+        });
+      }
+      expect(url).toContain('/calendar/v3/calendars/primary/events/evt-1');
+      return jsonResponse(200, {
+        id: 'evt-1',
+        summary: 'テスト2',
+        start: { dateTime: '2026-06-01T23:30:00+09:00' },
+        end: { dateTime: '2026-06-02T00:00:00+09:00' },
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'calendar_update_event',
+      {
+        event_id: 'evt-1',
+        summary: 'テスト2',
+        start: { dateTime: '2026-06-01T22:00:00+09:00' },
+        end: { dateTime: '2026-06-01T23:00:00+09:00' },
+      },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(false);
+    const payload = r.payload as { error: string; verification: { mismatches: string[] } };
+    expect(payload.error).toBe('verification_failed');
+    expect(payload.verification.mismatches).toContain('start');
+    expect(payload.verification.mismatches).toContain('end');
   });
 
   it('docs_create resolves OAuth then proxies', async () => {
@@ -199,9 +259,17 @@ describe('dispatchMakotoTool happy paths', () => {
       if (url.includes('oauth2.googleapis.com/token')) {
         return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
       }
-      expect(url).toContain('/documents');
-      expect(init.method).toBe('POST');
-      return jsonResponse(200, { documentId: 'doc-1', title: 'Doc' });
+      if (init.method === 'POST') {
+        expect(url).toContain('/documents');
+        return jsonResponse(200, { documentId: 'doc-1', title: 'Doc' });
+      }
+      expect(init.method).toBe('GET');
+      expect(url).toContain('/documents/doc-1');
+      return jsonResponse(200, {
+        documentId: 'doc-1',
+        title: 'Doc',
+        body: { content: [] },
+      });
     });
     const env = {
       DB: makeMakotoDb(),
@@ -217,7 +285,9 @@ describe('dispatchMakotoTool happy paths', () => {
       { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
     );
     expect(r.ok).toBe(true);
-    expect((r.payload as { document_url: string }).document_url).toContain('/document/d/doc-1');
+    const payload = r.payload as { verified: boolean; result: { document_url: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.result.document_url).toContain('/document/d/doc-1');
   });
 
   it('schema error from tool → ok:false / error:schema with tool name', async () => {

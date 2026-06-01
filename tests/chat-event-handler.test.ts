@@ -614,6 +614,92 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト');
   });
 
+  it('natural Calendar update applies same-day time changes from the target event date', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'その予定のタイトルをテスト2に変更して。時間を同日の22時から23時に変更して',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'テスト',
+                start: { dateTime: '2026-06-01T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T00:00:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト2' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト2');
+  });
+
+  it('natural Calendar time-only update can target a test-titled event', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: '時間を22時から23時に変更して',
+      threadName: 'spaces/AAA/threads/T1',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    makotoToolMock.handler = async (toolName, input) => {
+      if (toolName === 'calendar_list_events') {
+        return {
+          ok: true,
+          payload: {
+            events: [
+              {
+                id: 'evt-1',
+                summary: 'テスト2',
+                start: { dateTime: '2026-06-01T23:30:00+09:00', timeZone: 'Asia/Tokyo' },
+                end: { dateTime: '2026-06-02T00:00:00+09:00', timeZone: 'Asia/Tokyo' },
+              },
+            ],
+          },
+        };
+      }
+      if (toolName === 'calendar_update_event') {
+        expect(input).toMatchObject({
+          event_id: 'evt-1',
+          summary: 'テスト2',
+          start: { dateTime: '2026-06-01T22:00:00+09:00' },
+          end: { dateTime: '2026-06-01T23:00:00+09:00' },
+          send_updates: 'none',
+        });
+        return { ok: true, payload: { id: 'evt-1', summary: 'テスト2' } };
+      }
+      return { ok: false, payload: { error: 'unexpected' } };
+    };
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts[0]!.text).toContain('予定更新しました: テスト2');
+  });
+
   it('natural Calendar title update extracts Japanese title phrase without fallback', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({

@@ -211,8 +211,15 @@ interface NaturalCalendarCreateInput {
 
 interface NaturalCalendarTitleUpdateInput {
   summary?: string;
-  start?: { dateTime: string };
-  end?: { dateTime: string };
+  time?: CalendarTimeUpdate;
+}
+
+interface CalendarTimeUpdate {
+  date?: string;
+  startHour: number;
+  startMinute: number;
+  endHour: number;
+  endMinute: number;
 }
 
 function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | null {
@@ -250,8 +257,7 @@ function parseNaturalCalendarTitleUpdate(text: string): NaturalCalendarTitleUpda
   const result: NaturalCalendarTitleUpdateInput = {};
   if (summary) result.summary = summary;
   if (timeUpdate !== null) {
-    result.start = timeUpdate.start;
-    result.end = timeUpdate.end;
+    result.time = timeUpdate;
   }
   return result;
 }
@@ -271,7 +277,8 @@ function parseCalendarTitleFromText(text: string): string | null {
     );
     summary = (beforeLabel?.[1] ?? '').trim();
   }
-  if (!summary || /(適当|違うタイトル|別タイトル)/.test(summary)) {
+  if (!summary) return null;
+  if (/(適当|違うタイトル|別タイトル)/.test(summary)) {
     summary = `MAKOTOくん Calendarタイトル変更確認 ${formatJstMinuteLabel()}`;
   }
   summary = summary
@@ -283,10 +290,9 @@ function parseCalendarTitleFromText(text: string): string | null {
   return summary || null;
 }
 
-function parseCalendarTimeUpdate(text: string): { start: { dateTime: string }; end: { dateTime: string } } | null {
+function parseCalendarTimeUpdate(text: string): CalendarTimeUpdate | null {
   if (!/(予定時刻|時刻|時間|日時|\d{1,2}時)/.test(text)) return null;
   const date = parseJapaneseDateToken(text);
-  if (date === null) return null;
   const time = text.match(/(\d{1,2})時(?:(\d{1,2})分)?\s*(?:から|-|〜|~)\s*(\d{1,2})時(?:(\d{1,2})分)?/);
   if (!time) return null;
   const startHour = Number(time[1]);
@@ -294,11 +300,38 @@ function parseCalendarTimeUpdate(text: string): { start: { dateTime: string }; e
   const endHour = Number(time[3]);
   const endMinute = time[4] ? Number(time[4]) : 0;
   if (!validClock(startHour, startMinute) || !validEndClock(endHour, endMinute)) return null;
-  const endDate = addDaysToDateString(date, endHour === 24 ? 1 : 0);
   return {
-    start: { dateTime: `${date}T${pad2(startHour)}:${pad2(startMinute)}:00+09:00` },
-    end: { dateTime: `${endDate}T${pad2(endHour === 24 ? 0 : endHour)}:${pad2(endMinute)}:00+09:00` },
+    ...(date ? { date } : {}),
+    startHour,
+    startMinute,
+    endHour,
+    endMinute,
   };
+}
+
+function materializeCalendarTimeUpdate(
+  update: CalendarTimeUpdate,
+  targetStart: Record<string, unknown>,
+): { start: { dateTime: string }; end: { dateTime: string } } | null {
+  const date = update.date ?? calendarDateFromStart(targetStart);
+  if (date === null) return null;
+  const endDayOffset =
+    update.endHour === 24 || update.endHour < update.startHour ? 1 : 0;
+  const endDate = addDaysToDateString(date, endDayOffset);
+  return {
+    start: { dateTime: `${date}T${pad2(update.startHour)}:${pad2(update.startMinute)}:00+09:00` },
+    end: { dateTime: `${endDate}T${pad2(update.endHour === 24 ? 0 : update.endHour)}:${pad2(update.endMinute)}:00+09:00` },
+  };
+}
+
+function calendarDateFromStart(start: Record<string, unknown>): string | null {
+  const dateTime = start.dateTime;
+  if (typeof dateTime === 'string') {
+    const match = dateTime.match(/^(\d{4}-\d{2}-\d{2})T/);
+    return match?.[1] ?? null;
+  }
+  const date = start.date;
+  return typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
 }
 
 function formatJstMinuteLabel(nowMs: number = Date.now()): string {
@@ -371,10 +404,22 @@ function isCalendarTitleUpdateCandidate(event: unknown): event is {
   if (!e.start || typeof e.start !== 'object' || Array.isArray(e.start)) return false;
   if (!e.end || typeof e.end !== 'object' || Array.isArray(e.end)) return false;
   return (
-    e.summary === 'テスト' ||
+    /^テスト\d*$/.test(e.summary) ||
     (/MAKOTOくん/.test(e.summary) &&
       /(Google連携CRUDテスト|Calendarタイトル変更確認)/.test(e.summary))
   );
+}
+
+function calendarMutationPayload(payload: unknown): { htmlLink?: unknown; summary?: unknown } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  const wrapped = payload as { readback?: unknown; result?: unknown };
+  if (wrapped.readback && typeof wrapped.readback === 'object' && !Array.isArray(wrapped.readback)) {
+    return wrapped.readback as { htmlLink?: unknown; summary?: unknown };
+  }
+  if (wrapped.result && typeof wrapped.result === 'object' && !Array.isArray(wrapped.result)) {
+    return wrapped.result as { htmlLink?: unknown; summary?: unknown };
+  }
+  return payload as { htmlLink?: unknown; summary?: unknown };
 }
 
 /**
@@ -758,7 +803,7 @@ export async function handleChatEvent(
       });
       return { kind: 'committed' };
     }
-    const payload = result.payload as { htmlLink?: unknown; summary?: unknown };
+    const payload = calendarMutationPayload(result.payload);
     const summary =
       typeof payload.summary === 'string' && payload.summary.trim()
         ? payload.summary.trim()
@@ -845,8 +890,31 @@ export async function handleChatEvent(
     }
     const target = candidates[0]!;
     const nextSummary = naturalCalendarTitleUpdate.summary ?? target.summary;
-    const nextStart = naturalCalendarTitleUpdate.start ?? target.start;
-    const nextEnd = naturalCalendarTitleUpdate.end ?? target.end;
+    const timeUpdate = naturalCalendarTitleUpdate.time
+      ? materializeCalendarTimeUpdate(naturalCalendarTitleUpdate.time, target.start)
+      : null;
+    if (naturalCalendarTitleUpdate.time && timeUpdate === null) {
+      await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, 'カレンダー操作に失敗しました。問題が続くようでしたら開発側に連絡します。', threadName, eventKey);
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'calendar_natural_update_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { reason: 'time_update_without_target_date', target_start: target.start },
+      });
+      await safeCommit(env, eventKey, claim, {
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        reason: 'calendar_natural_update_failed',
+        stage: 'deterministic_workspace_command',
+        outcome: 'committed',
+      });
+      return { kind: 'committed' };
+    }
+    const nextStart = timeUpdate?.start ?? target.start;
+    const nextEnd = timeUpdate?.end ?? target.end;
     const updateResult = await dispatchMakotoTool('calendar_update_event', {
       event_id: target.id,
       summary: nextSummary,
@@ -879,7 +947,7 @@ export async function handleChatEvent(
       });
       return { kind: 'committed' };
     }
-    const payload = updateResult.payload as { htmlLink?: unknown; summary?: unknown };
+    const payload = calendarMutationPayload(updateResult.payload);
     const summary =
       typeof payload.summary === 'string' && payload.summary.trim()
         ? payload.summary.trim()

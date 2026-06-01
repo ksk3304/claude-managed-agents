@@ -139,6 +139,7 @@ export async function docsBatchUpdate(
   if (!Array.isArray(input.requests) || input.requests.length === 0) {
     throw new ToolSchemaError('docs_batch_update: requests must be a non-empty array');
   }
+  rejectDestructiveDocsRequests(input.requests);
   const requestBody: Record<string, unknown> = { requests: input.requests };
   if (input.write_control !== undefined) requestBody.writeControl = input.write_control;
 
@@ -157,6 +158,23 @@ export async function docsBatchUpdate(
     replies: Array.isArray(body.replies) ? body.replies : [],
     write_control: body.writeControl,
   };
+}
+
+function rejectDestructiveDocsRequests(requests: unknown[]): void {
+  for (const request of requests) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) continue;
+    const r = request as Record<string, unknown>;
+    if ('deleteContentRange' in r || 'deleteTableRow' in r || 'deleteTableColumn' in r) {
+      throw new ToolSchemaError('docs_batch_update: destructive delete requests are not allowed');
+    }
+    const replaceAllText = r.replaceAllText;
+    if (replaceAllText && typeof replaceAllText === 'object' && !Array.isArray(replaceAllText)) {
+      const replaceText = (replaceAllText as Record<string, unknown>).replaceText;
+      if (replaceText === '') {
+        throw new ToolSchemaError('docs_batch_update: empty replaceAllText is not allowed');
+      }
+    }
+  }
 }
 
 async function parseDocsResponse(

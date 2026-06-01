@@ -42,7 +42,7 @@ import {
 export const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
 export const DRIVE_UPLOAD_API_BASE = 'https://www.googleapis.com/upload/drive/v3';
 
-/** Deps shared by all 5 Drive tools. The dispatcher provides these. */
+/** Deps shared by all Drive tools. The dispatcher provides these. */
 export interface DriveToolDeps {
   accessToken: string;
   refreshAccessToken?: () => Promise<string>;
@@ -490,7 +490,88 @@ export async function driveCreateFile(
 }
 
 // ============================================================================
-// 5. drive_delete (destructive 2-step with TTL + fingerprint + Issue #126)
+// 5. drive_update_file_metadata
+// ============================================================================
+
+const DRIVE_UPDATE_METADATA_KNOWN_KEYS = new Set([
+  'file_id',
+  'name',
+  'description',
+  'starred',
+]);
+
+export interface DriveUpdateFileMetadataResult {
+  id?: string;
+  name?: string;
+  mimeType?: string;
+  modifiedTime?: string;
+  description?: string;
+  starred?: boolean;
+  webViewLink?: string;
+  parents?: string[];
+  [extra: string]: unknown;
+}
+
+export async function driveUpdateFileMetadata(
+  input: Record<string, unknown>,
+  deps: DriveToolDeps,
+): Promise<DriveUpdateFileMetadataResult> {
+  rejectUnknownKeys(input, DRIVE_UPDATE_METADATA_KNOWN_KEYS, 'drive_update_file_metadata');
+  const fileId = validateDriveFileId(input.file_id, 'drive_update_file_metadata');
+  const patch: Record<string, unknown> = {};
+  if (input.name !== undefined) {
+    patch.name = requireNonEmptyString(input.name, 'name', 'drive_update_file_metadata');
+  }
+  if (input.description !== undefined) {
+    if (typeof input.description !== 'string') {
+      throw new ToolSchemaError('drive_update_file_metadata: description must be string');
+    }
+    patch.description = input.description;
+  }
+  if (input.starred !== undefined) {
+    if (typeof input.starred !== 'boolean') {
+      throw new ToolSchemaError('drive_update_file_metadata: starred must be boolean');
+    }
+    patch.starred = input.starred;
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new ToolSchemaError(
+      'drive_update_file_metadata: at least one of name, description, starred is required',
+    );
+  }
+
+  const params = new URLSearchParams({
+    fields: 'id,name,mimeType,modifiedTime,description,starred,webViewLink,parents',
+    supportsAllDrives: 'true',
+  });
+  const url = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params.toString()}`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+    fetchOpts(deps),
+  );
+  if (resp.status === 404) {
+    throw new GoogleApiToolError(
+      `drive_update_file_metadata not_found: file_id=${fileId}`,
+      { status: 404 },
+    );
+  }
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    throw new GoogleApiToolError(
+      `drive_update_file_metadata HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  return (await resp.json()) as DriveUpdateFileMetadataResult;
+}
+
+// ============================================================================
+// 6. drive_delete (destructive 2-step with TTL + fingerprint + Issue #126)
 // ============================================================================
 
 const DRIVE_DELETE_KNOWN_KEYS = new Set(['file_id', 'confirmation_token']);

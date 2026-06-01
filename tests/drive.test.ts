@@ -14,6 +14,7 @@ import {
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveUpdateFileMetadata,
   type DriveToolDeps,
 } from '../src/tools/drive';
 import { createKvConfirmTokenStore } from '../src/tools/tool-common';
@@ -123,6 +124,38 @@ describe('driveCreateFile', () => {
     await expect(
       driveCreateFile({ name: 'x', content: big }, baseDeps(fetcher)),
     ).rejects.toThrow();
+  });
+});
+
+describe('driveUpdateFileMetadata', () => {
+  it('patches non-destructive metadata', async () => {
+    const fetcher = makeFetchMock(async (url, init) => {
+      expect(url).toContain('/drive/v3/files/abc');
+      expect(init.method).toBe('PATCH');
+      expect(JSON.parse(String(init.body))).toEqual({
+        name: 'renamed.txt',
+        description: 'CRU test',
+      });
+      return jsonResponse(200, {
+        id: 'abc',
+        name: 'renamed.txt',
+        description: 'CRU test',
+        mimeType: 'text/plain',
+      });
+    });
+    const r = await driveUpdateFileMetadata(
+      { file_id: 'abc', name: 'renamed.txt', description: 'CRU test' },
+      baseDeps(fetcher),
+    );
+    expect(r.name).toBe('renamed.txt');
+    expect(r.description).toBe('CRU test');
+  });
+
+  it('requires at least one patch field', async () => {
+    const fetcher = makeFetchMock(async () => new Response('', { status: 200 }));
+    await expect(
+      driveUpdateFileMetadata({ file_id: 'abc' }, baseDeps(fetcher)),
+    ).rejects.toThrow(/at least one/);
   });
 });
 

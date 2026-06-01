@@ -77,6 +77,21 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   },
   {
     type: 'custom',
+    name: 'drive_update_file_metadata',
+    description: 'Update non-destructive Google Drive file metadata such as name or description.',
+    input_schema: {
+      type: 'object',
+      required: ['file_id'],
+      properties: {
+        file_id: stringProp('Google Drive file id.'),
+        name: stringProp('Optional new file name.'),
+        description: stringProp('Optional file description.'),
+        starred: { type: 'boolean', description: 'Optional starred flag.' },
+      },
+    },
+  },
+  {
+    type: 'custom',
     name: 'sheets_create',
     description: 'Create a Google Sheets spreadsheet.',
     input_schema: {
@@ -223,7 +238,7 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   {
     type: 'custom',
     name: 'docs_batch_update',
-    description: 'Apply Google Docs API batchUpdate requests.',
+    description: 'Apply non-destructive Google Docs API batchUpdate requests. Delete/clear requests are rejected.',
     input_schema: {
       type: 'object',
       required: ['document_id', 'requests'],
