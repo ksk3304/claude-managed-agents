@@ -13,6 +13,7 @@ import { describe, it, expect } from 'vitest';
 import {
   INTERNAL_STATE_PATTERNS,
   scrubInternalStateForChat,
+  softenBenignInternalReferencesForChat,
 } from '../src/redact/internal-state';
 import parityCases from './data/internal_state_patterns_parity_cases.json';
 
@@ -54,6 +55,26 @@ describe('scrubInternalStateForChat', () => {
     const r = scrubInternalStateForChat('memory store にアクセス', 'job-X');
     expect(r.text).toBe('[job-X] 今回のタスクは完了できませんでした。担当者が確認します。');
     expect(r.hits).toEqual(['memory store']);
+  });
+});
+
+describe('softenBenignInternalReferencesForChat', () => {
+  it('rewrites memory runtime paths before hard scrub', () => {
+    const softened = softenBenignInternalReferencesForChat(
+      'まず `/mnt/memory/` に格納されている記憶を確認しました。',
+    );
+    expect(softened.text).toBe('まず 社内記憶 に格納されている記憶を確認しました。');
+    expect(softened.replacements).toEqual(['mnt_memory_path']);
+    expect(scrubInternalStateForChat(softened.text, 'job-1').hits).toEqual([]);
+  });
+
+  it('does not hide hard failure wording from the neutral redactor', () => {
+    const softened = softenBenignInternalReferencesForChat(
+      'memory store が未 attach のため対応できません',
+    );
+    const scrubbed = scrubInternalStateForChat(softened.text, 'job-1');
+    expect(scrubbed.hits).toEqual(['未 attach', 'memory store']);
+    expect(scrubbed.text).toContain('今回のタスクは完了できませんでした');
   });
 });
 

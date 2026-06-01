@@ -132,7 +132,10 @@ import {
   retrieveSessionUsageSnapshot,
   sendAndStreamWithToolDispatch,
 } from '../lib/session';
-import { scrubInternalStateForChat } from '../redact/internal-state';
+import {
+  scrubInternalStateForChat,
+  softenBenignInternalReferencesForChat,
+} from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
 import { executeWithCommit, LeaseHeartbeat } from '../lib/three-stage-precheck';
@@ -1532,7 +1535,14 @@ export async function handleChatEvent(
         `reason=${markerLeakScrubbed.reason}`,
     );
   }
-  const scrubbed = scrubInternalStateForChat(markerLeakScrubbed.text, `chat:${sessionId}`);
+  const softened = softenBenignInternalReferencesForChat(markerLeakScrubbed.text);
+  if (softened.replacements.length > 0) {
+    console.warn(
+      `[chat-event] benign internal references softened eventKey=${eventKey} ` +
+        `replacements=${softened.replacements.join(',')}`,
+    );
+  }
+  const scrubbed = scrubInternalStateForChat(softened.text, `chat:${sessionId}`);
   if (scrubbed.hits.length > 0) {
     console.warn(
       `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
