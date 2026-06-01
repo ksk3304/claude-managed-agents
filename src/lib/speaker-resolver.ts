@@ -4,21 +4,19 @@
  * supporting result types from `scripts/cma_session_resolver.py`
  * (`ResolvedSpeaker` / `SpeakerResolutionReport` / `ChatApiResolveResult`).
  *
- * These are the pure gate-judgement primitives that decide:
+ * These are the pure speaker-resolution primitives that decide:
  *   1. whether the ⚠️ "本人確認が取れなかった" notice should be prepended
  *      to a Chat reply (`unresolvedSpeakersNoticePrefix`)
  *   2. who the current-turn actor is and whether they're mapping-trusted
  *      (`resolveActorForGate`)
- *   3. whether external tools (Drive / Sheets / Cal / EMAIL_SEND) should
- *      be gated based on actor trust (`computeExternalToolGate`)
- *   4. whether the CHAT_POST sink should be wholly stripped because the
+ *   3. whether the CHAT_POST sink should be wholly stripped because the
  *      thread contains an unresolved speaker (`computeChatPostGate`)
- *   5. cross-space CHAT_POST gating when the thread has untrusted (but
+ *   4. cross-space CHAT_POST gating when the thread has untrusted (but
  *      display-name-resolved) speakers (`gateChatPostForCrossSpace`)
  *
  * Why this is one file rather than five: the helpers form one tight
- * decision tree — actor trust feeds external-tool gate, untrusted-but-
- * resolved speakers feed the cross-space gate, and they all share the
+ * decision tree — actor trust and untrusted-but-resolved speakers feed the
+ * cross-space gate, and they all share the
  * same `ResolvedSpeaker` / `SpeakerResolutionReport` vocabulary. Splitting
  * across files would force callers to import the same types from three
  * places without earning any reuse.
@@ -32,7 +30,7 @@
  *                                  "Speaker resolution + gate")
  * Source of truth (Python):
  *   - scripts/cma_gchat_bot.py l.1527-1564 (notice prefix + banner literal)
- *   - scripts/cma_gchat_bot.py l.1567-1635 (actor resolve + external gate)
+ *   - scripts/cma_gchat_bot.py l.1567-1635 (actor resolve)
  *   - scripts/cma_gchat_bot.py l.1638-1649 (chat-post gate)
  *   - scripts/cma_gchat_bot.py l.1740-1790 (cross-space chat-post gate)
  *   - scripts/cma_session_resolver.py l.67-126 (result types)
@@ -246,43 +244,6 @@ export function resolveActorForGate(
     actorTrusted: actor.trustedForExternalTools,
     actorSource: actor.source,
   };
-}
-
-/**
- * 外部ツール gate (Drive / EMAIL_SEND / SCHEDULE_ACTION / Sheets / Cal)
- * 発動有無 + 理由分類。
- *
- * Reason taxonomy (Python l.1606 と byte 等価):
- *   - `allowed_actor_trusted` — actor が mapping 解決 = gate せず通す
- *   - `chat_api_untrusted`    — actor が chat_api fallback (display-name only) = gate
- *   - `unresolved`            — actor が解決不能 / None = gate
- *
- * 履歴側の状態 (has_unresolved_speakers / has_chat_api_speakers) は本 gate
- * には**一切寄与しない** (issue #161 で履歴 latch を撤去、actor 駆動に再設計).
- *
- * TS port of `_compute_external_tool_gate` (issue #161).
- */
-export type ExternalToolGateReason =
-  | 'allowed_actor_trusted'
-  | 'chat_api_untrusted'
-  | 'unresolved';
-
-export interface ExternalToolGateDecision {
-  gate: boolean;
-  reason: ExternalToolGateReason;
-}
-
-export function computeExternalToolGate(
-  actorTrusted: boolean,
-  actorSource: ResolvedSpeakerSource | null,
-): ExternalToolGateDecision {
-  if (actorTrusted) {
-    return { gate: false, reason: 'allowed_actor_trusted' };
-  }
-  if (actorSource === 'chat_api') {
-    return { gate: true, reason: 'chat_api_untrusted' };
-  }
-  return { gate: true, reason: 'unresolved' };
 }
 
 /**

@@ -1779,7 +1779,7 @@ describe('handleChatEvent', () => {
     expect(allTexts.some((t) => t.includes('ゲストモード'))).toBe(true);
   });
 
-  it('default fallback actor でも CHAT_POST は許可し EMAIL/SCHEDULE は gate する', async () => {
+  it('default fallback actor でも EMAIL/CHAT_POST/SCHEDULE を許可する', async () => {
     const env = buildEnv({
       envOverrides: {
         DEFAULT_USER_SLUG: 'guest',
@@ -1813,26 +1813,34 @@ describe('handleChatEvent', () => {
       ],
     });
 
-    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('committed');
-    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
-    expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
-    expect(chatApiMock.patches[0]!.text).toContain(
-      '外部連携操作は登録済みユーザーの現在発話でのみ実行します',
-    );
+    const origFetch = globalThis.fetch;
+    const amCalls: unknown[] = [];
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: init.body });
+      return new Response(JSON.stringify({ message_id: 'msg_default_gate' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
 
-    const runtimeEvents = (env.DB as unknown as {
-      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
-    })._tables.cma_worker_runtime_events;
-    const families = runtimeEvents
-      .filter((row) => row.event_type === 'external_tool_gated')
-      .map((row) => JSON.parse(String(row.detail_json)).tool_family)
-      .sort();
-    expect(families).toEqual(['EMAIL_SEND', 'SCHEDULE_ACTION']);
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(amCalls).toHaveLength(1);
+      expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
+      expect(schedulerMock.capturedCalls.some((c) => c.method === 'list_jobs')).toBe(true);
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('メール送信完了');
+      expect(chatApiMock.patches[0]!.text).toContain('定期実行ジョブ一覧');
+      expect(
+        runtimeEvents(env).some((row) => row.event_type === 'external_tool_gated'),
+      ).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
-  it('auto pending sender mapping は chat 専用 prefix に作成し外部ツールを gate する', async () => {
+  it('auto pending sender mapping は chat 専用 prefix に作成し外部ツールも許可する', async () => {
     const env = buildEnv({
       envOverrides: {
         DEFAULT_USER_SLUG: 'guest',
@@ -1870,36 +1878,50 @@ describe('handleChatEvent', () => {
       ],
     });
 
-    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('committed');
-    const kv = env.MAKOTO_KV as unknown as {
-      _store: Map<string, { value: string; metadata?: unknown }>;
-    };
-    expect(kv._store.has('user_mapping:intern@example.com')).toBe(false);
-    expect(kv._store.has('chat_pending_user_mapping:email:intern@example.com')).toBe(true);
-    expect(kv._store.has('chat_pending_user_mapping:user:users%2F777')).toBe(true);
-    const pending = JSON.parse(
-      kv._store.get('chat_pending_user_mapping:email:intern@example.com')!.value,
-    );
-    expect(pending).toMatchObject({
-      user_slug: 'guest',
-      agent_id: 'agent_default',
-      auto_registered: true,
-      actor_trusted: false,
-      chat_user_id: 'users/777',
-      display_name: 'Intern User',
-      mapping_source: 'chat_auto_pending',
-    });
-    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
-    expect(chatApiMock.patches[0]!.text).toContain('初回ユーザーにも応答します');
-    expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
+    const origFetch = globalThis.fetch;
+    const amCalls: unknown[] = [];
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      amCalls.push({ url, body: init.body });
+      return new Response(JSON.stringify({ message_id: 'msg_auto_pending' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
 
-    const runtimeEvents = (env.DB as unknown as {
-      _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
-    })._tables.cma_worker_runtime_events;
-    expect(runtimeEvents.some((row) => row.event_type === 'chat_auto_pending_user_mapping')).toBe(
-      true,
-    );
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(amCalls).toHaveLength(1);
+      const kv = env.MAKOTO_KV as unknown as {
+        _store: Map<string, { value: string; metadata?: unknown }>;
+      };
+      expect(kv._store.has('user_mapping:intern@example.com')).toBe(false);
+      expect(kv._store.has('chat_pending_user_mapping:email:intern@example.com')).toBe(true);
+      expect(kv._store.has('chat_pending_user_mapping:user:users%2F777')).toBe(true);
+      const pending = JSON.parse(
+        kv._store.get('chat_pending_user_mapping:email:intern@example.com')!.value,
+      );
+      expect(pending).toMatchObject({
+        user_slug: 'guest',
+        agent_id: 'agent_default',
+        auto_registered: true,
+        actor_trusted: false,
+        chat_user_id: 'users/777',
+        display_name: 'Intern User',
+        mapping_source: 'chat_auto_pending',
+      });
+      expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
+      expect(chatApiMock.patches[0]!.text).toContain('初回ユーザーにも応答します');
+      expect(chatApiMock.patches[0]!.text).toContain('メール送信完了');
+      expect(
+        runtimeEvents(env).some((row) => row.event_type === 'chat_auto_pending_user_mapping'),
+      ).toBe(true);
+      expect(
+        runtimeEvents(env).some((row) => row.event_type === 'external_tool_gated'),
+      ).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('Case 14c: user_mapping 不在 + DEFAULT_USER_SLUG 未設定 → 従来の unknown_sender skip (回帰防止)', async () => {

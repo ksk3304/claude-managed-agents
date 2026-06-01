@@ -1,8 +1,7 @@
 /**
  * Unit tests for `src/lib/speaker-resolver.ts` — port-mapping v1 §1
  * row #26 ("Speaker resolution + gate"). Mirrors the Python tests for
- * `_resolve_actor_for_gate` / `_compute_external_tool_gate` /
- * `_compute_chat_post_gate` / `_gate_chat_post_for_cross_space` /
+ * `_resolve_actor_for_gate` / `_compute_chat_post_gate` / `_gate_chat_post_for_cross_space` /
  * `_unresolved_speakers_notice_prefix` and the result-type invariants
  * from `cma_session_resolver.py` (`ResolvedSpeaker.trusted_for_external_tools`,
  * `SpeakerResolutionReport.has_chat_api_speakers`).
@@ -15,7 +14,6 @@ import {
   CHAT_POST_MARKER_REGEX,
   UNRESOLVED_NOTICE_MESSAGE,
   computeChatPostGate,
-  computeExternalToolGate,
   gateChatPostForCrossSpace,
   hasChatApiSpeakers,
   makeResolvedSpeaker,
@@ -192,40 +190,6 @@ describe('resolveActorForGate', () => {
       spaceName: null,
       apiResolver: undefined,
     });
-  });
-});
-
-// ---------------------------------------------------------------- computeExternalToolGate
-
-describe('computeExternalToolGate', () => {
-  it('allows when actor is trusted (mapping)', () => {
-    expect(computeExternalToolGate(true, 'mapping')).toEqual({
-      gate: false,
-      reason: 'allowed_actor_trusted',
-    });
-  });
-
-  it('gates when actor source is chat_api (untrusted but resolved)', () => {
-    expect(computeExternalToolGate(false, 'chat_api')).toEqual({
-      gate: true,
-      reason: 'chat_api_untrusted',
-    });
-  });
-
-  it('gates when actor is wholly unresolved (source=null)', () => {
-    expect(computeExternalToolGate(false, null)).toEqual({
-      gate: true,
-      reason: 'unresolved',
-    });
-  });
-
-  it('treats actorTrusted=false + actorSource=mapping as untrusted (fail-safe; should not happen but guard)', () => {
-    // 妥当性は呼出側保証だが、本関数は actorTrusted を最優先するので gate しない。
-    // ただし mapping & untrusted という矛盾入力は来ない前提。actorTrusted を信じる契約を明示。
-    expect(computeExternalToolGate(true, 'mapping').gate).toBe(false);
-    // 逆方向 (actorTrusted=true, source=chat_api) は呼出側で不整合だが、
-    // actor_trusted 優先で allow にする (Python l.1631-1632 と同形)。
-    expect(computeExternalToolGate(true, 'chat_api').gate).toBe(false);
   });
 });
 
