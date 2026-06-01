@@ -328,7 +328,7 @@ const DEFAULT_SESSION_WATCHDOG_SEC = 600;
  *
  * Note: `agent.tool_use` (built-in tools like bash) is observed but
  * NOT dispatched here — only `agent.custom_tool_use` (= MAKOTOくん's
- * 10 Google Workspace tools) routes through `toolDispatcher`. Built-in
+ * MAKOTO custom tools) routes through `toolDispatcher`. Built-in
  * tool execution happens server-side in Anthropic's runtime; the bridge
  * just watches the result come back as part of the stream.
  */

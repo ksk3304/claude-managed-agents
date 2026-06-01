@@ -1,7 +1,7 @@
 /**
  * MAKOTO 専用 tool dispatcher — bridges the bridge layer's
- * `sendAndStreamWithToolDispatch` event loop to the 10 Google Workspace
- * custom tools (drive / sheets / calendar) ported in layer 6.
+ * `sendAndStreamWithToolDispatch` event loop to MAKOTO custom tools
+ * (Drive / Sheets / Calendar / AgentMail).
  *
  * Why this layer exists (vs. wiring tools into `custom-tools-runtime`):
  *   The Cloudflare fork's `defineTool` / `CustomToolContext` exposes
@@ -49,6 +49,10 @@ import {
   type CalendarToolDeps,
 } from '../tools/calendar';
 import {
+  AgentMailToolError,
+  agentmailRead,
+} from '../tools/agentmail-read';
+import {
   GoogleApiToolError,
   ToolSchemaError,
   createKvConfirmTokenStore,
@@ -56,7 +60,7 @@ import {
 import { getAccessToken } from '../lib/workspace-oauth';
 import { getOAuthLease } from '../durable-objects/oauth-lease';
 
-/** Names of the 10 tools the MAKOTO bridge exposes to its agent. */
+/** Names of the tools the MAKOTO bridge exposes to its agent. */
 export type MakotoToolName =
   | 'drive_search'
   | 'drive_get_file_metadata'
@@ -67,7 +71,8 @@ export type MakotoToolName =
   | 'sheets_read'
   | 'sheets_update'
   | 'sheets_append'
-  | 'calendar_list_events';
+  | 'calendar_list_events'
+  | 'agentmail_read';
 
 export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_search',
@@ -80,6 +85,7 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'sheets_update',
   'sheets_append',
   'calendar_list_events',
+  'agentmail_read',
 ];
 
 const MAKOTO_TOOL_NAME_SET: ReadonlySet<string> = new Set(MAKOTO_TOOL_NAMES);
@@ -151,6 +157,40 @@ export async function dispatchMakotoTool(
     };
   }
   const args = input as Record<string, unknown>;
+
+  if (name === 'agentmail_read') {
+    try {
+      return ok(
+        await agentmailRead(args, {
+          apiKey: ctx.env.AGENTMAIL_API_KEY,
+          inboxId: ctx.env.AGENTMAIL_DEFAULT_INBOX_ID,
+          apiBaseUrl: ctx.env.AGENTMAIL_API_BASE_URL,
+          ...(ctx.fetchImpl ? { fetcher: ctx.fetchImpl } : {}),
+        }),
+      );
+    } catch (err) {
+      if (err instanceof ToolSchemaError) {
+        return {
+          ok: false,
+          payload: { error: 'schema', tool: name, message: err.message },
+        };
+      }
+      if (err instanceof AgentMailToolError) {
+        const payload: Record<string, unknown> = {
+          error: err.code,
+          tool: name,
+          message: err.message,
+        };
+        if (err.status !== undefined) payload.status = err.status;
+        return { ok: false, payload };
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        payload: { error: 'unexpected', tool: name, message },
+      };
+    }
+  }
 
   // Resolve per-user access token. Fail-close if the vault has no
   // entry — the agent must surface a clear "Workspace not connected"

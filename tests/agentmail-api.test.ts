@@ -142,6 +142,41 @@ describe('AgentMailClient.getMessage', () => {
   });
 });
 
+describe('AgentMailClient.listMessages', () => {
+  it('uses current AgentMail pagination and safety query params', async () => {
+    const fetchMock = makeFetchMock(async (url, init) => {
+      expect(init.method).toBe('GET');
+      const parsed = new URL(url);
+      expect(parsed.pathname).toBe(`/v0/inboxes/${INBOX}/messages`);
+      expect(parsed.searchParams.get('limit')).toBe('5');
+      expect(parsed.searchParams.get('page_token')).toBe('pt_1');
+      expect(parsed.searchParams.getAll('labels')).toEqual(['survey']);
+      expect(parsed.searchParams.get('after')).toBe('2026-06-01T00:00:00Z');
+      expect(parsed.searchParams.get('before')).toBe('2026-06-02T00:00:00Z');
+      expect(parsed.searchParams.get('include_spam')).toBe('true');
+      expect(parsed.searchParams.get('include_blocked')).toBe('true');
+      expect(parsed.searchParams.get('include_unauthenticated')).toBe('true');
+      return jsonResponse(200, {
+        messages: [{ id: 'msg_x', subject: 'hi' }],
+        next_page_token: 'pt_2',
+      });
+    });
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+    const res = await client.listMessages(INBOX, {
+      limit: 5,
+      pageToken: 'pt_1',
+      labels: ['survey'],
+      after: '2026-06-01T00:00:00Z',
+      before: '2026-06-02T00:00:00Z',
+      includeSpam: true,
+      includeBlocked: true,
+      includeUnauthenticated: true,
+    });
+    expect(res.messages[0].id).toBe('msg_x');
+    expect(res.next_page_token).toBe('pt_2');
+  });
+});
+
 describe('AgentMailClient egress guard', () => {
   it('throws BridgeEgressDeniedError when baseUrl is off the allowlist', async () => {
     const client = new AgentMailClient(API_KEY, { baseUrl: 'https://evil.example.com' });

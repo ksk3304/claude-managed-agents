@@ -1,6 +1,6 @@
 /**
  * Unit tests for `src/dispatch/makoto-tool-dispatcher.ts` — wraps the
- * 10 layer-6 tool functions with per-user OAuth resolution + error
+ * custom tool functions with per-user OAuth where needed + error
  * envelope encoding.
  */
 
@@ -38,11 +38,13 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
-  it('covers all 10 tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(10);
+  it('covers all tools', () => {
+    expect(MAKOTO_TOOL_NAMES.length).toBe(11);
+    expect(MAKOTO_TOOL_NAMES).toContain('agentmail_read');
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('agentmail_read')).toBe(true);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
   });
 });
@@ -97,6 +99,43 @@ describe('dispatchMakotoTool error envelopes', () => {
 });
 
 describe('dispatchMakotoTool happy paths', () => {
+  it('agentmail_read bypasses Workspace OAuth and reads default inbox', async () => {
+    const fetchImpl = makeFetchMock(async (url) => {
+      expect(url).toContain('/v0/inboxes/inbox_main/messages?');
+      return jsonResponse(200, {
+        messages: [{ id: 'msg_1', from: 'alice@example.com', subject: 'アンケート' }],
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: makeKv(),
+      AGENTMAIL_API_KEY: 'am-key',
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_main',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'agentmail_read',
+      { action: 'search', subject_contains: 'アンケート' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    expect((r.payload as { count: number }).count).toBe(1);
+  });
+
+  it('agentmail_read missing key returns AgentMail error without OAuth checks', async () => {
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: makeKv(),
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_main',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'agentmail_read',
+      { action: 'get', message_id: 'msg_1' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1' },
+    );
+    expect(r.ok).toBe(false);
+    expect((r.payload as Record<string, unknown>).error).toBe('agentmail_unavailable');
+  });
+
   it('drive_search resolves OAuth then proxies to driveSearch', async () => {
     const kv = makeKv();
     await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
