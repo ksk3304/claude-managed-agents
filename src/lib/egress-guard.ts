@@ -48,9 +48,10 @@ export const MAKOTO_BRIDGE_EGRESS_ALLOWLIST: readonly string[] = [
   'oauth2.googleapis.com',
   // Cloud Scheduler — bot から CRUD のみ (Issue #186 SCHEDULE_ACTION dispatch)。
   'cloudscheduler.googleapis.com',
-  // Google Drive / Sheets / Calendar / Chat APIs — base + upload subdomain.
+  // Google Drive / Sheets / Docs / Calendar / Chat APIs — base + upload subdomain.
   'www.googleapis.com',
   'sheets.googleapis.com',
+  'docs.googleapis.com',
   'calendar.googleapis.com',
   'drive.googleapis.com',
   // Google Chat REST API (MAKOTOくん bot POST + thread replies, Issue #186 Phase 2).

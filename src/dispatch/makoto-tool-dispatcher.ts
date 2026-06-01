@@ -1,7 +1,7 @@
 /**
  * MAKOTO 専用 tool dispatcher — bridges the bridge layer's
- * `sendAndStreamWithToolDispatch` event loop to the 10 Google Workspace
- * custom tools (drive / sheets / calendar) ported in layer 6.
+ * `sendAndStreamWithToolDispatch` event loop to the Google Workspace
+ * custom tools (drive / sheets / calendar / docs) ported in layer 6.
  *
  * Why this layer exists (vs. wiring tools into `custom-tools-runtime`):
  *   The Cloudflare fork's `defineTool` / `CustomToolContext` exposes
@@ -45,9 +45,19 @@ import {
   type SheetsToolDeps,
 } from '../tools/sheets';
 import {
+  calendarCreateEvent,
+  calendarDeleteEvent,
+  calendarGetEvent,
   calendarListEvents,
+  calendarUpdateEvent,
   type CalendarToolDeps,
 } from '../tools/calendar';
+import {
+  docsBatchUpdate,
+  docsCreate,
+  docsGet,
+  type DocsToolDeps,
+} from '../tools/docs';
 import {
   GoogleApiToolError,
   ToolSchemaError,
@@ -56,7 +66,7 @@ import {
 import { getAccessToken } from '../lib/workspace-oauth';
 import { getOAuthLease } from '../durable-objects/oauth-lease';
 
-/** Names of the 10 tools the MAKOTO bridge exposes to its agent. */
+/** Names of the tools the MAKOTO bridge exposes to its agent. */
 export type MakotoToolName =
   | 'drive_search'
   | 'drive_get_file_metadata'
@@ -67,7 +77,14 @@ export type MakotoToolName =
   | 'sheets_read'
   | 'sheets_update'
   | 'sheets_append'
-  | 'calendar_list_events';
+  | 'calendar_list_events'
+  | 'calendar_get_event'
+  | 'calendar_create_event'
+  | 'calendar_update_event'
+  | 'calendar_delete_event'
+  | 'docs_create'
+  | 'docs_get'
+  | 'docs_batch_update';
 
 export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_search',
@@ -80,6 +97,13 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'sheets_update',
   'sheets_append',
   'calendar_list_events',
+  'calendar_get_event',
+  'calendar_create_event',
+  'calendar_update_event',
+  'calendar_delete_event',
+  'docs_create',
+  'docs_get',
+  'docs_batch_update',
 ];
 
 const MAKOTO_TOOL_NAME_SET: ReadonlySet<string> = new Set(MAKOTO_TOOL_NAMES);
@@ -227,7 +251,35 @@ export async function dispatchMakotoTool(
         );
       case 'calendar_list_events':
         return ok(
-          await calendarListEvents(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken)),
+          await calendarListEvents(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+        );
+      case 'calendar_get_event':
+        return ok(
+          await calendarGetEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+        );
+      case 'calendar_create_event':
+        return ok(
+          await calendarCreateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+        );
+      case 'calendar_update_event':
+        return ok(
+          await calendarUpdateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+        );
+      case 'calendar_delete_event':
+        return ok(
+          await calendarDeleteEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, true)),
+        );
+      case 'docs_create':
+        return ok(
+          await docsCreate(args, docsDeps(ctx, initialAccessToken, refreshAccessToken)),
+        );
+      case 'docs_get':
+        return ok(
+          await docsGet(args, docsDeps(ctx, initialAccessToken, refreshAccessToken)),
+        );
+      case 'docs_batch_update':
+        return ok(
+          await docsBatchUpdate(args, docsDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
     }
   } catch (err) {
@@ -353,8 +405,23 @@ function calendarDeps(
   ctx: MakotoToolDispatchContext,
   accessToken: string,
   refreshAccessToken: () => Promise<string>,
+  withConfirmStore: boolean,
 ): CalendarToolDeps {
   const deps: CalendarToolDeps = { accessToken, refreshAccessToken };
+  if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
+  if (withConfirmStore) {
+    deps.confirmTokenStore = createKvConfirmTokenStore(ctx.env.MAKOTO_KV);
+    if (ctx.boundMessageId) deps.boundMessageId = ctx.boundMessageId;
+  }
+  return deps;
+}
+
+function docsDeps(
+  ctx: MakotoToolDispatchContext,
+  accessToken: string,
+  refreshAccessToken: () => Promise<string>,
+): DocsToolDeps {
+  const deps: DocsToolDeps = { accessToken, refreshAccessToken };
   if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
   return deps;
 }

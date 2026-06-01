@@ -1,6 +1,6 @@
 /**
  * Unit tests for `src/dispatch/makoto-tool-dispatcher.ts` — wraps the
- * 10 layer-6 tool functions with per-user OAuth resolution + error
+ * layer-6 tool functions with per-user OAuth resolution + error
  * envelope encoding.
  */
 
@@ -38,8 +38,8 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
-  it('covers all 10 tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(10);
+  it('covers all registered tools', () => {
+    expect(MAKOTO_TOOL_NAMES.length).toBe(17);
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
@@ -151,6 +151,71 @@ describe('dispatchMakotoTool happy paths', () => {
     );
     expect(r.ok).toBe(true);
     expect((r.payload as { count: number }).count).toBe(0);
+  });
+
+  it('calendar_create_event resolves OAuth then proxies', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      expect(url).toContain('/calendar/v3/calendars/primary/events?sendUpdates=all');
+      expect(init.method).toBe('POST');
+      return jsonResponse(200, {
+        id: 'evt-1',
+        summary: '予定',
+        start: { dateTime: '2026-06-02T10:00:00+09:00' },
+        end: { dateTime: '2026-06-02T11:00:00+09:00' },
+      });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'calendar_create_event',
+      {
+        summary: '予定',
+        start: { dateTime: '2026-06-02T10:00:00+09:00' },
+        end: { dateTime: '2026-06-02T11:00:00+09:00' },
+      },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    expect((r.payload as { id: string }).id).toBe('evt-1');
+  });
+
+  it('docs_create resolves OAuth then proxies', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      expect(url).toContain('/documents');
+      expect(init.method).toBe('POST');
+      return jsonResponse(200, { documentId: 'doc-1', title: 'Doc' });
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'docs_create',
+      { title: 'Doc' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    expect((r.payload as { document_url: string }).document_url).toContain('/document/d/doc-1');
   });
 
   it('schema error from tool → ok:false / error:schema with tool name', async () => {
