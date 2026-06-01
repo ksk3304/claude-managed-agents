@@ -463,12 +463,13 @@ async function handleEnsureMakotoAgentTools(request: Request, env: Env): Promise
   }
   const currentTools = (agent as { tools?: unknown }).tools;
   const ensured = ensureMakotoAgentCustomTools(currentTools);
-  if (ensured.added.length === 0) {
+  if (ensured.added.length === 0 && ensured.removed.length === 0) {
     return Response.json({
       ok: true,
       agent_id: agentId,
       changed: false,
       version,
+      removed: ensured.removed,
       present: ensured.present,
     });
   }
@@ -483,6 +484,7 @@ async function handleEnsureMakotoAgentTools(request: Request, env: Env): Promise
     before_version: version,
     after_version: updated.version,
     added: ensured.added,
+    removed: ensured.removed,
     present: ensured.present,
   });
 }

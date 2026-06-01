@@ -39,10 +39,12 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all registered tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(17);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(15);
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('drive_delete')).toBe(false);
+    expect(isMakotoToolName('calendar_delete_event')).toBe(false);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
   });
 });

@@ -210,7 +210,9 @@ interface NaturalCalendarCreateInput {
 }
 
 interface NaturalCalendarTitleUpdateInput {
-  summary: string;
+  summary?: string;
+  start?: { dateTime: string };
+  end?: { dateTime: string };
 }
 
 function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | null {
@@ -238,24 +240,65 @@ function parseNaturalCalendarCreate(text: string): NaturalCalendarCreateInput | 
 }
 
 function parseNaturalCalendarTitleUpdate(text: string): NaturalCalendarTitleUpdateInput | null {
-  if (!/(タイトル|件名|予定名)/.test(text)) return null;
-  if (!/(書き換え|変更|変えて|更新|直して|リネーム)/.test(text)) return null;
+  if (!/(タイトル|件名|予定名|予定時刻|時刻|時間|日時)/.test(text)) return null;
+  if (!/(書き換え|変更|変えて|変えろ|更新|直して|リネーム|せよ|しろ|して)/.test(text)) return null;
   if (/(削除|消して|キャンセル)/.test(text)) return null;
 
-  const quoted = text.match(/[「『"]([^」』"]{1,80})[」』"]/);
+  let summary = parseCalendarTitleFromText(text);
+  const timeUpdate = parseCalendarTimeUpdate(text);
+  if (!summary && timeUpdate === null) return null;
+  const result: NaturalCalendarTitleUpdateInput = {};
+  if (summary) result.summary = summary;
+  if (timeUpdate !== null) {
+    result.start = timeUpdate.start;
+    result.end = timeUpdate.end;
+  }
+  return result;
+}
+
+function parseCalendarTitleFromText(text: string): string | null {
+  const quoted = text.match(/[「『"“”']([^」』"“”']{1,80})[」』"“”']/);
   let summary = (quoted?.[1] ?? '').trim();
   if (!summary) {
-    const explicit = text.match(
-      /(?:タイトル|件名|予定名)(?:を|は)?\s*(.+?)(?:に|へ)(?:書き換え|変更|変えて|更新|直して|リネーム)/,
+    const afterLabel = text.match(
+      /(?:タイトル|件名|予定名)(?:を|は|が)?\s*(.+?)(?:に|へ)?(?:書き換え|変更|変えて|変えろ|更新|直して|リネーム|せよ|しろ|して)/,
     );
-    summary = (explicit?.[1] ?? '').trim();
+    summary = (afterLabel?.[1] ?? '').trim();
+  }
+  if (!summary) {
+    const beforeLabel = text.match(
+      /(?:^|[。．、,，\s])(?!タイトル|件名|予定名)(.{1,80}?)(?:っていう|という|の)?(?:タイトル|件名|予定名)(?:に|へ)(?:書き換え|変更|変えて|変えろ|更新|直して|リネーム|せよ|しろ|して)/,
+    );
+    summary = (beforeLabel?.[1] ?? '').trim();
   }
   if (!summary || /(適当|違うタイトル|別タイトル)/.test(summary)) {
     summary = `MAKOTOくん Calendarタイトル変更確認 ${formatJstMinuteLabel()}`;
   }
-  summary = summary.replace(/[。．、,，\s]+$/g, '');
-  if (!summary) return null;
-  return { summary };
+  summary = summary
+    .replace(/^[「『"“”'\s]+/g, '')
+    .replace(/[」』"“”'\s]+$/g, '')
+    .replace(/(?:っていう|という|の)?(?:タイトル|件名|予定名)$/g, '')
+    .replace(/[。．、,，\s]+$/g, '')
+    .trim();
+  return summary || null;
+}
+
+function parseCalendarTimeUpdate(text: string): { start: { dateTime: string }; end: { dateTime: string } } | null {
+  if (!/(予定時刻|時刻|時間|日時|\d{1,2}時)/.test(text)) return null;
+  const date = parseJapaneseDateToken(text);
+  if (date === null) return null;
+  const time = text.match(/(\d{1,2})時(?:(\d{1,2})分)?\s*(?:から|-|〜|~)\s*(\d{1,2})時(?:(\d{1,2})分)?/);
+  if (!time) return null;
+  const startHour = Number(time[1]);
+  const startMinute = time[2] ? Number(time[2]) : 0;
+  const endHour = Number(time[3]);
+  const endMinute = time[4] ? Number(time[4]) : 0;
+  if (!validClock(startHour, startMinute) || !validEndClock(endHour, endMinute)) return null;
+  const endDate = addDaysToDateString(date, endHour === 24 ? 1 : 0);
+  return {
+    start: { dateTime: `${date}T${pad2(startHour)}:${pad2(startMinute)}:00+09:00` },
+    end: { dateTime: `${endDate}T${pad2(endHour === 24 ? 0 : endHour)}:${pad2(endMinute)}:00+09:00` },
+  };
 }
 
 function formatJstMinuteLabel(nowMs: number = Date.now()): string {
@@ -269,6 +312,10 @@ function parseJapaneseDateToken(text: string): string | null {
     return `${explicit[1]}-${pad2(Number(explicit[2]))}-${pad2(Number(explicit[3]))}`;
   }
   const jstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const monthDay = text.match(/(?:^|[^\d])(\d{1,2})月\s*(\d{1,2})日/);
+  if (monthDay) {
+    return `${jstNow.getUTCFullYear()}-${pad2(Number(monthDay[1]))}-${pad2(Number(monthDay[2]))}`;
+  }
   const base = new Date(Date.UTC(jstNow.getUTCFullYear(), jstNow.getUTCMonth(), jstNow.getUTCDate()));
   const offsetDays = text.includes('明日') ? 1 : text.includes('今日') ? 0 : null;
   if (offsetDays === null) return null;
@@ -280,8 +327,21 @@ function validClock(hour: number, minute: number): boolean {
   return Number.isInteger(hour) && Number.isInteger(minute) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
 }
 
+function validEndClock(hour: number, minute: number): boolean {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) return false;
+  return (hour >= 0 && hour <= 23) || (hour === 24 && minute === 0);
+}
+
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
+}
+
+function addDaysToDateString(date: string, days: number): string {
+  if (days === 0) return date;
+  const [year, month, day] = date.split('-').map(Number);
+  const base = new Date(Date.UTC(year, month - 1, day));
+  base.setUTCDate(base.getUTCDate() + days);
+  return `${base.getUTCFullYear()}-${pad2(base.getUTCMonth() + 1)}-${pad2(base.getUTCDate())}`;
 }
 
 function jstDayWindow(offsetStartDays: number, offsetEndDays: number): { time_min: string; time_max: string } {
@@ -310,7 +370,11 @@ function isCalendarTitleUpdateCandidate(event: unknown): event is {
   if (typeof e.summary !== 'string') return false;
   if (!e.start || typeof e.start !== 'object' || Array.isArray(e.start)) return false;
   if (!e.end || typeof e.end !== 'object' || Array.isArray(e.end)) return false;
-  return /MAKOTOくん/.test(e.summary) && /(Google連携CRUDテスト|Calendarタイトル変更確認)/.test(e.summary);
+  return (
+    e.summary === 'テスト' ||
+    (/MAKOTOくん/.test(e.summary) &&
+      /(Google連携CRUDテスト|Calendarタイトル変更確認)/.test(e.summary))
+  );
 }
 
 /**
@@ -737,7 +801,7 @@ export async function handleChatEvent(
       });
       return { kind: 'committed' };
     }
-    const window = jstDayWindow(0, 8);
+    const window = jstDayWindow(-7, 8);
     const listResult = await dispatchMakotoTool('calendar_list_events', {
       time_min: window.time_min,
       time_max: window.time_max,
@@ -780,11 +844,14 @@ export async function handleChatEvent(
       return { kind: 'committed' };
     }
     const target = candidates[0]!;
+    const nextSummary = naturalCalendarTitleUpdate.summary ?? target.summary;
+    const nextStart = naturalCalendarTitleUpdate.start ?? target.start;
+    const nextEnd = naturalCalendarTitleUpdate.end ?? target.end;
     const updateResult = await dispatchMakotoTool('calendar_update_event', {
       event_id: target.id,
-      summary: naturalCalendarTitleUpdate.summary,
-      start: target.start,
-      end: target.end,
+      summary: nextSummary,
+      start: nextStart,
+      end: nextEnd,
       send_updates: 'none',
     }, {
       env,
@@ -816,7 +883,7 @@ export async function handleChatEvent(
     const summary =
       typeof payload.summary === 'string' && payload.summary.trim()
         ? payload.summary.trim()
-        : naturalCalendarTitleUpdate.summary;
+        : nextSummary;
     const link = typeof payload.htmlLink === 'string' ? `: ${payload.htmlLink}` : '';
     await replyToCurrentSpace(env, ingressPlaceholderName, spaceName, `予定更新しました: ${summary}${link}`, threadName, eventKey);
     await recordRuntimeEvent(env, {
@@ -829,6 +896,8 @@ export async function handleChatEvent(
         event_id: target.id,
         previous_summary: target.summary,
         summary,
+        start: nextStart,
+        end: nextEnd,
         has_link: typeof payload.htmlLink === 'string',
       },
     });

@@ -20,10 +20,9 @@
  *     (cached in KV for ~55 min). On 401 inside `googleApiFetch`, the
  *     wrapper calls `refreshAccessToken()` which busts the cache and
  *     re-fetches once.
- *   - `boundMessageId` is the inbound RFC 822 Message-ID. Only
- *     `drive_delete` consumes it (Issue #126 same-message-block
- *     enforcement); other tools accept it as a no-op so the dispatcher
- *     doesn't have to branch per-tool.
+ *   - `boundMessageId` is carried for audit compatibility with older
+ *     destructive tools. No currently exposed MAKOTO workspace tool
+ *     performs deletion.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 — 層 7-4)
  * Spec: plan-draft.md §6 custom tools + impl-mid-2 R15 dispatcher wrap
@@ -31,7 +30,6 @@
 
 import {
   driveCreateFile,
-  driveDelete,
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
@@ -46,7 +44,6 @@ import {
 } from '../tools/sheets';
 import {
   calendarCreateEvent,
-  calendarDeleteEvent,
   calendarGetEvent,
   calendarListEvents,
   calendarUpdateEvent,
@@ -61,7 +58,6 @@ import {
 import {
   GoogleApiToolError,
   ToolSchemaError,
-  createKvConfirmTokenStore,
 } from '../tools/tool-common';
 import { getAccessToken } from '../lib/workspace-oauth';
 import { getOAuthLease } from '../durable-objects/oauth-lease';
@@ -72,7 +68,6 @@ export type MakotoToolName =
   | 'drive_get_file_metadata'
   | 'drive_read_export'
   | 'drive_create_file'
-  | 'drive_delete'
   | 'sheets_create'
   | 'sheets_read'
   | 'sheets_update'
@@ -81,7 +76,6 @@ export type MakotoToolName =
   | 'calendar_get_event'
   | 'calendar_create_event'
   | 'calendar_update_event'
-  | 'calendar_delete_event'
   | 'docs_create'
   | 'docs_get'
   | 'docs_batch_update';
@@ -91,7 +85,6 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_get_file_metadata',
   'drive_read_export',
   'drive_create_file',
-  'drive_delete',
   'sheets_create',
   'sheets_read',
   'sheets_update',
@@ -100,7 +93,6 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'calendar_get_event',
   'calendar_create_event',
   'calendar_update_event',
-  'calendar_delete_event',
   'docs_create',
   'docs_get',
   'docs_batch_update',
@@ -121,7 +113,7 @@ export function isMakotoToolName(name: string): name is MakotoToolName {
 export interface MakotoToolDispatchContext {
   env: Env;
   userSlug: string;
-  /** Inbound RFC 822 Message-ID — only meaningful for `drive_delete`. */
+  /** Inbound RFC 822 Message-ID. Kept for audit/backward compatibility. */
   boundMessageId: string;
   /** Optional — passed to oauth_audit row. */
   callerSessionId?: string;
@@ -211,27 +203,22 @@ export async function dispatchMakotoTool(
     switch (name) {
       case 'drive_search':
         return ok(
-          await driveSearch(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await driveSearch(args, driveDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'drive_get_file_metadata':
         return ok(
           await driveGetFileMetadata(
             args,
-            driveDeps(ctx, initialAccessToken, refreshAccessToken, false),
+            driveDeps(ctx, initialAccessToken, refreshAccessToken),
           ),
         );
       case 'drive_read_export':
         return ok(
-          await driveReadExport(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await driveReadExport(args, driveDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'drive_create_file':
         return ok(
-          await driveCreateFile(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
-        );
-      case 'drive_delete':
-        // drive_delete requires the confirm token store + bound message id.
-        return ok(
-          await driveDelete(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, true)),
+          await driveCreateFile(args, driveDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'sheets_create':
         return ok(
@@ -251,23 +238,19 @@ export async function dispatchMakotoTool(
         );
       case 'calendar_list_events':
         return ok(
-          await calendarListEvents(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await calendarListEvents(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'calendar_get_event':
         return ok(
-          await calendarGetEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await calendarGetEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'calendar_create_event':
         return ok(
-          await calendarCreateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+          await calendarCreateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'calendar_update_event':
         return ok(
-          await calendarUpdateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, false)),
-        );
-      case 'calendar_delete_event':
-        return ok(
-          await calendarDeleteEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken, true)),
+          await calendarUpdateEvent(args, calendarDeps(ctx, initialAccessToken, refreshAccessToken)),
         );
       case 'docs_create':
         return ok(
@@ -380,14 +363,9 @@ function driveDeps(
   ctx: MakotoToolDispatchContext,
   accessToken: string,
   refreshAccessToken: () => Promise<string>,
-  withConfirmStore: boolean,
 ): DriveToolDeps {
   const deps: DriveToolDeps = { accessToken, refreshAccessToken };
   if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
-  if (withConfirmStore) {
-    deps.confirmTokenStore = createKvConfirmTokenStore(ctx.env.MAKOTO_KV);
-    if (ctx.boundMessageId) deps.boundMessageId = ctx.boundMessageId;
-  }
   return deps;
 }
 
@@ -405,14 +383,9 @@ function calendarDeps(
   ctx: MakotoToolDispatchContext,
   accessToken: string,
   refreshAccessToken: () => Promise<string>,
-  withConfirmStore: boolean,
 ): CalendarToolDeps {
   const deps: CalendarToolDeps = { accessToken, refreshAccessToken };
   if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
-  if (withConfirmStore) {
-    deps.confirmTokenStore = createKvConfirmTokenStore(ctx.env.MAKOTO_KV);
-    if (ctx.boundMessageId) deps.boundMessageId = ctx.boundMessageId;
-  }
   return deps;
 }
 

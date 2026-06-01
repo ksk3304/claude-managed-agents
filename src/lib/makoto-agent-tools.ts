@@ -77,19 +77,6 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   },
   {
     type: 'custom',
-    name: 'drive_delete',
-    description: 'Move a Google Drive file to trash using the required two-step confirmation flow.',
-    input_schema: {
-      type: 'object',
-      required: ['file_id'],
-      properties: {
-        file_id: stringProp('Google Drive file id.'),
-        confirmation_token: stringProp('Token returned by the first confirmation_required call.'),
-      },
-    },
-  },
-  {
-    type: 'custom',
     name: 'sheets_create',
     description: 'Create a Google Sheets spreadsheet.',
     input_schema: {
@@ -209,21 +196,6 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   },
   {
     type: 'custom',
-    name: 'calendar_delete_event',
-    description: 'Delete a Google Calendar event using the required two-step confirmation flow.',
-    input_schema: {
-      type: 'object',
-      required: ['event_id'],
-      properties: {
-        calendar_id: stringProp('Calendar id. Defaults to primary.'),
-        event_id: stringProp('Calendar event id.'),
-        confirmation_token: stringProp('Token returned by the first confirmation_required call.'),
-        send_updates: stringProp("'all', 'externalOnly', or 'none'."),
-      },
-    },
-  },
-  {
-    type: 'custom',
     name: 'docs_create',
     description: 'Create a Google Docs document.',
     input_schema: {
@@ -264,10 +236,24 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   },
 ];
 
+const DEPRECATED_MAKOTO_AGENT_TOOL_NAMES = new Set([
+  'drive_delete',
+  'calendar_delete_event',
+]);
+
 export function ensureMakotoAgentCustomTools(
   existingTools: unknown,
-): { tools: unknown[]; added: string[]; present: string[] } {
-  const tools = Array.isArray(existingTools) ? [...existingTools] : [];
+): { tools: unknown[]; added: string[]; present: string[]; removed: string[] } {
+  const removed: string[] = [];
+  const tools = (Array.isArray(existingTools) ? existingTools : []).filter((tool) => {
+    const name =
+      tool && typeof tool === 'object' ? (tool as { name?: unknown }).name : undefined;
+    if (typeof name === 'string' && DEPRECATED_MAKOTO_AGENT_TOOL_NAMES.has(name)) {
+      removed.push(name);
+      return false;
+    }
+    return true;
+  });
   const names = new Set(
     tools
       .map((tool) =>
@@ -285,5 +271,5 @@ export function ensureMakotoAgentCustomTools(
     tools.push(tool);
     added.push(tool.name);
   }
-  return { tools, added, present };
+  return { tools, added, present, removed };
 }
