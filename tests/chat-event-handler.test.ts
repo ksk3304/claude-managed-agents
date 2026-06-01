@@ -2280,6 +2280,28 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
+  it('placeholder empty final text: DELETEせず見える説明へPATCHする', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_empty_text',
+      events: [
+        { type: 'agent.message.text', text: '' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('Chat に表示できる本文が空でした');
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
   it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});

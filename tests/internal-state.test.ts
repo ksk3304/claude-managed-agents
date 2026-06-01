@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   INTERNAL_STATE_PATTERNS,
+  maskInternalStateForChat,
   scrubInternalStateForChat,
   softenBenignInternalReferencesForChat,
 } from '../src/redact/internal-state';
@@ -71,6 +72,15 @@ describe('softenBenignInternalReferencesForChat', () => {
     const scrubbed = scrubInternalStateForChat(softened.text, 'job-1');
     expect(scrubbed.hits).toEqual([]);
     expect(scrubbed.text).toBe('memory store が未 attach のため対応できません');
+  });
+});
+
+describe('maskInternalStateForChat', () => {
+  it('uses the same registry while preserving the answer body', () => {
+    const r = maskInternalStateForChat('memory store が未 attach のため対応できません');
+    expect(r.hits).toEqual([]);
+    expect(r.text).toBe('memory store が未 attach のため対応できません');
+    expect(r.text).not.toContain('今回のタスクは完了できませんでした');
   });
 });
 
