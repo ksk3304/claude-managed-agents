@@ -29,6 +29,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
+import { buildAllManagedAgentSkills } from '../src/lib/attached-skills';
+import { skillsHash } from '../src/lib/agent-cache';
+import { chatThreadSessionKey } from '../src/lib/session-orchestrator';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
 import { buildSideEffectKey } from '../src/lib/three-stage-precheck';
@@ -1438,10 +1441,15 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this sender + space + thread.
-    const sessionKey =
-      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
-    await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
+    // pre-populate KV with existing session for this thread + current skills set.
+    const sessionKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/ROOM10',
+      'spaces/ROOM10/threads/T10',
+      await skillsHash(buildAllManagedAgentSkills(env)),
+    );
+    expect(sessionKey).not.toBeNull();
+    await env.MAKOTO_KV.put(sessionKey!, 'sesn_existing');
 
     const created: unknown[] = [];
     const sends: string[] = [];
@@ -1499,11 +1507,14 @@ describe('handleChatEvent', () => {
     expect(created).toHaveLength(1);
     expect(sends).toEqual(['sesn_new_thread']);
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_old_scope');
-    expect(
-      await env.MAKOTO_KV.get(
-        'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T11',
-      ),
-    ).toBe('sesn_new_thread');
+    const threadKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/ROOM10',
+      'spaces/ROOM10/threads/T11',
+      await skillsHash(buildAllManagedAgentSkills(env)),
+    );
+    expect(threadKey).not.toBeNull();
+    expect(await env.MAKOTO_KV.get(threadKey!)).toBe('sesn_new_thread');
   });
 
   it('attachment turn follows Chat thread session and ignores broad DM scope session', async () => {
@@ -1513,10 +1524,15 @@ describe('handleChatEvent', () => {
       } as Partial<Env>,
     });
     const scopeKey = 'chat_scope_session:agent_001:dm:alice@example.com';
-    const threadKey =
-      'chat_thread_session:alice@example.com:spaces/AAA:spaces/AAA/threads/TATT';
+    const threadKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TATT',
+      await skillsHash(buildAllManagedAgentSkills(env)),
+    );
+    expect(threadKey).not.toBeNull();
     await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');
-    await env.MAKOTO_KV.put(threadKey, 'sesn_thread_existing');
+    await env.MAKOTO_KV.put(threadKey!, 'sesn_thread_existing');
     const msg = buildQueueMsg({
       threadName: 'spaces/AAA/threads/TATT',
       attachment: [
@@ -1548,7 +1564,7 @@ describe('handleChatEvent', () => {
     expect(created).toHaveLength(0);
     expect(sends).toEqual(['sesn_thread_existing']);
     expect(await env.MAKOTO_KV.get(scopeKey)).toBe('sesn_existing');
-    expect(await env.MAKOTO_KV.get(threadKey)).toBe('sesn_thread_existing');
+    expect(await env.MAKOTO_KV.get(threadKey!)).toBe('sesn_thread_existing');
   });
 
   it('same Chat thread lock held → releases claim and retries without posting placeholder', async () => {

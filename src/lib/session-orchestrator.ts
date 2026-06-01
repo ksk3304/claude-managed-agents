@@ -23,7 +23,12 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { hasAttachedSkills } from './attached-skills';
+import { skillsHash } from './agent-cache';
+import {
+  buildAllManagedAgentSkills,
+  ensureManagedAgentSkills,
+  hasAttachedSkills,
+} from './attached-skills';
 import type { UserMappingValue } from './memory-attach';
 import {
   buildAnthropicClient,
@@ -73,12 +78,14 @@ export function chatThreadSessionKey(
   senderEmail: string,
   spaceName: string,
   threadName: string | null | undefined,
+  skillsKey?: string | null,
 ): string | null {
   const email = (senderEmail || '').trim().toLowerCase();
   const space = (spaceName || '').trim();
   const thread = (threadName || '').trim();
   if (!email || !space || !thread) return null;
-  return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}`;
+  const suffix = skillsKey && skillsKey !== 'none' ? `:skills-${skillsKey}` : '';
+  return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}${suffix}`;
 }
 
 /**
@@ -304,10 +311,40 @@ export async function orchestrateChatTurn(
     };
   }
 
+  // ---- attached skills ensure ----
+  // Anthropic pre-built document skills (xlsx / pptx / docx / pdf) are only
+  // usable after they are attached to the employee agent. Keep the existing
+  // agent/session design and patch the agent skill list in place.
+  const desiredAttachedSkills = buildAllManagedAgentSkills(input.env);
+  const attachedSkillsHash = await skillsHash(desiredAttachedSkills);
+  try {
+    const ensured = await ensureManagedAgentSkills(
+      client,
+      input.userMapping.agent_id,
+      desiredAttachedSkills,
+      {
+        kv,
+        desiredSkillsHash: attachedSkillsHash,
+      },
+    );
+    if (ensured.reason !== 'ensured_cache_hit') {
+      console.log(
+        `[chat-event] attached skills ensure agent=${input.userMapping.agent_id} ` +
+          `reason=${ensured.reason} updated=${ensured.updated} skills=${ensured.finalSkills.length}`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[chat-event] attached skills ensure failed agent=${input.userMapping.agent_id}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   // ---- thread session 解決 ----
   // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
   // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
   // 古い CMA session を継続してしまうため、scope key への fallback はしない。
+  // skills hash を suffix に含め、document skills 付与前の session を再利用しない。
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
     ? null
@@ -315,6 +352,7 @@ export async function orchestrateChatTurn(
         input.senderEmail,
         input.spaceName,
         input.threadName,
+        attachedSkillsHash,
       );
   let sessionId: string | null = null;
   if (sessionKey !== null) {
