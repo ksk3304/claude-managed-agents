@@ -14,6 +14,7 @@ import {
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveUpdateFileContent,
   driveUpdateFileMetadata,
   type DriveToolDeps,
 } from '../src/tools/drive';
@@ -156,6 +157,49 @@ describe('driveUpdateFileMetadata', () => {
     await expect(
       driveUpdateFileMetadata({ file_id: 'abc' }, baseDeps(fetcher)),
     ).rejects.toThrow(/at least one/);
+  });
+});
+
+describe('driveUpdateFileContent', () => {
+  it('replaces text content through media update', async () => {
+    const fetcher = makeFetchMock(async (url, init) => {
+      if (init.method === 'GET') {
+        expect(url).toContain('/drive/v3/files/abc');
+        return jsonResponse(200, {
+          id: 'abc',
+          name: 'doc.txt',
+          mimeType: 'text/plain',
+        });
+      }
+      expect(url).toContain('/upload/drive/v3/files/abc');
+      expect(url).toContain('uploadType=media');
+      expect(init.method).toBe('PATCH');
+      expect(String(init.body)).toBe('CRU-Uのテスト');
+      expect((init.headers as Headers).get('Content-Type')).toBe('text/plain; charset=UTF-8');
+      return jsonResponse(200, {
+        id: 'abc',
+        name: 'doc.txt',
+        mimeType: 'text/plain',
+      });
+    });
+    const r = await driveUpdateFileContent(
+      { file_id: 'abc', content: 'CRU-Uのテスト' },
+      baseDeps(fetcher),
+    );
+    expect(r.id).toBe('abc');
+  });
+
+  it('rejects Google-native files', async () => {
+    const fetcher = makeFetchMock(async () =>
+      jsonResponse(200, {
+        id: 'abc',
+        name: 'doc',
+        mimeType: 'application/vnd.google-apps.document',
+      }),
+    );
+    await expect(
+      driveUpdateFileContent({ file_id: 'abc', content: 'x' }, baseDeps(fetcher)),
+    ).rejects.toThrow(/Google-native files/);
   });
 });
 

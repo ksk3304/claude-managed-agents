@@ -92,6 +92,20 @@ export const MAKOTO_AGENT_CUSTOM_TOOLS: readonly CustomToolParam[] = [
   },
   {
     type: 'custom',
+    name: 'drive_update_file_content',
+    description: 'Replace the UTF-8 text body of an existing non-Google-native, non-binary Drive file without deleting or recreating it.',
+    input_schema: {
+      type: 'object',
+      required: ['file_id', 'content'],
+      properties: {
+        file_id: stringProp('Google Drive file id.'),
+        content: stringProp('New full file content. Replaces the existing body.'),
+        mime_type: stringProp('Optional MIME type. Defaults to the existing MIME type.'),
+      },
+    },
+  },
+  {
+    type: 'custom',
     name: 'sheets_create',
     description: 'Create a Google Sheets spreadsheet.',
     input_schema: {

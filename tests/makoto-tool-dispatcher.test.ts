@@ -39,11 +39,12 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all registered tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(16);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(17);
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
     expect(isMakotoToolName('drive_update_file_metadata')).toBe(true);
+    expect(isMakotoToolName('drive_update_file_content')).toBe(true);
     expect(isMakotoToolName('drive_delete')).toBe(false);
     expect(isMakotoToolName('calendar_delete_event')).toBe(false);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
@@ -154,6 +155,50 @@ describe('dispatchMakotoTool happy paths', () => {
     );
     expect(r.ok).toBe(true);
     expect((r.payload as { count: number }).count).toBe(0);
+  });
+
+  it('drive_update_file_content verifies by reading back content', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    let metadataReads = 0;
+    const fetchImpl = makeFetchMock(async (url, init) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (url.includes('/upload/drive/v3/files/abc')) {
+        expect(init.method).toBe('PATCH');
+        expect(String(init.body)).toBe('CRU-Uのテスト');
+        return jsonResponse(200, { id: 'abc', name: 'doc.txt', mimeType: 'text/plain' });
+      }
+      if (url.includes('/drive/v3/files/abc') && url.includes('alt=media')) {
+        expect(init.method).toBe('GET');
+        return new Response('CRU-Uのテスト', { status: 200 });
+      }
+      if (url.includes('/drive/v3/files/abc')) {
+        metadataReads++;
+        expect(init.method).toBe('GET');
+        return jsonResponse(200, { id: 'abc', name: 'doc.txt', mimeType: 'text/plain' });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'drive_update_file_content',
+      { file_id: 'abc', content: 'CRU-Uのテスト' },
+      { env, userSlug: 'alice', boundMessageId: 'm-1', fetchImpl },
+    );
+    expect(r.ok).toBe(true);
+    expect(metadataReads).toBe(2);
+    const payload = r.payload as { verified: boolean; readback: { content: string } };
+    expect(payload.verified).toBe(true);
+    expect(payload.readback.content).toBe('CRU-Uのテスト');
   });
 
   it('calendar_create_event resolves OAuth then proxies', async () => {

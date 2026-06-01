@@ -33,6 +33,7 @@ import {
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveUpdateFileContent,
   driveUpdateFileMetadata,
   type DriveToolDeps,
 } from '../tools/drive';
@@ -69,6 +70,7 @@ export type MakotoToolName =
   | 'drive_get_file_metadata'
   | 'drive_read_export'
   | 'drive_create_file'
+  | 'drive_update_file_content'
   | 'drive_update_file_metadata'
   | 'sheets_create'
   | 'sheets_read'
@@ -87,6 +89,7 @@ export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
   'drive_get_file_metadata',
   'drive_read_export',
   'drive_create_file',
+  'drive_update_file_content',
   'drive_update_file_metadata',
   'sheets_create',
   'sheets_read',
@@ -221,6 +224,11 @@ export async function dispatchMakotoTool(
         );
       case 'drive_create_file':
         return await verifiedDriveCreate(
+          args,
+          driveDeps(ctx, initialAccessToken, refreshAccessToken),
+        );
+      case 'drive_update_file_content':
+        return await verifiedDriveUpdateContent(
           args,
           driveDeps(ctx, initialAccessToken, refreshAccessToken),
         );
@@ -392,6 +400,24 @@ async function verifiedDriveCreate(
   return mismatches.length === 0
     ? verificationOk('drive_create_file', result, readback, checked)
     : verificationFail('drive_create_file', result, readback, checked, mismatches);
+}
+
+async function verifiedDriveUpdateContent(
+  args: Record<string, unknown>,
+  deps: DriveToolDeps,
+): Promise<MakotoToolResult> {
+  const result = await driveUpdateFileContent(args, deps);
+  const fileId = typeof result.id === 'string' && result.id ? result.id : args.file_id;
+  if (typeof fileId !== 'string' || !fileId) {
+    return verificationMissing('drive_update_file_content', result, 'drive_update_file_content: file id missing');
+  }
+  const readback = await driveReadExport({ file_id: fileId, format: 'text', max_chars: 200000 }, deps);
+  const mismatches =
+    typeof args.content === 'string' && readback.content === args.content ? [] : ['content'];
+  const checked = ['content'];
+  return mismatches.length === 0
+    ? verificationOk('drive_update_file_content', result, readback, checked)
+    : verificationFail('drive_update_file_content', result, readback, checked, mismatches);
 }
 
 async function verifiedDriveUpdateMetadata(
