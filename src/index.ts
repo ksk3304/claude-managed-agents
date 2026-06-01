@@ -43,6 +43,10 @@ import {
   recordRuntimeEvent,
   pruneObservability,
 } from "./lib/observability";
+import {
+  handleWorkspaceOAuthCallback,
+  handleWorkspaceOAuthStart,
+} from "./lib/workspace-oauth-flow";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -72,6 +76,20 @@ export default {
     _ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    if (
+      url.pathname === "/oauth/google/workspace/start" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthStart(request, env);
+    }
+
+    if (
+      url.pathname === "/oauth/google/workspace/callback" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthCallback(request, env);
+    }
 
     // AgentMail inbound webhook (svix protocol).
     if (
