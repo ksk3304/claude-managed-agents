@@ -52,6 +52,9 @@ import {
   recordChatWebhookPayload,
   recordRuntimeEvent,
 } from '../lib/observability';
+import { postChatPlaceholder } from '../lib/chat-placeholder';
+import { isMentioningBot } from '../lib/mention-detection';
+import { deleteChatMessage } from '../lib/chat-api';
 
 // ============================================================================
 // 型定義
@@ -122,6 +125,7 @@ export interface ChatQueueMessage {
   receivedAtMs: number;
   claim: { owner: string; version: number };
   payload: ChatEventPayload;
+  placeholderName?: string;
 }
 
 // ============================================================================
@@ -545,12 +549,31 @@ export async function handleGoogleChatWebhook(
     return Response.json({ error: 'unexpected claim state' }, { status: 500 });
   }
 
+  const spaceName = event.space?.name ?? '';
+  const spaceType = event.space?.type ?? 'UNKNOWN';
+  const senderType = (event.message.sender as { type?: string } | undefined)?.type;
+  const isForBot =
+    spaceType === 'DM' ||
+    isMentioningBot(event.message.annotations ?? [], (env.GCHAT_BOT_USER_NAME ?? '').trim());
+  const placeholderName =
+    senderType === 'BOT' || !isForBot
+      ? ''
+      : await postChatPlaceholder(env, {
+          spaceName,
+          threadName: event.message.thread?.name ?? null,
+          eventKey,
+          messageId: event.message.name,
+          claim: { owner: claim.owner, version: claim.version },
+          source: 'google-chat-webhook',
+        });
+
   // ---- 7. Queue 投入 ----
   const queueMsg: ChatQueueMessage = {
     eventKey,
     receivedAtMs: Date.now(),
     claim: { owner: claim.owner, version: claim.version },
     payload: event,
+    ...(placeholderName ? { placeholderName } : {}),
   };
   try {
     await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
@@ -564,6 +587,15 @@ export async function handleGoogleChatWebhook(
   } catch (err) {
     // Queue 投入失敗 → claim は release して successor が retake できる
     // ようにする。Google Chat 側 retry に任せる。
+    if (placeholderName) {
+      try {
+        await deleteChatMessage({ saKeyJson: env.CHAT_SA_KEY_JSON! }, placeholderName);
+      } catch (deleteErr) {
+        console.warn(
+          `[chat-webhook] placeholder cleanup after queue fail failed cfRay=${cfRay} eventKey=${eventKey}: ${deleteErr instanceof Error ? deleteErr.message : String(deleteErr)}`,
+        );
+      }
+    }
     try {
       await releaseClaim(env.DB, eventKey, claim.owner, claim.version);
     } catch (releaseErr) {
