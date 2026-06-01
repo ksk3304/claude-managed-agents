@@ -185,6 +185,24 @@ describe('buildUserMessageEnvelope — roster 層 (Python _build_space_roster_bl
   });
 });
 
+describe('buildUserMessageEnvelope — provenance guard', () => {
+  it('external_data 判定を user_message より前に注入する', () => {
+    const out = buildUserMessageEnvelope('Forwarded:\nFrom: a@example.com\nSubject: test', {
+      speaker: { spaceType: 'DM', senderEmail: 'x@example.com' },
+      provenance: {
+        classification: 'external_data',
+        hitAxes: ['forwarded_header', 'first_person_absent'],
+        score: 2,
+        summary: 'external_data axes=forwarded_header,first_person_absent',
+      },
+    });
+    expect(out).toContain('<trust_boundary classification=external_data');
+    expect(out).toContain('hit_axes="forwarded_header,first_person_absent"');
+    expect(out).toContain('引用ブロック外のユーザー本人指示');
+    expect(out.indexOf('<trust_boundary')).toBeLessThan(out.indexOf('<user_message>'));
+  });
+});
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

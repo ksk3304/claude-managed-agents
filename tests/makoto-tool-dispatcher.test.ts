@@ -1,6 +1,6 @@
 /**
  * Unit tests for `src/dispatch/makoto-tool-dispatcher.ts` — wraps the
- * 10 layer-6 tool functions with per-user OAuth resolution + error
+ * layer-6 tool functions with per-user OAuth resolution + error
  * envelope encoding.
  */
 
@@ -10,6 +10,7 @@ import {
   isMakotoToolName,
   MAKOTO_TOOL_NAMES,
 } from '../src/dispatch/makoto-tool-dispatcher';
+import { MAKOTO_AGENT_TOOLS } from '../src/lib/makoto-capability-registry';
 import { putRefreshToken } from '../src/lib/oauth-vault';
 import {
   makeFetchMock,
@@ -38,12 +39,21 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
-  it('covers all 10 tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(10);
+  it('covers all tools', () => {
+    expect(MAKOTO_TOOL_NAMES.length).toBe(11);
+    expect(MAKOTO_TOOL_NAMES).toContain('makoto_introspect');
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('makoto_introspect')).toBe(true);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
+  });
+  it('agent create tool schema stays aligned with dispatcher names', () => {
+    const customToolNames = MAKOTO_AGENT_TOOLS
+      .filter((tool) => tool.type === 'custom')
+      .map((tool) => tool.name);
+    expect(customToolNames.sort()).toEqual([...MAKOTO_TOOL_NAMES].sort());
+    expect(customToolNames).toContain('makoto_introspect');
   });
 });
 
@@ -97,6 +107,39 @@ describe('dispatchMakotoTool error envelopes', () => {
 });
 
 describe('dispatchMakotoTool happy paths', () => {
+  it('makoto_introspect returns safe local manifest without OAuth', async () => {
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: makeKv(),
+    } as unknown as Env;
+    const r = await dispatchMakotoTool('makoto_introspect', { detail: 'all' }, {
+      env,
+      userSlug: 'alice',
+      boundMessageId: 'm-1',
+    });
+    expect(r.ok).toBe(true);
+    const payload = r.payload as Record<string, unknown>;
+    expect(payload.product).toBe('MAKOTOくん Cloudflare版');
+    expect(payload.schema_version).toBe(2);
+    expect((payload.custom_tools as Array<Record<string, unknown>>).length).toBe(
+      MAKOTO_TOOL_NAMES.length,
+    );
+    expect(payload.mcp).toMatchObject({
+      status: 'not_active_for_workspace',
+      active_connectors: [],
+    });
+    expect(payload.cannot_claim).toContain(
+      'Do not claim active MCP connectors for Google Workspace; they are not the current implementation path.',
+    );
+    expect(payload.observed_managed_agent_tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'docs_get', status: 'live_observed' }),
+        expect.objectContaining({ name: 'docs_batch_update', status: 'live_observed' }),
+      ]),
+    );
+    expect(payload).not.toHaveProperty('secrets');
+  });
+
   it('drive_search resolves OAuth then proxies to driveSearch', async () => {
     const kv = makeKv();
     await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');

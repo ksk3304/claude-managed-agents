@@ -29,6 +29,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
+import { chatThreadSessionKey } from '../src/lib/session-orchestrator';
+import { writeSpeakerAlias } from '../src/lib/speaker-alias-ledger';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { makeFetchMock, makeKv, makeMakotoDb } from './makoto-helpers';
 
@@ -90,6 +92,17 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
       if (chatApiMock.deleteThrow) throw chatApiMock.deleteThrow;
       chatApiMock.deletes.push(messageName);
     },
+  };
+});
+
+vi.mock('../src/lib/chat-oauth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/chat-oauth')>();
+  return {
+    ...actual,
+    getChatReadonlyAccessToken: async () => ({
+      access_token: 'chat-oauth-token',
+      expires_at_ms: Date.now() + 3600_000,
+    }),
   };
 });
 
@@ -157,6 +170,7 @@ vi.mock('../src/lib/cloud-scheduler-client', async (importOriginal) => {
 interface FakeAnthOpts {
   events: Array<Record<string, unknown>>;
   sessionId?: string;
+  agentCreateCapture?: Array<unknown>;
   createCapture?: Array<unknown>;
   streamThrow?: Error;
   /** sessions.create を呼んだときに throw する error。orchestrator 内で
@@ -165,6 +179,8 @@ interface FakeAnthOpts {
   createThrow?: Error;
   // Track which sessionId was used for events.send (continuation vs new)
   sendCaptureSessionIds?: string[];
+  // Capture raw events.send payloads so context envelope can be asserted.
+  sendCapturePayloads?: unknown[];
   // Capture memory store list/retrieve/create/update calls for session-log
   memoryListReturns?: AsyncIterable<Record<string, unknown>>;
   memoryRetrieveContent?: string;
@@ -202,6 +218,17 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
   }
   return {
     beta: {
+      agents: {
+        async create(args: unknown) {
+          opts.agentCreateCapture?.push(args);
+          return { id: 'agent_fake_skills' };
+        },
+      },
+      environments: {
+        async create() {
+          return { id: 'env_fake_skills' };
+        },
+      },
       sessions: {
         async create(args: unknown) {
           opts.createCapture?.push(args);
@@ -211,6 +238,7 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
         events: {
           async send(sessionId: string, _payload: unknown): Promise<void> {
             opts.sendCaptureSessionIds?.push(sessionId);
+            opts.sendCapturePayloads?.push(_payload);
           },
           async stream(
             _sessionId: string,
@@ -220,6 +248,11 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
             const callIndex = streamCallCount;
             streamCallCount += 1;
             return streamForCall(callIndex);
+          },
+        },
+        resources: {
+          async add() {
+            return { id: 'resource_fake', type: 'file', file_id: 'file_fake' };
           },
         },
       },
@@ -273,6 +306,8 @@ function buildEnv(opts: BuildEnvOpts = {}): Env {
 }
 
 function buildQueueMsg(overrides: {
+  messageName?: string;
+  eventKey?: string;
   spaceType?: string;
   spaceName?: string;
   threadName?: string | null;
@@ -287,15 +322,16 @@ function buildQueueMsg(overrides: {
   }>;
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
+  const messageName = overrides.messageName ?? 'spaces/AAA/messages/M1';
   return {
-    eventKey: 'chat:msgname:spaces/AAA/messages/M1',
+    eventKey: overrides.eventKey ?? `chat:msgname:${messageName}`,
     receivedAtMs: Date.now(),
     claim: { owner: 'w1-uuid', version: 1 },
     payload: {
       type: 'MESSAGE',
       eventTime: '2026-05-26T08:00:00Z',
       message: {
-        name: 'spaces/AAA/messages/M1',
+        name: messageName,
         sender: {
           name: 'users/U1',
           ...(overrides.senderEmail !== undefined
@@ -483,6 +519,27 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
+  it('Case 3b: webhook placeholder + bot mention なし → placeholder DELETE + commit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '雑談だけ、bot 関係なし',
+    });
+    msg.placeholderMessageName = 'spaces/ROOM1/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('skipped');
+    if (result.kind === 'skipped') expect(result.reason).toBe('not_for_bot');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(0);
+    expect(chatApiMock.deletes).toEqual(['spaces/ROOM1/messages/from_webhook']);
+  });
+
   it('Case 4: BOT sender → skip + commit', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({ senderType: 'BOT' });
@@ -496,7 +553,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
-  it('Case 5: body 空 + thread あり → mention-only 指示文で agent に渡し継続', async () => {
+  it('Case 5: mention-only で履歴取得不能なら agent に丸投げせず決定論的に案内', async () => {
     const env = buildEnv();
     // annotations-based 厳密 mention のみ (本文無し)。strip 後 bodyText が
     // 空になり、thread 有 → mention-only 指示文へ。
@@ -529,11 +586,232 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    expect(sends).toHaveLength(1); // events.send called
-    // placeholder POST 1 件 + 最終 reply は PATCH (= #186 UX 致命傷 fix)。
+    expect(sends).toHaveLength(0);
     expect(chatApiMock.posts).toHaveLength(1);
-    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
-    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toContain('直前の発話を取得できませんでした');
+    expect(chatApiMock.patches).toHaveLength(0);
+  });
+
+  it('Case 5b: mention-only は直前 non-mention を近傍 context として渡す', async () => {
+    const env = buildEnv();
+    const prior = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M0',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: 'このスペースの参加者一覧教えて。',
+      threadName: null,
+    });
+    await preClaim(env, prior.eventKey, prior.claim.owner);
+
+    installFakeAnthropic({ events: [] });
+    const skipped = await handleChatEvent(env, {} as ExecutionContext, prior);
+    expect(skipped.kind).toBe('skipped');
+    if (skipped.kind === 'skipped') expect(skipped.reason).toBe('not_for_bot');
+
+    const mention = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M1',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '@MAKOTOくん',
+      threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, mention.eventKey, mention.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    await writeSpeakerAlias(env.MAKOTO_KV, 'spaces/ROOM1', 'users/U1', '竹井さん', {
+      confirmedByEmail: 'alice@example.com',
+      nowMs: 1,
+    });
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_5b',
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: '参加者一覧を確認します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, mention);
+    expect(result.kind).toBe('committed');
+    expect(payloads).toHaveLength(1);
+    expect(JSON.stringify(payloads[0])).toContain(
+      '直前のスペース発話候補（mention-only補完）',
+    );
+    expect(JSON.stringify(payloads[0])).toContain('[竹井さん]');
+    expect(JSON.stringify(payloads[0])).toContain('このスペースの参加者一覧教えて。');
+  });
+
+  it('Case 5c: mention-only の直前話者が未確認なら user id を出さず名前確認し、返答で台帳保存', async () => {
+    const env = buildEnv();
+    const prior = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M0',
+      eventKey: 'chat:msgname:spaces/ROOM1/messages/M0',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '今日の大崎市古川の天気を教えてください',
+      threadName: null,
+    });
+    await preClaim(env, prior.eventKey, prior.claim.owner);
+
+    installFakeAnthropic({ events: [] });
+    const skipped = await handleChatEvent(env, {} as ExecutionContext, prior);
+    expect(skipped.kind).toBe('skipped');
+
+    const mention = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M1',
+      eventKey: 'chat:msgname:spaces/ROOM1/messages/M1',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '@MAKOTOくん',
+      threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, mention.eventKey, mention.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_unused',
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: '呼ばれない' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const ask = await handleChatEvent(env, {} as ExecutionContext, mention);
+    expect(ask.kind).toBe('committed');
+    expect(payloads).toHaveLength(0);
+    const question = chatApiMock.posts.at(-1)!.text;
+    expect(question).toContain('今日の大崎市古川の天気を教えてください');
+    expect(question).toContain('どなたとして扱えばよいですか');
+    expect(question).not.toContain('user:');
+    expect(question).not.toContain('users/');
+
+    const confirm = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M2',
+      eventKey: 'chat:msgname:spaces/ROOM1/messages/M2',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '@MAKOTOくん 竹井さんです',
+      threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, confirm.eventKey, confirm.claim.owner);
+
+    const learned = await handleChatEvent(env, {} as ExecutionContext, confirm);
+    expect(learned.kind).toBe('committed');
+    expect(chatApiMock.posts.at(-1)!.text).toContain('「竹井さん」として扱います');
+
+    const alias = await env.MAKOTO_KV.get(
+      'speaker_alias:spaces%2FROOM1:users%2FU1',
+    );
+    expect(alias).toContain('竹井さん');
+  });
+
+  it('Case 5d: non-mention event が届かなくても User OAuth の space recent で直前 top-level を拾う', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCHAT_OAUTH_CLIENT_ID: 'cid',
+        GCHAT_OAUTH_CLIENT_SECRET: 'sec',
+        OAUTH_VAULT_KEY: 'vault-key',
+      } as Partial<Env>,
+    });
+    const mention = buildQueueMsg({
+      messageName: 'spaces/ROOM1/messages/M1',
+      eventKey: 'chat:msgname:spaces/ROOM1/messages/M1',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '@MAKOTOくん',
+      threadName: 'spaces/ROOM1/threads/T1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, mention.eventKey, mention.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    await writeSpeakerAlias(env.MAKOTO_KV, 'spaces/ROOM1', 'users/U1', '瀬戸さん', {
+      confirmedByEmail: 'alice@example.com',
+      nowMs: 1,
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url) => {
+      const parsed = new URL(url);
+      if (parsed.searchParams.get('filter')) {
+        return new Response(JSON.stringify({ messages: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          messages: [
+            {
+              name: 'spaces/ROOM1/messages/M1',
+              text: '@MAKOTOくん',
+              sender: { name: 'users/U1', type: 'HUMAN' },
+            },
+            {
+              name: 'spaces/ROOM1/messages/M0',
+              text: '今日の大崎市古川の天気を教えてください',
+              sender: { name: 'users/U1', type: 'HUMAN' },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_5d',
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: '大崎市古川の天気を確認します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, mention);
+      expect(result.kind).toBe('committed');
+      expect(payloads).toHaveLength(1);
+      const body = JSON.stringify(payloads[0]);
+      expect(body).toContain('直前のスペース発話候補（mention-only補完）');
+      expect(body).toContain('[瀬戸さん]');
+      expect(body).toContain('今日の大崎市古川の天気を教えてください');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('Case 6: body 空 + thread なし → 「（空メッセージ）」投稿 + commit', async () => {
@@ -548,6 +826,45 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('（空メッセージ）');
+  });
+
+  it('Case 6b: webhook placeholder + body 空 → placeholder PATCH + commit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '' });
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toEqual([
+      {
+        messageName: 'spaces/AAA/messages/from_webhook',
+        text: '（空メッセージ）',
+      },
+    ]);
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('Case 6c: webhook placeholder + /costguard 決定論応答 → placeholder PATCH + commit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '/costguard status' });
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({ events: [] });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/from_webhook');
+    expect(chatApiMock.patches[0]!.text).toContain('Cost Guard');
+    expect(chatApiMock.deletes).toHaveLength(0);
   });
 
   it('Case 7: CHAT_POST marker → 別 space に投稿 + current space に clean 後本文', async () => {
@@ -624,7 +941,7 @@ describe('handleChatEvent', () => {
     }
   });
 
-  it('Case 9: 内部状態漏洩語 → scrubInternalStateForChat で redaction', async () => {
+  it('Case 9: 内部状態語は回答本文を消さずに局所マスクする', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -644,13 +961,42 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    // placeholder POST 1 件 → 最終 redaction 結果は PATCH で書き換え。
+    // placeholder POST 1 件 → 最終回答は PATCH。固定エラー文へ置換しない。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
     expect(post!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
+    expect(chatApiMock.patches[0]!.text).toContain('対応できません');
+    expect(chatApiMock.patches[0]!.text).toContain('内部運用表現を一部伏せました');
+    expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
+    expect(chatApiMock.patches[0]!.text).not.toContain('未 attach');
+  });
+
+  it('Case 9b: benign runtime path mention is softened, not neutralized', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9b',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: 'まず `/mnt/memory/` を確認し、調査プロセスを説明しました。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('社内記憶');
+    expect(chatApiMock.patches[0]!.text).toContain('調査プロセス');
+    expect(chatApiMock.patches[0]!.text).not.toContain('/mnt/memory');
+    expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
   });
 
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
@@ -671,10 +1017,24 @@ describe('handleChatEvent', () => {
     });
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
-    // pre-populate KV with existing session for this thread.
-    const sessionKey =
-      'chat_thread_session:alice@example.com:spaces/ROOM10:spaces/ROOM10/threads/T10';
-    await env.MAKOTO_KV.put(sessionKey, 'sesn_existing');
+    // pre-populate KV with existing session for this employee agent/env/space/thread.
+    const sessionKey = chatThreadSessionKey(
+      'agent_001',
+      env.ENVIRONMENT_ID,
+      'spaces/ROOM10',
+      'spaces/ROOM10/threads/T10',
+    );
+    expect(sessionKey).not.toBeNull();
+    await env.MAKOTO_KV.put(
+      sessionKey!,
+      JSON.stringify({
+        session_id: 'sesn_existing',
+        agent_id: 'agent_001',
+        environment_id: env.ENVIRONMENT_ID,
+        space_name: 'spaces/ROOM10',
+        thread_name: 'spaces/ROOM10/threads/T10',
+      }),
+    );
 
     const created: unknown[] = [];
     const sends: string[] = [];
@@ -694,9 +1054,108 @@ describe('handleChatEvent', () => {
     expect(sends).toEqual(['sesn_existing']);
   });
 
+  it('Case 10a: KV hit が別 agent/env の record なら新規 session に張り替える', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10',
+      text: '@MAKOTOくん 続きの質問',
+      threadName: 'spaces/ROOM10/threads/T10',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const sessionKey = chatThreadSessionKey(
+      'agent_001',
+      env.ENVIRONMENT_ID,
+      'spaces/ROOM10',
+      'spaces/ROOM10/threads/T10',
+    );
+    expect(sessionKey).not.toBeNull();
+    await env.MAKOTO_KV.put(
+      sessionKey!,
+      JSON.stringify({
+        session_id: 'sesn_wrong_owner',
+        agent_id: 'agent_other',
+        environment_id: env.ENVIRONMENT_ID,
+        space_name: 'spaces/ROOM10',
+        thread_name: 'spaces/ROOM10/threads/T10',
+      }),
+    );
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_new_owner_checked',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '正しい社員agentで応答です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_new_owner_checked']);
+    await expect(env.MAKOTO_KV.get(sessionKey!)).resolves.toContain(
+      '"session_id":"sesn_new_owner_checked"',
+    );
+  });
+
+  it('Case 10b: Chat turn uses mapped employee agent without creating a skill agent', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM10B',
+      text: '@MAKOTOくん 何ができる?',
+      threadName: 'spaces/ROOM10B/threads/T10B',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const agentCreates: unknown[] = [];
+    const created: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_10b',
+      agentCreateCapture: agentCreates,
+      createCapture: created,
+      events: [
+        { type: 'agent.message.text', text: 'できます。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(agentCreates).toHaveLength(0);
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({
+      agent: 'agent_001',
+      environment_id: env.ENVIRONMENT_ID,
+    });
+  });
+
   it('Case 11: confirmOwner 失敗 (successor TAKEOVER) → skip', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
     await preClaim(env, msg.eventKey, msg.claim.owner);
     await putMapping(env, 'alice@example.com');
     // simulate successor
@@ -712,6 +1171,25 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('skipped');
     if (result.kind === 'skipped') expect(result.reason).toBe('lost_claim');
     expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.deletes).toEqual(['spaces/AAA/messages/from_webhook']);
+  });
+
+  it('Case 11b: Anthropic client 不在 + webhook placeholder → DELETE + commit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    installFakeAnthropic(null);
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('skipped');
+    if (result.kind === 'skipped') {
+      expect(result.reason).toBe('no_anthropic_api_key');
+    }
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(0);
+    expect(chatApiMock.deletes).toEqual(['spaces/AAA/messages/from_webhook']);
   });
 
   it('Case 12: LLM stream throw → release_and_retry', async () => {
@@ -1002,6 +1480,55 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
     // DELETE は呼ばれない (失敗経路ではない)
     expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('placeholder empty final text: DELETEせず見える説明へPATCHする', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_empty_text',
+      events: [
+        { type: 'agent.message.text', text: '' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('Chat に表示できる本文が空でした');
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('webhook placeholder が渡されたら新規 placeholder を POST せず既存 message を PATCH', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '質問です' });
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_placeholder_from_webhook',
+      events: [
+        { type: 'agent.message.text', text: '応答テキスト' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toEqual([
+      {
+        messageName: 'spaces/AAA/messages/from_webhook',
+        text: '応答テキスト',
+      },
+    ]);
   });
 
   it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {

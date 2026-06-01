@@ -20,7 +20,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { ANTHROPIC_BETA, resolveAnthropicApiKey } from '../anthropic';
-import type { MemoryStoreResourceParam } from '../types/memory';
+import type { SessionResourceParam } from '../types/memory';
 import type { EmailSendMarker } from '../types/agentmail';
 import { parseEmailSendMarkers } from './email-send-marker';
 
@@ -44,7 +44,7 @@ export interface CreateSessionInput {
   agentId: string;
   environmentId: string;
   /** Memory Stores to attach. Empty array is permitted (rare). */
-  resources: MemoryStoreResourceParam[];
+  resources: SessionResourceParam[];
   /**
    * Per-user system-prompt addendum. Surfaced as an `instructions`
    * resource if present — the SDK's `sessions.create` accepts a
@@ -328,7 +328,7 @@ const DEFAULT_SESSION_WATCHDOG_SEC = 600;
  *
  * Note: `agent.tool_use` (built-in tools like bash) is observed but
  * NOT dispatched here — only `agent.custom_tool_use` (= MAKOTOくん's
- * 10 Google Workspace tools) routes through `toolDispatcher`. Built-in
+ * custom tools) routes through `toolDispatcher`. Built-in
  * tool execution happens server-side in Anthropic's runtime; the bridge
  * just watches the result come back as part of the stream.
  */
@@ -464,7 +464,7 @@ export async function sendAndStreamWithToolDispatch(
         continue;
       }
 
-      // 2b. custom tool dispatch — MAKOTOくん の 10 tool が呼ばれた時。
+      // 2b. custom tool dispatch — MAKOTOくん の custom tool が呼ばれた時。
       // Managed Agents contract: collect `agent.custom_tool_use` here, then
       // execute/send `user.custom_tool_result` only after the session pauses
       // with `session.status_idle(stop_reason=requires_action)`. Sending the

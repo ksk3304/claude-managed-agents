@@ -1,5 +1,10 @@
 /**
- * Agent cache — Cloud Run の `scripts/cma_lib.py:_load_agent_cache` (l.379) /
+ * Agent cache — legacy Cloud Run parity helper. Current Google Chat
+ * Cloudflare runtime does not call this file; Chat session continuation is
+ * keyed by `user_mapping.agent_id` + `ENVIRONMENT_ID` in
+ * `session-orchestrator.ts`.
+ *
+ * Cloud Run の `scripts/cma_lib.py:_load_agent_cache` (l.379) /
  * `_save_agent_cache_entry` (l.409) / `get_or_create_resources` (l.511) の
  * Cloudflare Worker (TS) port。
  *

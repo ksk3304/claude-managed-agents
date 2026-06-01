@@ -45,7 +45,6 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
-import { buildMailSendSkills } from '../lib/attached-skills';
 import { buildAllAttachmentBlocks } from '../lib/attachment-processing';
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
@@ -61,19 +60,37 @@ import {
 import { resolveChatAlias } from '../lib/chat-alias-resolver';
 import {
   fetchThreadMessages,
+  fetchRecentSpaceMessages,
   formatThreadHistoryWithMeta,
+  CHAT_APP_MESSAGES_READONLY_SCOPE,
   recordHistoryFailure,
   clearHistoryFailure,
   handleHistoryFetchPermanentFailure,
   isHistoryPermanentlyFailed,
+  type ChatHistoryDeps,
+  type ThreadHistoryMessage,
 } from '../lib/chat-history';
+import { getChatReadonlyAccessToken } from '../lib/chat-oauth';
 import {
   fetchSpaceMemberRoster,
+  buildSpaceRosterBlock,
   buildSpaceContextBlock,
+  computeRosterHash,
+  sanitizeRosterDisplayName,
   type RosterFetchResult,
 } from '../lib/space-roster';
+import {
+  clearPendingSpeakerAlias,
+  extractAliasLabelFromConfirmation,
+  readPendingSpeakerAlias,
+  readSpeakerAlias,
+  writePendingSpeakerAlias,
+  writeSpeakerAlias,
+  type PendingSpeakerAlias,
+} from '../lib/speaker-alias-ledger';
 import { applyChatPostGateToText } from '../lib/speaker-gate';
 import { isMailSendApprovalText, isMailSendApprovalTurn } from '../lib/mail-confirmation';
+import { detectExternalDataProvenance } from '../lib/provenance-check';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
 import {
   parseCostGuardCommand,
@@ -106,7 +123,11 @@ import {
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
 import { sendAndStreamWithToolDispatch } from '../lib/session';
-import { scrubInternalStateForChat } from '../redact/internal-state';
+import {
+  maskInternalStateForChat,
+  scrubInternalStateForChat,
+  softenBenignInternalReferencesForChat,
+} from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { recordSentMessage } from '../storage';
 import { executeWithCommit } from '../lib/three-stage-precheck';
@@ -179,6 +200,7 @@ export async function handleChatEvent(
   void ctx; // 中間版では使わない。完全 port (waitUntil 経路) で利用余地
 
   const { eventKey, claim, payload } = body;
+  const webhookPlaceholderName = (body.placeholderMessageName ?? '').trim();
 
   // ---- 1. claim 維持確認 ----
   const stillOwner = await confirmOwner(env.DB, eventKey, claim.owner, claim.version);
@@ -186,6 +208,7 @@ export async function handleChatEvent(
     console.warn(
       `[chat-event] lost_claim eventKey=${eventKey} owner=${claim.owner} version=${claim.version}`,
     );
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     return { kind: 'skipped', reason: 'lost_claim' };
   }
 
@@ -193,6 +216,7 @@ export async function handleChatEvent(
   const message = payload.message;
   if (!message) {
     console.warn(`[chat-event] no message field eventKey=${eventKey}`);
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_message' };
   }
@@ -202,6 +226,7 @@ export async function handleChatEvent(
   if (senderType === 'BOT') {
     // bot 自身の投稿 (= echo 防止)
     console.log(`[chat-event] skip BOT sender eventKey=${eventKey}`);
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'bot_sender' };
   }
@@ -220,9 +245,22 @@ export async function handleChatEvent(
   const isDm = isDmSpace(spaceType);
   const isForBot = isDm || isMentioningBot(annotations, botUserName);
   if (!isForBot) {
+    if (!isDm) {
+      await rememberRecentSpaceMessage(env, {
+        spaceName,
+        threadName,
+        messageName: message.name ?? '',
+        senderId: sender.name ?? '',
+        senderType: senderType ?? '',
+        text: rawText,
+        createTime: (message as { createTime?: string }).createTime ?? payload.eventTime ?? '',
+        receivedAtMs: body.receivedAtMs,
+      });
+    }
     console.log(
       `[chat-event] skip non-mention eventKey=${eventKey} space=${spaceName} type=${spaceType}`,
     );
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'not_for_bot' };
   }
@@ -231,6 +269,7 @@ export async function handleChatEvent(
   // startIndex + length 範囲を正確に切り出す (= 先頭以外の mention や
   // 複数 mention も漏れなく除去、Issue #186 既知 #10 解消)。
   let bodyText = stripMentions(rawText, annotations);
+  const isMentionOnlyTurn = bodyText.length === 0;
   if (bodyText.length === 0) {
     if (threadName) {
       // Cloud Run l.3903-3906 と同等: mention のみのとき、文脈追従指示で agent に渡す
@@ -238,7 +277,14 @@ export async function handleChatEvent(
         '（メンションのみで本文がありません。直前のスレッドの文脈に沿って応答してください）';
     } else {
       // Cloud Run l.3895-3902 同等: 空メッセージはその旨を投稿して終了
-      await safePost(env, spaceName, '（空メッセージ）', threadName, eventKey);
+      await safeReplyOrPatch(
+        env,
+        webhookPlaceholderName,
+        spaceName,
+        '（空メッセージ）',
+        threadName,
+        eventKey,
+      );
       await safeCommit(env, eventKey, claim);
       return { kind: 'committed' };
     }
@@ -248,6 +294,7 @@ export async function handleChatEvent(
   const senderEmail = ((sender as { email?: string }).email || '').trim().toLowerCase();
   if (!senderEmail) {
     console.warn(`[chat-event] no sender email eventKey=${eventKey}`);
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_sender_email' };
   }
@@ -268,6 +315,7 @@ export async function handleChatEvent(
     console.warn(
       `[chat-event] unknown_sender eventKey=${eventKey} email=${redactPiiInText(senderEmail)}`,
     );
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'unknown_sender' };
   }
@@ -277,6 +325,21 @@ export async function handleChatEvent(
       `[chat-event] mapping_default_fallback eventKey=${eventKey} ` +
         `email=${redactPiiInText(senderEmail)} default_slug=${userMapping.user_slug}`,
     );
+  }
+
+  if (!isDm) {
+    const aliasConfirmed = await maybeHandleSpeakerAliasConfirmation(env, {
+      eventKey,
+      claim,
+      spaceName,
+      threadName,
+      senderEmail,
+      bodyText,
+      placeholderName: webhookPlaceholderName,
+    });
+    if (aliasConfirmed) {
+      return { kind: 'committed' };
+    }
   }
 
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
@@ -290,7 +353,7 @@ export async function handleChatEvent(
         guardDeps: { kv: env.MAKOTO_KV },
       },
     );
-    await safePost(env, spaceName, cgText, threadName, eventKey);
+    await safeReplyOrPatch(env, webhookPlaceholderName, spaceName, cgText, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
     console.log(
       `[chat-event] /costguard handled eventKey=${eventKey} sub=${cgCommand.subcommand}`,
@@ -308,7 +371,14 @@ export async function handleChatEvent(
       console.log(
         `[chat-event] slash decided eventKey=${eventKey} source=${slashOutcome.source} chars=${slashOutcome.text.length}`,
       );
-      await safePost(env, spaceName, slashOutcome.text, threadName, eventKey);
+      await safeReplyOrPatch(
+        env,
+        webhookPlaceholderName,
+        spaceName,
+        slashOutcome.text,
+        threadName,
+        eventKey,
+      );
       await safeCommit(env, eventKey, claim);
       return { kind: 'committed' };
     }
@@ -318,6 +388,23 @@ export async function handleChatEvent(
           `attach_memory=${slashOutcome.attachMemory} (agent path)`,
       );
     }
+  }
+
+  const provenance = detectExternalDataProvenance(bodyText);
+  const provenanceForEnvelope =
+    provenance.classification === 'external_data'
+      ? {
+          classification: provenance.classification,
+          hitAxes: provenance.hitAxes,
+          score: provenance.score,
+          summary: provenance.summary,
+        }
+      : undefined;
+  if (provenanceForEnvelope) {
+    console.warn(
+      `[chat-event] external_data detected eventKey=${eventKey} ` +
+        `axes=${provenance.hitAxes.join(',')} score=${provenance.score}`,
+    );
   }
 
   // ---- 5b. thread history prepend (Issue #186 A 業務影響大) ----
@@ -339,21 +426,42 @@ export async function handleChatEvent(
   // 履歴自体存在しないため、初期値 false のまま CHAT_POST も自然に通る。
   let hasUnresolvedSpeakers = false;
   let historyBlock = '';
+  let recentContextBlock = '';
+  let rosterResult: RosterFetchResult | null = null;
+  if (!isDm && env.CHAT_SA_KEY_JSON) {
+    try {
+      rosterResult = await fetchSpaceMemberRoster(
+        { saKeyJson: env.CHAT_SA_KEY_JSON },
+        spaceName,
+      );
+    } catch (err) {
+      console.warn(
+        `[chat-event] roster fetch threw eventKey=${eventKey} space=${spaceName}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  const historyDeps = buildChatHistoryDeps(env);
   const shouldFetchHistory =
     threadName !== null &&
-    Boolean(env.CHAT_SA_KEY_JSON) &&
+    historyDeps !== null &&
     (!isDm || isMailSendApprovalText(bodyText));
   if (shouldFetchHistory) {
     const isPermFail = await isHistoryPermanentlyFailed(env.MAKOTO_KV, threadName);
     if (!isPermFail) {
       try {
-        const history = await fetchThreadMessages(
-          { saKeyJson: env.CHAT_SA_KEY_JSON! },
+        const history = await fetchThreadMessagesWithFallback(env, spaceName, threadName, {
+          primaryDeps: historyDeps,
+        });
+        const speakerLabels = await buildSpeakerLabelMap(
+          env,
           spaceName,
-          threadName,
+          rosterResult,
+          collectSenderIds(history),
         );
         const historyResult = formatThreadHistoryWithMeta(history, {
           currentMessageName: message.name ?? '',
+          speakerLabels,
+          requireKnownHumanSpeaker: !isDm,
         });
         historyBlock = historyResult.text;
         if (historyResult.unresolvedCount > 0) {
@@ -380,6 +488,49 @@ export async function handleChatEvent(
       }
     }
   }
+  if (!isDm && isMentionOnlyTurn) {
+    let recentContext = await buildRecentMentionOnlyContextFromChatApi(env, spaceName, {
+      currentMessageName: message.name ?? '',
+      limit: 3,
+      roster: rosterResult,
+      historyDeps,
+    });
+    if (!recentContext.text && recentContext.unresolvedSpeakers.length === 0) {
+      recentContext = await buildRecentMentionOnlyContext(env, spaceName, {
+        currentMessageName: message.name ?? '',
+        limit: 3,
+        roster: rosterResult,
+      });
+    }
+    if (recentContext.unresolvedSpeakers.length > 0) {
+      await askSpeakerAliasConfirmation(env, {
+        eventKey,
+        claim,
+        spaceName,
+        threadName,
+        requestedByEmail: senderEmail,
+        unresolved: recentContext.unresolvedSpeakers[0]!,
+        placeholderName: webhookPlaceholderName,
+      });
+      return { kind: 'committed' };
+    }
+    recentContextBlock = recentContext.text;
+  }
+  const combinedHistoryBlock = [recentContextBlock, historyBlock]
+    .filter((block) => block.trim().length > 0)
+    .join('\n\n');
+  if (!isDm && isMentionOnlyTurn && combinedHistoryBlock.length === 0) {
+    await safeReplyOrPatch(
+      env,
+      webhookPlaceholderName,
+      spaceName,
+      '直前の発話を取得できませんでした。Google Chat の履歴取得権限か、アプリがこのスペースの公開メッセージを読む権限を持っていない可能性があります。本文つきで呼びかけてください。',
+      threadName,
+      eventKey,
+    );
+    await safeCommit(env, eventKey, claim);
+    return { kind: 'committed' };
+  }
 
   // ---- 5c. Space context + roster prepend (Issue #186 C 業務影響大) ----
   // shared space + chat-api key 有り時、「ここは何の space で、誰がいる、
@@ -399,23 +550,29 @@ export async function handleChatEvent(
   // 履歴 latch と同じ権限事故源 (= unknown member 混在 thread からの横展開)
   // のため、保守的に gate 側へ倒す (= 「分からない時は止める」)。
   let speakerContextBlock = '';
-  if (!isDm && env.CHAT_SA_KEY_JSON) {
+  let rosterBlock = '';
+  let rosterHash: string | null = null;
+  if (!isDm && rosterResult) {
     try {
-      const rosterResult: RosterFetchResult = await fetchSpaceMemberRoster(
-        { saKeyJson: env.CHAT_SA_KEY_JSON },
-        spaceName,
-      );
       const contextBlock = buildSpaceContextBlock(
         space as { name?: string; displayName?: string; type?: string },
         { name: sender.name, displayName: (sender as { displayName?: string }).displayName },
-        { threadName, roster: rosterResult },
+        { threadName },
       );
       if (contextBlock) {
         speakerContextBlock = contextBlock;
+      }
+      const rosterBlockResult = buildSpaceRosterBlock(rosterResult, { isDm });
+      if (rosterBlockResult.block) {
+        rosterBlock = rosterBlockResult.block;
+        rosterHash = computeRosterHash(rosterResult);
+      }
+      if (contextBlock || rosterBlockResult.reason) {
         if (rosterResult.kind === 'roster') {
           console.log(
             `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
-              `space=${spaceName} member_count=${rosterResult.members.size}`,
+              `space=${spaceName} member_count=${rosterResult.members.size} ` +
+              `roster_reason=${rosterBlockResult.reason} roster_hash=${rosterHash ?? 'n/a'}`,
           );
         } else {
           console.warn(
@@ -441,19 +598,10 @@ export async function handleChatEvent(
       );
     }
   }
-  // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
-  // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
-  // intent-detector に通して以下を決定:
-  //   - `isActionSkill=true` なら orchestrator に `forceFreshSession=true` を
-  //     渡し既存 thread session 継続を破棄 (Python l.4002-4013 等価)
-  //   - mail intent / schedule intent の log を出力 (Python l.4027/4031 等価)
-  //   - intent 種別を user message envelope の <context> に prefix 注入
-  //     (= context 質向上、agent が intent を考慮した応答を返しやすくする)
-  // 危険語句 / 過剰 dispatch 防止:
-  //   - intent 判定はあくまで「session 経路 + context prefix 注入」までで、
-  //     ここで /mail や /schedule の skill 自体を invoke することはしない
-  //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
-  //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
+  // ---- 5d. intent detection ----
+  // intent は user message envelope の <context> に prefix 注入するだけ。
+  // Cloudflare版の正本仕様どおり、skill 実行や mail intent を理由に
+  // fresh session / skill 専用 agent へ逃がさない。
   let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
   if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
@@ -461,7 +609,6 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
-  const forceFreshSession = intent?.isActionSkill === true;
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -472,18 +619,13 @@ export async function handleChatEvent(
         `[chat-event] schedule intent detected eventKey=${eventKey} command=${intent.command}`,
       );
     }
-    if (forceFreshSession) {
-      console.log(
-        `[chat-event] continuation discarded for action skill eventKey=${eventKey} ` +
-          `command=${intent.command} source=${intent.source}`,
-      );
-    }
   }
 
   // ---- 6. orchestrate session ----
   const client = buildAnthropicClient(env);
   if (client === null) {
     console.error(`[chat-event] no Anthropic API key eventKey=${eventKey}`);
+    await safeClearWebhookPlaceholder(env, webhookPlaceholderName, eventKey);
     await safeCommit(env, eventKey, claim);
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
@@ -495,6 +637,7 @@ export async function handleChatEvent(
   // 失敗で全体落とさないため try/catch で吸収し、cleanup は finally で必ず実行。
   let attachmentBlocks: Awaited<ReturnType<typeof buildAllAttachmentBlocks>> = {
     extraBlocks: [],
+    sessionFileResources: [],
     notice: null,
     uploadedFileIds: [],
     cleanup: async () => undefined,
@@ -509,6 +652,7 @@ export async function handleChatEvent(
         console.log(
           `[chat-event] attachments wired eventKey=${eventKey} ` +
             `blocks=${attachmentBlocks.extraBlocks.length} ` +
+            `session_files=${attachmentBlocks.sessionFileResources.length} ` +
             `uploaded=${attachmentBlocks.uploadedFileIds.length}`,
         );
       }
@@ -521,14 +665,7 @@ export async function handleChatEvent(
   }
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
-  const attachedSkills =
-    intent?.command === '/mail' ? buildMailSendSkills(env) : [];
-  if (intent?.command === '/mail' && attachedSkills.length === 0) {
-    console.warn(
-      `[chat-event] mail intent without MAIL_SEND_SKILL_ID eventKey=${eventKey}`,
-    );
-  }
-
+  const fileResources = attachmentBlocks.sessionFileResources;
   // ---- 6a. placeholder POST (#186 UX 致命傷) ----
   // session.create + LLM stream (24-45 秒) 前に短い ack を Chat に POST
   // し、Chat client の「MAKOTOくん から応答ありません」timeout 表示を
@@ -536,7 +673,9 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey, claim);
+  const placeholderName =
+    body.placeholderMessageName ||
+    (await safePostPlaceholder(env, spaceName, threadName, eventKey, claim));
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -558,8 +697,10 @@ export async function handleChatEvent(
         personaSpec: PERSONA_SPEC,
         toolsSpec: TOOLS_SPEC,
         extraContentBlocks,
-        ...(historyBlock ? { historyBlock } : {}),
+        ...(fileResources.length > 0 ? { fileResources } : {}),
+        ...(combinedHistoryBlock ? { historyBlock: combinedHistoryBlock } : {}),
         ...(speakerContextBlock ? { speakerContextBlock } : {}),
+        ...(rosterBlock && rosterHash ? { rosterBlock, rosterHash } : {}),
         ...(intent
           ? {
               intent: {
@@ -569,7 +710,10 @@ export async function handleChatEvent(
               },
             }
           : {}),
-        ...(attachedSkills.length > 0 ? { attachedSkills } : {}),
+        ...(provenanceForEnvelope ? { provenance: provenanceForEnvelope } : {}),
+        onSessionResolved: (resolvedSessionId) => {
+          sessionIdRef.current = resolvedSessionId;
+        },
         toolDispatcher: (toolName, toolInput) =>
           dispatchMakotoTool(toolName, toolInput, {
             env,
@@ -577,9 +721,6 @@ export async function handleChatEvent(
             boundMessageId: '',
             callerSessionId: sessionIdRef.current,
           }),
-        // Issue #186 既知 #4 intent-detector 統合: action skill (= attach_memory=
-        // false) 起動時は KV thread session lookup/put を bypass。
-        forceFreshSession,
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
@@ -765,19 +906,38 @@ export async function handleChatEvent(
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
-  const scrubbed = scrubInternalStateForChat(scheduleResult.cleanedText, `chat:${sessionId}`);
-  if (scrubbed.hits.length > 0) {
+  const softened = softenBenignInternalReferencesForChat(scheduleResult.cleanedText);
+  if (softened.replacements.length > 0) {
     console.warn(
-      `[chat-event] internal-state redactor scrubbed eventKey=${eventKey} hits=${scrubbed.hits.join(',')}`,
+      `[chat-event] benign internal references softened eventKey=${eventKey} ` +
+        `replacements=${softened.replacements.join(',')}`,
     );
   }
+  const masked = maskInternalStateForChat(softened.text);
+  if (masked.hits.length > 0) {
+    console.warn(
+      `[chat-event] internal-state redactor masked eventKey=${eventKey} hits=${masked.hits.join(',')}`,
+    );
+  }
+  const visibleText =
+    masked.hits.length > 0
+      ? `${masked.text}\n\n（内部運用表現を一部伏せました。回答本文は表示しています。）`
+      : masked.text;
   // 添付処理の notice を本文末尾に追記 (Python では `_build_*_attachments` の
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
   const finalText = attachmentNotice
-    ? `${scrubbed.text}\n\n${attachmentNotice}`.trim()
-    : scrubbed.text;
-  if (finalText.trim().length > 0) {
+    ? `${visibleText}\n\n${attachmentNotice}`.trim()
+    : visibleText;
+  const chatReplyText =
+    finalText.trim().length > 0
+      ? finalText
+      : 'CMA は処理を完了しましたが、Chat に表示できる本文が空でした。副作用マーカーだけが出力された可能性があります。';
+  if (finalText.trim().length === 0) {
+    console.warn(
+      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting visible notice`,
+    );
+  }
     // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
     // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
     // WARN log + safePost に fallback (= bot 全体は落とさない、Python
@@ -795,9 +955,9 @@ export async function handleChatEvent(
       target: `${spaceName}:${threadName ?? ''}`,
       sendFn: async () => {
         if (placeholderName) {
-          await safeUpdateOrPost(env, placeholderName, spaceName, finalText, threadName, eventKey);
+          await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
         } else {
-          await safePost(env, spaceName, finalText, threadName, eventKey);
+          await safePost(env, spaceName, chatReplyText, threadName, eventKey);
         }
         // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
         return undefined as unknown as void;
@@ -816,17 +976,6 @@ export async function handleChatEvent(
         `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
       );
     }
-  } else {
-    console.log(
-      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}`,
-    );
-    // 本文空 = 投稿すべきテキスト無し。placeholder 残骸を消す
-    // (Python では placeholder のまま残るが、TS では `_delete_chat_message`
-    // 経路で残骸を出さない方が UX 上素直 = #186 の主旨に沿う)。
-    if (placeholderName) {
-      await safeDeletePlaceholder(env, placeholderName, eventKey);
-    }
-  }
 
   // ---- 8. session-log memory append ----
   await safeAppendSessionLog(env, {
@@ -840,7 +989,7 @@ export async function handleChatEvent(
     sender,
     threadName,
     userText: bodyText,
-    finalText,
+    finalText: chatReplyText,
     sessionId,
     messageId: message.name,
   });
@@ -1205,6 +1354,405 @@ function isDmSpace(spaceType: string): boolean {
   return up === 'DM' || up === 'DIRECT_MESSAGE';
 }
 
+const RECENT_SPACE_CONTEXT_TTL_SEC = 2 * 60 * 60;
+const RECENT_SPACE_CONTEXT_MAX = 20;
+
+interface RecentSpaceMessage {
+  spaceName: string;
+  threadName: string | null;
+  messageName: string;
+  senderId: string;
+  senderType: string;
+  text: string;
+  createTime: string;
+  receivedAtMs: number;
+}
+
+interface RecentMentionOnlyContext {
+  text: string;
+  unresolvedSpeakers: Array<{
+    senderId: string;
+    messageName: string;
+    text: string;
+  }>;
+}
+
+function recentSpaceContextKey(spaceName: string): string {
+  return `chat_recent:${spaceName}`;
+}
+
+async function rememberRecentSpaceMessage(
+  env: Env,
+  input: RecentSpaceMessage,
+): Promise<void> {
+  const text = input.text.trim();
+  if (!input.spaceName || !text) return;
+  try {
+    const key = recentSpaceContextKey(input.spaceName);
+    const raw = await env.MAKOTO_KV.get(key);
+    const current = parseRecentSpaceMessages(raw);
+    const next = current
+      .filter((m) => m.messageName !== input.messageName)
+      .concat({ ...input, text })
+      .slice(-RECENT_SPACE_CONTEXT_MAX);
+    await env.MAKOTO_KV.put(key, JSON.stringify(next), {
+      expirationTtl: RECENT_SPACE_CONTEXT_TTL_SEC,
+    });
+  } catch (err) {
+    console.warn(
+      `[chat-event] recent context remember failed space=${input.spaceName}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+async function buildRecentMentionOnlyContext(
+  env: Env,
+  spaceName: string,
+  options: {
+    currentMessageName: string;
+    limit: number;
+    roster: RosterFetchResult | null;
+  },
+): Promise<RecentMentionOnlyContext> {
+  try {
+    const raw = await env.MAKOTO_KV.get(recentSpaceContextKey(spaceName));
+    const messages = parseRecentSpaceMessages(raw)
+      .filter((m) => m.messageName !== options.currentMessageName)
+      .slice(-Math.max(1, options.limit));
+    return buildRecentMentionOnlyContextFromMessages(env, spaceName, options.roster, messages);
+  } catch (err) {
+    console.warn(
+      `[chat-event] recent context read failed space=${spaceName}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return { text: '', unresolvedSpeakers: [] };
+  }
+}
+
+async function buildRecentMentionOnlyContextFromChatApi(
+  env: Env,
+  spaceName: string,
+  options: {
+    currentMessageName: string;
+    limit: number;
+    roster: RosterFetchResult | null;
+    historyDeps: ChatHistoryDeps | null;
+  },
+): Promise<RecentMentionOnlyContext> {
+  if (!options.historyDeps) return { text: '', unresolvedSpeakers: [] };
+  try {
+    const recent = await fetchRecentSpaceMessagesWithFallback(env, spaceName, {
+      primaryDeps: options.historyDeps,
+      pageSize: Math.max(5, options.limit + 2),
+    });
+    const messages: RecentSpaceMessage[] = recent
+      .filter((m) => m.name !== options.currentMessageName)
+      .filter((m) => m.text.trim().length > 0)
+      .slice(-Math.max(1, options.limit))
+      .map((m) => ({
+        spaceName,
+        threadName: null,
+        messageName: m.name,
+        senderId: m.senderId,
+        senderType: m.senderType,
+        text: m.text,
+        createTime: m.createTime,
+        receivedAtMs: Date.now(),
+      }));
+    return buildRecentMentionOnlyContextFromMessages(env, spaceName, options.roster, messages);
+  } catch (err) {
+    console.warn(
+      `[chat-event] recent space fetch failed space=${spaceName}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return { text: '', unresolvedSpeakers: [] };
+  }
+}
+
+async function fetchRecentSpaceMessagesWithFallback(
+  env: Env,
+  spaceName: string,
+  options: { primaryDeps: ChatHistoryDeps; pageSize: number },
+): Promise<ThreadHistoryMessage[]> {
+  try {
+    return await fetchRecentSpaceMessages(options.primaryDeps, spaceName, {
+      pageSize: options.pageSize,
+    });
+  } catch (err) {
+    const primaryReason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[chat-event] recent space fetch primary failed space=${spaceName}: ${primaryReason}`,
+    );
+    if (!env.CHAT_SA_KEY_JSON) throw err;
+    try {
+      const fallback = await fetchRecentSpaceMessages(
+        {
+          saKeyJson: env.CHAT_SA_KEY_JSON,
+          scopes: [CHAT_APP_MESSAGES_READONLY_SCOPE],
+        },
+        spaceName,
+        { pageSize: options.pageSize },
+      );
+      console.log(
+        `[chat-event] recent space fetch app-auth fallback ok space=${spaceName} msgs=${fallback.length}`,
+      );
+      return fallback;
+    } catch (fallbackErr) {
+      const fallbackReason =
+        fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      console.warn(
+        `[chat-event] recent space fetch app-auth fallback failed space=${spaceName}: ${fallbackReason}`,
+      );
+      throw err;
+    }
+  }
+}
+
+async function buildRecentMentionOnlyContextFromMessages(
+  env: Env,
+  spaceName: string,
+  roster: RosterFetchResult | null,
+  messages: readonly RecentSpaceMessage[],
+): Promise<RecentMentionOnlyContext> {
+  if (messages.length === 0) return { text: '', unresolvedSpeakers: [] };
+  const speakerLabels = await buildSpeakerLabelMap(
+    env,
+    spaceName,
+    roster,
+    messages.map((m) => m.senderId),
+  );
+  const lines = [
+    '## 直前のスペース発話候補（mention-only補完）',
+    '注: 今回のメンション本文が空のため、直前発話候補を今回依頼の補完候補として優先してください。',
+  ];
+  const unresolvedSpeakers: RecentMentionOnlyContext['unresolvedSpeakers'] = [];
+  for (const m of messages) {
+    const label =
+      m.senderType.toUpperCase() === 'BOT'
+        ? 'bot'
+        : speakerLabels.get(m.senderId) ?? '';
+    if (!label) {
+      unresolvedSpeakers.push({
+        senderId: m.senderId,
+        messageName: m.messageName,
+        text: m.text,
+      });
+      continue;
+    }
+    lines.push(`- [${label}] ${m.text}`);
+  }
+  return {
+    text: lines.length > 2 ? lines.join('\n') : '',
+    unresolvedSpeakers,
+  };
+}
+
+function parseRecentSpaceMessages(raw: string | null): RecentSpaceMessage[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): RecentSpaceMessage[] => {
+      if (!item || typeof item !== 'object') return [];
+      const m = item as Partial<RecentSpaceMessage>;
+      if (typeof m.spaceName !== 'string' || typeof m.text !== 'string') return [];
+      return [
+        {
+          spaceName: m.spaceName,
+          threadName: typeof m.threadName === 'string' ? m.threadName : null,
+          messageName: typeof m.messageName === 'string' ? m.messageName : '',
+          senderId: typeof m.senderId === 'string' ? m.senderId : '',
+          senderType: typeof m.senderType === 'string' ? m.senderType : '',
+          text: m.text,
+          createTime: typeof m.createTime === 'string' ? m.createTime : '',
+          receivedAtMs: typeof m.receivedAtMs === 'number' ? m.receivedAtMs : 0,
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function buildSpeakerLabelMap(
+  env: Env,
+  spaceName: string,
+  roster: RosterFetchResult | null,
+  senderIds: readonly string[],
+): Promise<Map<string, string>> {
+  const labels = new Map<string, string>();
+  if (roster?.kind === 'roster') {
+    for (const [senderId, displayName] of roster.members.entries()) {
+      const safe = sanitizeRosterDisplayName(displayName);
+      if (safe) labels.set(senderId, safe);
+    }
+  }
+  const unique = Array.from(new Set(senderIds.filter(Boolean)));
+  await Promise.all(
+    unique.map(async (senderId) => {
+      if (labels.has(senderId)) return;
+      const alias = await readSpeakerAlias(env.MAKOTO_KV, spaceName, senderId);
+      if (alias?.label) labels.set(senderId, alias.label);
+    }),
+  );
+  return labels;
+}
+
+function collectSenderIds(messages: readonly ThreadHistoryMessage[]): string[] {
+  return messages
+    .filter((m) => (m.senderType || '').toUpperCase() === 'HUMAN')
+    .map((m) => m.senderId)
+    .filter(Boolean);
+}
+
+async function fetchThreadMessagesWithFallback(
+  env: Env,
+  spaceName: string,
+  threadName: string,
+  options: { primaryDeps: ChatHistoryDeps },
+): Promise<ThreadHistoryMessage[]> {
+  try {
+    return await fetchThreadMessages(options.primaryDeps, spaceName, threadName);
+  } catch (err) {
+    const primaryReason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[chat-event] thread history primary failed space=${spaceName} thread=${threadName}: ${primaryReason}`,
+    );
+    if (!env.CHAT_SA_KEY_JSON) throw err;
+    try {
+      const fallback = await fetchThreadMessages(
+        {
+          saKeyJson: env.CHAT_SA_KEY_JSON,
+          scopes: [CHAT_APP_MESSAGES_READONLY_SCOPE],
+        },
+        spaceName,
+        threadName,
+      );
+      console.log(
+        `[chat-event] thread history app-auth fallback ok space=${spaceName} thread=${threadName} msgs=${fallback.length}`,
+      );
+      return fallback;
+    } catch (fallbackErr) {
+      const fallbackReason =
+        fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      console.warn(
+        `[chat-event] thread history app-auth fallback failed space=${spaceName} thread=${threadName}: ${fallbackReason}`,
+      );
+      throw err;
+    }
+  }
+}
+
+async function maybeHandleSpeakerAliasConfirmation(
+  env: Env,
+  input: {
+    eventKey: string;
+    claim: { owner: string; version: number };
+    spaceName: string;
+    threadName: string | null;
+    senderEmail: string;
+    bodyText: string;
+    placeholderName?: string;
+  },
+): Promise<boolean> {
+  const pending = await readPendingSpeakerAlias(
+    env.MAKOTO_KV,
+    input.spaceName,
+    input.senderEmail,
+  );
+  if (!pending) return false;
+  if (looksLikeNewRequest(input.bodyText)) return false;
+  const label = extractAliasLabelFromConfirmation(input.bodyText);
+  if (!label) return false;
+  await writeSpeakerAlias(env.MAKOTO_KV, pending.spaceName, pending.senderId, label, {
+    confirmedByEmail: input.senderEmail,
+  });
+  await clearPendingSpeakerAlias(env.MAKOTO_KV, input.spaceName, input.senderEmail);
+  await safeReplyOrPatch(
+    env,
+    input.placeholderName ?? '',
+    input.spaceName,
+    `覚えました。以後このスペースでは「${label}」として扱います。`,
+    input.threadName,
+    input.eventKey,
+  );
+  await safeCommit(env, input.eventKey, input.claim);
+  return true;
+}
+
+async function askSpeakerAliasConfirmation(
+  env: Env,
+  input: {
+    eventKey: string;
+    claim: { owner: string; version: number };
+    spaceName: string;
+    threadName: string | null;
+    requestedByEmail: string;
+    unresolved: { senderId: string; messageName: string; text: string };
+    placeholderName?: string;
+  },
+): Promise<void> {
+  const snippet = speakerAliasQuestionSnippet(input.unresolved.text);
+  const pending: PendingSpeakerAlias = {
+    spaceName: input.spaceName,
+    senderId: input.unresolved.senderId,
+    messageName: input.unresolved.messageName,
+    messageText: snippet,
+    requestedByEmail: input.requestedByEmail,
+    createdAtMs: Date.now(),
+  };
+  await writePendingSpeakerAlias(env.MAKOTO_KV, pending);
+  await safeReplyOrPatch(
+    env,
+    input.placeholderName ?? '',
+    input.spaceName,
+    `直前の「${snippet}」と発言した方、どなたとして扱えばよいですか？一度教えてもらえれば、このスペースでは次回から覚えます。`,
+    input.threadName,
+    input.eventKey,
+  );
+  await safeCommit(env, input.eventKey, input.claim);
+}
+
+function speakerAliasQuestionSnippet(text: string): string {
+  const trimmed = text.replace(/\s+/g, ' ').trim();
+  if (trimmed.length <= 48) return trimmed || '本文なし';
+  return `${trimmed.slice(0, 48)}…`;
+}
+
+function looksLikeNewRequest(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length > 80) return true;
+  return /(教えて|お願い|ください|して|調べて|作って|やって|確認|一覧|天気|[?？])/.test(t);
+}
+
+function buildChatHistoryDeps(env: Env): ChatHistoryDeps | null {
+  const clientId = (env.GCHAT_OAUTH_CLIENT_ID ?? '').trim();
+  const clientSecret = (env.GCHAT_OAUTH_CLIENT_SECRET ?? '').trim();
+  const vaultKey = (env.OAUTH_VAULT_KEY ?? '').trim();
+  if (clientId && clientSecret && vaultKey) {
+    return {
+      accessTokenProvider: async () => {
+        const token = await getChatReadonlyAccessToken({
+          kv: env.MAKOTO_KV,
+          vaultKeyB64: vaultKey,
+          clientId,
+          clientSecret,
+          refreshTokenSeed: env.GCHAT_OAUTH_REFRESH_TOKEN_SEED ?? '',
+        });
+        return token.access_token;
+      },
+    };
+  }
+  if (env.CHAT_SA_KEY_JSON) {
+    return { saKeyJson: env.CHAT_SA_KEY_JSON };
+  }
+  return null;
+}
+
 /**
  * session.ts の `stopReason` を Python `_CAP_STOP_REASONS` 用語に正規化する。
  * Python 一次ソース (`scripts/cma_lib.py:l.59`):
@@ -1297,6 +1845,30 @@ async function safePost(
       `[chat-event] safePost fail eventKey=${eventKey} space=${spaceName}: ${reason}`,
     );
   }
+}
+
+async function safeReplyOrPatch(
+  env: Env,
+  placeholderName: string,
+  spaceName: string,
+  text: string,
+  threadName: string | null,
+  eventKey: string,
+): Promise<void> {
+  if (placeholderName) {
+    await safeUpdateOrPost(env, placeholderName, spaceName, text, threadName, eventKey);
+    return;
+  }
+  await safePost(env, spaceName, text, threadName, eventKey);
+}
+
+async function safeClearWebhookPlaceholder(
+  env: Env,
+  placeholderName: string,
+  eventKey: string,
+): Promise<void> {
+  if (!placeholderName) return;
+  await safeDeletePlaceholder(env, placeholderName, eventKey);
 }
 
 /**
@@ -1617,8 +2189,8 @@ function loadSlashSkillsData(env: Env): SkillsData {
 //                       永続層が必要、Issue #186 follow-up)。Phase 2 では
 //                       status のみ port 済 (= `cost-guard-command.ts`)。
 // TODO(#186 follow-up): cap-recovery 完全実装 (cap 超過後の memory snapshot)
-// Done (Issue #186 既知 #4): intent-detector 統合 (= forceFreshSession +
-//   bodyText intent prefix。完全な /mail /schedule skill dispatch 自体は
+// Done (Issue #186 既知 #4): intent-detector 統合 (= bodyText intent prefix。
+//   Cloudflare版正本どおり fresh session 化はしない。完全な /mail /schedule skill dispatch 自体は
 //   `_resolve_skill_run` 全体 port の follow-up に温存)。
 // TODO(#186 follow-up): Cold continuation の SignalB 経由 thread-self-scan
 // ✅ DONE (Issue #186 既知 #6): 未解決 speaker gate (= shared space で

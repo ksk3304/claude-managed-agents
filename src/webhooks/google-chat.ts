@@ -48,6 +48,7 @@ import {
   type ClaimResult,
 } from '../lib/dedupe';
 import { assertBridgeEgressAllowed } from '../lib/egress-guard';
+import { ChatApiError, deleteChatMessage, postChatMessage } from '../lib/chat-api';
 
 // ============================================================================
 // 型定義
@@ -118,7 +119,15 @@ export interface ChatQueueMessage {
   receivedAtMs: number;
   claim: { owner: string; version: number };
   payload: ChatEventPayload;
+  /**
+   * Message resource name for the synchronous placeholder posted from the
+   * webhook handler. Queue consumer patches this instead of posting a second
+   * placeholder. Empty/undefined means consumer falls back to its old flow.
+   */
+  placeholderMessageName?: string;
 }
+
+const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 
 // ============================================================================
 // 公開鍵 cache + fetch
@@ -527,12 +536,19 @@ export async function handleGoogleChatWebhook(
     return Response.json({ error: 'unexpected claim state' }, { status: 500 });
   }
 
+  // ---- 7a. synchronous placeholder ----
+  // Google Chat requires a real-time response within 30s, or an async Chat
+  // API message later. The heavy CMA turn runs in Queue, so post a short
+  // placeholder immediately and let the consumer PATCH it with the final text.
+  const placeholderMessageName = await safePostInteractionPlaceholder(env, event, eventKey);
+
   // ---- 7. Queue 投入 ----
   const queueMsg: ChatQueueMessage = {
     eventKey,
     receivedAtMs: Date.now(),
     claim: { owner: claim.owner, version: claim.version },
     payload: event,
+    ...(placeholderMessageName ? { placeholderMessageName } : {}),
   };
   try {
     await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
@@ -546,6 +562,9 @@ export async function handleGoogleChatWebhook(
         `[chat-webhook] releaseClaim after queue fail also failed cfRay=${cfRay}: ${releaseErr instanceof Error ? releaseErr.message : String(releaseErr)}`,
       );
     }
+    if (placeholderMessageName) {
+      await safeDeleteInteractionPlaceholder(env, placeholderMessageName, eventKey);
+    }
     console.error(
       `[chat-webhook] queue-send failed cfRay=${cfRay} eventKey=${eventKey}: ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -556,4 +575,60 @@ export async function handleGoogleChatWebhook(
     `[chat-webhook] enqueued eventKey=${eventKey} sender=${event.message.sender?.name ?? ''} cfRay=${cfRay}`,
   );
   return Response.json({});
+}
+
+async function safePostInteractionPlaceholder(
+  env: Env,
+  event: ChatEventPayload & { message: NonNullable<ChatEventPayload['message']> },
+  eventKey: string,
+): Promise<string> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  if (!saKey) return '';
+  const spaceName = event.space?.name ?? '';
+  if (!spaceName) return '';
+  const threadName = event.message.thread?.name ?? null;
+  try {
+    const posted = await postChatMessage(
+      { saKeyJson: saKey },
+      spaceName,
+      PLACEHOLDER_TEXT,
+      threadName
+        ? {
+            threadName,
+            threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
+          }
+        : {},
+    );
+    console.log(`[chat-webhook] placeholder posted eventKey=${eventKey}`);
+    return posted.name;
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(`[chat-webhook] placeholder post failed eventKey=${eventKey}: ${reason}`);
+    return '';
+  }
+}
+
+async function safeDeleteInteractionPlaceholder(
+  env: Env,
+  messageName: string,
+  eventKey: string,
+): Promise<void> {
+  const saKey = env.CHAT_SA_KEY_JSON;
+  if (!saKey) return;
+  try {
+    await deleteChatMessage({ saKeyJson: saKey }, messageName);
+  } catch (err) {
+    const reason =
+      err instanceof ChatApiError
+        ? `chat_api_${err.status}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.warn(`[chat-webhook] placeholder delete failed eventKey=${eventKey}: ${reason}`);
+  }
 }

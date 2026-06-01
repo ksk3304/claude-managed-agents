@@ -33,6 +33,7 @@ import {
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import { buildAnthropicClient } from "./lib/session";
+import { ANTHROPIC_BETA } from "./anthropic";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -81,6 +82,17 @@ export default {
       request.method === "POST"
     ) {
       return handleGoogleChatWebhook(request, env);
+    }
+
+    const debugSessionEventsMatch = url.pathname.match(
+      /^\/debug\/sessions\/([^/]+)\/events$/,
+    );
+    if (debugSessionEventsMatch && request.method === "GET") {
+      return handleDebugSessionEvents(
+        request,
+        env,
+        decodeURIComponent(debugSessionEventsMatch[1] || ""),
+      );
     }
 
     return new Response("not found", { status: 404 });
@@ -199,4 +211,106 @@ async function runDailyReportCron(env: Env): Promise<void> {
   } catch (error) {
     console.error("[cron] daily-report failed", error);
   }
+}
+
+async function handleDebugSessionEvents(
+  request: Request,
+  env: Env,
+  sessionId: string,
+): Promise<Response> {
+  const token = (env.MAKOTO_DEBUG_TOKEN || "").trim();
+  if (!token) return new Response("not found", { status: 404 });
+  const authz = request.headers.get("authorization") || "";
+  if (authz !== `Bearer ${token}`) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  if (!/^sesn_[A-Za-z0-9]+$/.test(sessionId)) {
+    return Response.json({ error: "invalid session id" }, { status: 400 });
+  }
+  const client = buildAnthropicClient(env);
+  if (!client) {
+    return Response.json({ error: "anthropic client unavailable" }, { status: 500 });
+  }
+
+  const url = new URL(request.url);
+  const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
+  const order = url.searchParams.get("order") === "desc" ? "desc" : "asc";
+  const typesRaw = (url.searchParams.get("types") || "").trim();
+  const types = typesRaw
+    ? typesRaw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 20)
+    : undefined;
+
+  const eventSummaries: Array<Record<string, unknown>> = [];
+  try {
+    const params: Record<string, unknown> = {
+      limit,
+      order,
+      betas: [ANTHROPIC_BETA],
+    };
+    if (types && types.length > 0) params.types = types;
+    for await (const event of client.beta.sessions.events.list(
+      sessionId,
+      params as never,
+    )) {
+      eventSummaries.push(summarizeDebugSessionEvent(event));
+      if (eventSummaries.length >= limit) break;
+    }
+  } catch (err) {
+    return Response.json(
+      {
+        error: "events.list failed",
+        message: err instanceof Error ? err.message : String(err),
+      },
+      { status: 502 },
+    );
+  }
+
+  return Response.json({
+    session_id: sessionId,
+    count: eventSummaries.length,
+    order,
+    types: types ?? null,
+    redacted: true,
+    event_summaries: eventSummaries,
+  });
+}
+
+export function summarizeDebugSessionEvent(event: unknown): Record<string, unknown> {
+  const src =
+    event && typeof event === "object" && !Array.isArray(event)
+      ? (event as Record<string, unknown>)
+      : {};
+  const out: Record<string, unknown> = {
+    type: typeof src.type === "string" ? src.type : "unknown",
+  };
+  if (typeof src.id === "string") out.id = src.id;
+  if (typeof src.created_at === "string") out.created_at = src.created_at;
+  if (typeof src.stop_reason === "string") out.stop_reason = src.stop_reason;
+  if (typeof src.name === "string") out.tool_name = src.name;
+  if (typeof src.custom_tool_use_id === "string") {
+    out.custom_tool_use_id = src.custom_tool_use_id;
+  }
+  if (typeof src.is_error === "boolean") out.is_error = src.is_error;
+  if (typeof src.text === "string") out.text_chars = src.text.length;
+  if (src.input !== undefined) out.input_redacted = true;
+  if (src.content !== undefined) out.content_redacted = true;
+  if (src.result !== undefined) out.result_redacted = true;
+  if (src.error !== undefined) out.error_redacted = true;
+  return out;
+}
+
+function clampInt(
+  raw: string | null,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }

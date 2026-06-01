@@ -16,15 +16,14 @@
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 2 #5 — Google Chat reactive bot, Phase B)
  * Spec: Day 3 subagent G task brief §設計確定事項 1
- * Source of truth (Python):
- *   - scripts/cma_gchat_bot.py l.494-512 (_session_key_for_thread)
+ * Source of truth:
+ *   - makoto-prime/products/makoto-kun/specs/cloudflare-agent-session-skill-design.md
  *   - scripts/cma_gchat_bot.py l.3784-       (_handle_event)
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { getOrCreateResources, type AgentCacheBindings } from './agent-cache';
-import { hasAttachedSkills } from './attached-skills';
+import { ANTHROPIC_BETA } from '../anthropic';
 import type { UserMappingValue } from './memory-attach';
 import {
   buildAnthropicClient,
@@ -40,37 +39,86 @@ import {
   type SystemPromptResult,
 } from './persona-builder';
 import { toResourceParam } from '../types/memory';
-import type { MemoryStoreResourceParam } from '../types/memory';
+import type {
+  FileResourceParam,
+  MemoryStoreResourceParam,
+  SessionResourceParam,
+} from '../types/memory';
 import {
   buildUserMessageEnvelope,
   type IntentEnvelopeOption,
   type SpeakerEnvelopeOption,
   type CapEnvelopeOption,
+  type ProvenanceEnvelopeOption,
 } from './user-message-envelope';
-
 /** KV key prefix for thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
+const KV_CHAT_THREAD_ROSTER_HASH_SUFFIX = ':roster_hash';
 
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
 
 /**
- * `_session_key_for_thread` (Python l.494-512) と byte 等価な KV key を
- * 組み立てる純関数。sender_email + space + thread の三つ組で per-user per-thread
- * に振り分ける (issue #1119 = per-user 化)。いずれかが空なら null を返し、
- * 毎回新規 session として扱わせる (fail-closed)。
+ * Cloudflare版の session 正本に合わせた KV key を組み立てる純関数。
+ * `user_mapping.agent_id` + `ENVIRONMENT_ID` を key に含め、email ではなく社員
+ * agent を owner 正本にする。いずれかが空なら null を返し、毎回新規 session
+ * として扱わせる (fail-closed)。
  */
 export function chatThreadSessionKey(
-  senderEmail: string,
+  agentId: string,
+  environmentId: string,
   spaceName: string,
   threadName: string | null | undefined,
 ): string | null {
-  const email = (senderEmail || '').trim().toLowerCase();
+  const agent = (agentId || '').trim();
+  const environment = (environmentId || '').trim();
   const space = (spaceName || '').trim();
   const thread = (threadName || '').trim();
-  if (!email || !space || !thread) return null;
-  return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}`;
+  if (!agent || !environment || !space || !thread) return null;
+  return `${KV_CHAT_THREAD_SESSION_PREFIX}:${agent}:${environment}:${space}:${thread}`;
+}
+
+interface ChatThreadSessionRecord {
+  session_id: string;
+  agent_id: string;
+  environment_id: string;
+  space_name: string;
+  thread_name: string;
+}
+
+function parseChatThreadSessionRecord(
+  raw: string | null,
+  expected: Omit<ChatThreadSessionRecord, 'session_id'>,
+): ChatThreadSessionRecord | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  const sessionId = typeof record.session_id === 'string' ? record.session_id.trim() : '';
+  if (!sessionId) return null;
+  const candidate: ChatThreadSessionRecord = {
+    session_id: sessionId,
+    agent_id: typeof record.agent_id === 'string' ? record.agent_id.trim() : '',
+    environment_id:
+      typeof record.environment_id === 'string' ? record.environment_id.trim() : '',
+    space_name: typeof record.space_name === 'string' ? record.space_name.trim() : '',
+    thread_name: typeof record.thread_name === 'string' ? record.thread_name.trim() : '',
+  };
+  if (
+    candidate.agent_id !== expected.agent_id ||
+    candidate.environment_id !== expected.environment_id ||
+    candidate.space_name !== expected.space_name ||
+    candidate.thread_name !== expected.thread_name
+  ) {
+    return null;
+  }
+  return candidate;
 }
 
 /**
@@ -80,7 +128,7 @@ export function chatThreadSessionKey(
  *   memory_attachments を保有)。
  * - `personaSpec` / `toolsSpec` は静的 import 済の文字列 (caller が
  *   `src/data/persona-spec.ts` 等から渡す。orchestrator は持たない)。
- * - `toolDispatcher` は MAKOTOくん 10 tool dispatcher を bind 済の関数。
+ * - `toolDispatcher` は MAKOTOくん custom tool dispatcher を bind 済の関数。
  *   caller (chat-event-handler) が `dispatchMakotoTool` を bind して渡す。
  */
 export interface OrchestrateChatTurnInput {
@@ -103,24 +151,14 @@ export interface OrchestrateChatTurnInput {
    * または未指定なら従来通り text-only。
    */
   extraContentBlocks?: UserMessageContentBlock[];
+  /** Files uploaded through Anthropic Files API and mounted into the agent container. */
+  fileResources?: FileResourceParam[];
   /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
-  /**
-   * Action skill (= attach_memory=false) 起動時に true で渡す (Issue #186
-   * 既知 #4 intent-detector 統合)。
-   *
-   * true のとき:
-   *   - KV thread session lookup を skip (= 既存 session を再利用しない)
-   *   - sessions.create で生成した新 sessionId を KV put しない
-   *     (= 次ターン以降も ephemeral 経路を踏ませる)
-   *
-   * 効果: Cloud Run `cma_gchat_bot.py:_handle_event:l.4002-4013` 等価。
-   * 「スレッド 2 通目以降の "メールして" が前セッションの memory + bash
-   * 前提で暴走する」(incident 2026-05-08 同根) を防ぐ。
-   */
-  forceFreshSession?: boolean;
+  /** Session id が KV hit / create で確定した直後に通知する hook。 */
+  onSessionResolved?: (sessionId: string) => void;
   /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
@@ -134,6 +172,8 @@ export interface OrchestrateChatTurnInput {
    * agent context に hint として注入される (TS port 拡張点).
    */
   intent?: IntentEnvelopeOption;
+  /** Deterministic Trust Boundary result for quoted/pasted third-party text. */
+  provenance?: ProvenanceEnvelopeOption;
   /**
    * speaker context block の Python 完成形 (= `_build_space_context_block`
    * の出力)。未指定 / 空文字なら最小 `<context>space_type=... sender=...</context>`
@@ -145,17 +185,13 @@ export interface OrchestrateChatTurnInput {
    * なら envelope に 0 bytes (= 旧挙動互換).
    */
   rosterBlock?: string;
+  /** rosterBlock と同じ roster 内容から作った stable hash。重複注入抑制用。 */
+  rosterHash?: string;
   /**
    * cap-recovery turn opt-in。`{recovery: true}` 時 body は RECOVERY_PROMPT
    * で完全差し替え (Python recovery semantics)。未指定 = 通常 turn (旧挙動互換).
    */
   cap?: CapEnvelopeOption;
-  /**
-   * External Anthropic Skills to attach by creating / reusing a dedicated
-   * Managed Agent via `agent-cache`. Empty/undefined keeps the Console-mapped
-   * `userMapping.agent_id` path unchanged.
-   */
-  attachedSkills?: Array<Record<string, unknown>> | null;
 }
 
 export interface OrchestrateChatTurnResult {
@@ -254,19 +290,28 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
-  // `forceFreshSession=true` のときは KV lookup を skip (= 既存 session を
-  // 再利用しない、Issue #186 既知 #4 intent-detector 統合)。Cloud Run
-  // `_handle_event:l.4002-4013` 等価で「スレッド 2 通目以降の メールして」
-  // が前セッションの memory + bash 前提で暴走する」を防ぐ。
+  const agentId = input.userMapping.agent_id;
+  const environmentId = input.env.ENVIRONMENT_ID;
   const sessionKey = chatThreadSessionKey(
-    input.senderEmail,
+    agentId,
+    environmentId,
     input.spaceName,
     input.threadName,
   );
   let sessionId: string | null = null;
-  if (sessionKey !== null && !input.forceFreshSession) {
+  if (sessionKey !== null) {
     try {
-      sessionId = await kv.get(sessionKey);
+      const rawSessionRecord = await kv.get(sessionKey);
+      const sessionRecord = parseChatThreadSessionRecord(rawSessionRecord, {
+        agent_id: agentId,
+        environment_id: environmentId,
+        space_name: input.spaceName,
+        thread_name: input.threadName ?? '',
+      });
+      sessionId = sessionRecord?.session_id ?? null;
+      if (rawSessionRecord && sessionId === null) {
+        console.warn(`[chat-event] KV session record ignored key=${sessionKey}`);
+      }
     } catch (err) {
       console.warn(
         `[chat-event] KV get failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
@@ -278,56 +323,10 @@ export async function orchestrateChatTurn(
 
   let isNewSession = false;
   if (sessionId === null) {
-    const resources: MemoryStoreResourceParam[] =
-      input.userMapping.memory_attachments.map(toResourceParam);
-    let agentId = input.userMapping.agent_id;
-    let environmentId = input.env.ENVIRONMENT_ID;
-    const attachedSkills = input.attachedSkills ?? null;
-
-    if (hasAttachedSkills(attachedSkills)) {
-      try {
-        const skillResources = await getOrCreateResources(
-          {
-            DB: input.env.DB as unknown as AgentCacheBindings['DB'],
-            MAKOTO_KV: input.env.MAKOTO_KV as unknown as AgentCacheBindings['MAKOTO_KV'],
-          },
-          async (createOpts) => {
-            const agent = await client.beta.agents.create({
-              name: createOpts.agentName,
-              model: createOpts.model,
-              system: createOpts.system,
-              tools: createOpts.tools as unknown as Anthropic.Beta.Agents.AgentCreateParams['tools'],
-              skills: createOpts.skills as unknown as Anthropic.Beta.Agents.AgentCreateParams['skills'],
-            });
-            const environment = await client.beta.environments.create({
-              name: createOpts.environmentName,
-            });
-            return { agent_id: agent.id, environment_id: environment.id };
-          },
-          {
-            agentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            environmentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            system: systemPromptInfo.systemPrompt,
-            skills: attachedSkills,
-            userSlug: input.userMapping.user_slug,
-          },
-        );
-        agentId = skillResources.agent_id;
-        environmentId = skillResources.environment_id;
-        console.log(
-          `[chat-event] attached-skill agent resolved agent=${agentId} ` +
-            `env=${environmentId} source=${skillResources.source} user=${input.userMapping.user_slug}`,
-        );
-      } catch (err) {
-        throw new OrchestratorFailure(
-          'sessions_create_failed',
-          `attached skill agent create failed for user=${input.userMapping.user_slug}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          err,
-        );
-      }
-    }
+    const resources: SessionResourceParam[] = [
+      ...input.userMapping.memory_attachments.map(toResourceParam),
+      ...(input.fileResources ?? []),
+    ];
 
     try {
       sessionId = await createSessionWithResources(client, {
@@ -345,15 +344,18 @@ export async function orchestrateChatTurn(
     isNewSession = true;
     console.log(
       `[chat-event] created session=${sessionId} agent=${agentId} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}` +
-        (input.forceFreshSession ? ' ephemeral=true' : ''),
+        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
     );
-    // `forceFreshSession=true` のときは KV put も skip (= 次ターン以降も
-    // 毎回 ephemeral 経路を踏ませる)。Cloud Run `_handle_event:l.4010-4013`
-    // 「session_key = None で thread_sessions に保存しない」と等価。
-    if (sessionKey !== null && !input.forceFreshSession) {
+    if (sessionKey !== null) {
       try {
-        await kv.put(sessionKey, sessionId, {
+        const sessionRecord: ChatThreadSessionRecord = {
+          session_id: sessionId,
+          agent_id: agentId,
+          environment_id: environmentId,
+          space_name: input.spaceName,
+          thread_name: input.threadName ?? '',
+        };
+        await kv.put(sessionKey, JSON.stringify(sessionRecord), {
           expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
         });
       } catch (err) {
@@ -368,6 +370,69 @@ export async function orchestrateChatTurn(
       `[chat-event] continuing session=${sessionId} agent=${input.userMapping.agent_id} ` +
         `user=${input.userMapping.user_slug} space=${input.spaceName}`,
     );
+    for (const resource of input.fileResources ?? []) {
+      try {
+        await client.beta.sessions.resources.add(sessionId, {
+          ...resource,
+          betas: [ANTHROPIC_BETA],
+        } as unknown as Parameters<typeof client.beta.sessions.resources.add>[1]);
+        console.log(
+          `[chat-event] file resource added session=${sessionId} file=${resource.file_id} ` +
+            `mount=${resource.mount_path ?? '(default)'}`,
+        );
+      } catch (err) {
+        throw new OrchestratorFailure(
+          'sessions_create_failed',
+          `session file resource add failed for session=${sessionId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          err,
+        );
+      }
+    }
+  }
+  input.onSessionResolved?.(sessionId);
+
+  // ---- roster context dedupe ----
+  // 初回 session には必ず注入。継続 session では前回送った roster_hash と
+  // 同じなら注入しない。参加者追加/退出/displayName 変更で hash が変われば再注入。
+  let effectiveRosterBlock = input.rosterBlock;
+  if (effectiveRosterBlock && input.rosterHash && sessionKey !== null) {
+    const rosterHashKey = `${sessionKey}${KV_CHAT_THREAD_ROSTER_HASH_SUFFIX}`;
+    let previousRosterHash: string | null = null;
+    if (!isNewSession) {
+      try {
+        previousRosterHash = await kv.get(rosterHashKey);
+      } catch (err) {
+        console.warn(
+          `[chat-event] roster_hash KV get failed key=${rosterHashKey}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (!isNewSession && previousRosterHash === input.rosterHash) {
+      effectiveRosterBlock = '';
+      console.log(
+        `[chat-event] roster_context deduped session=${sessionId} hash=${input.rosterHash}`,
+      );
+    } else {
+      const reason = isNewSession
+        ? 'session_new'
+        : previousRosterHash
+          ? 'hash_changed'
+          : 'hash_missing';
+      console.log(
+        `[chat-event] roster_context injected session=${sessionId} reason=${reason} hash=${input.rosterHash}`,
+      );
+      try {
+        await kv.put(rosterHashKey, input.rosterHash, {
+          expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
+        });
+      } catch (err) {
+        console.warn(
+          `[chat-event] roster_hash KV put failed key=${rosterHashKey}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   // ---- user message envelope ----
@@ -388,7 +453,8 @@ export async function orchestrateChatTurn(
   };
   if (input.historyBlock) envelopeOpts.history = input.historyBlock;
   if (input.intent) envelopeOpts.intent = input.intent;
-  if (input.rosterBlock) envelopeOpts.roster = input.rosterBlock;
+  if (input.provenance) envelopeOpts.provenance = input.provenance;
+  if (effectiveRosterBlock) envelopeOpts.roster = effectiveRosterBlock;
   if (input.cap) envelopeOpts.cap = input.cap;
   const userMessageText = buildUserMessageEnvelope(input.bodyText, envelopeOpts);
 

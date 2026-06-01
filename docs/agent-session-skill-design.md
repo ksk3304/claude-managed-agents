@@ -27,14 +27,16 @@ Cloudflare版は、MAKOTOくん本体specを正本に実装する。ここを二
 ## 現行コードで注意する場所
 
 - `src/lib/session-orchestrator.ts`
-  - `forceFreshSession`
-  - `chat_thread_session` key
-  - attached skill時の agent-cache 経路
+  - Chat は user mapping の employee agent + `ENVIRONMENT_ID` 固定
+  - `chat_thread_session` key/value は `user_mapping.agent_id` / `ENVIRONMENT_ID` / space / thread 単位。KV hit でも agent/env 一致を検証する。skills hash は含めない
+  - `forceFreshSession` / attached skill agent-cache 経路は廃止済み。復活させる場合は正本 spec 更新が先
 - `src/lib/memory-attach.ts`
   - AgentMail inbound はDM scopeだが、mail skill一般を固定DM扱いしない
 - `src/queue/chat-event-handler.ts`
-  - mail intent検出と fresh session 化
-  - mail skill attach
+  - mail intent検出は envelope context 注入のみ。fresh session 化しない
+  - built-in document tools / MAKOTO custom tools は onboarding の employee agent tool catalog に持たせる
+  - env設定済 custom skill id (`PROVENANCE` / `CLOUDRUN` / `MAIL_SEND` / `COST_GUARD`) で per-turn attach しない
+  - Chat Office 添付 (`.xlsx` / `.docx` / `.pptx`) は text 抽出だけで済ませず、Anthropic Files API upload → session `file` resource mount → mount path を user message に注入する
 - `src/queue/agentmail-dispatch.ts`
   - AgentMail inbound scope
 - `src/storage.ts`

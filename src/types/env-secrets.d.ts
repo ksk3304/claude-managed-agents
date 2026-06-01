@@ -17,6 +17,12 @@ declare namespace Cloudflare {
     ANTHROPIC_API_KEY: string;
     ANTHROPIC_API_KEY_CMA?: string;
     ANTHROPIC_BASE_URL?: string;
+    /**
+     * Optional bearer token enabling `/debug/sessions/:id/events`.
+     * Unset = endpoint returns 404. Used for incident payload inspection
+     * without exposing Anthropic API keys to the local shell.
+     */
+    MAKOTO_DEBUG_TOKEN?: string;
     ENVIRONMENT_ID: string;
     OAUTH_VAULT_KEY: string;
     /**
@@ -121,10 +127,9 @@ declare namespace Cloudflare {
      */
     AGENTMAIL_DEFAULT_INBOX_ID?: string;
     /**
-     * Anthropic custom Skill for outbound email composition. When present, the
-     * Google Chat `/mail` / natural-language mail intent path uses a managed
-     * agent with this skill attached, so the behavior is visible in Claude
-     * Console instead of living only in prompt hints.
+     * Legacy/reserved custom Skill id for outbound email composition. Google
+     * Chat must not create per-turn skill agents or skill-specific sessions
+     * from this env; employee agents carry the canonical tool catalog instead.
      *
      * Provisioned via `wrangler secret put MAIL_SEND_SKILL_ID`.
      */
@@ -135,6 +140,48 @@ declare namespace Cloudflare {
      * Provisioned via `wrangler secret put MAIL_SEND_SKILL_VERSION`.
      */
     MAIL_SEND_SKILL_VERSION?: string;
+    /**
+     * Legacy/reserved custom Skill id for Trust Boundary provenance checks.
+     * Do not attach it to every Google Chat turn without updating the
+     * canonical Cloudflare session design first.
+     *
+     * Provisioned via `wrangler secret put PROVENANCE_SKILL_ID`.
+     */
+    PROVENANCE_SKILL_ID?: string;
+    /**
+     * Optional pinned version for `PROVENANCE_SKILL_ID`.
+     *
+     * Provisioned via `wrangler secret put PROVENANCE_SKILL_VERSION`.
+     */
+    PROVENANCE_SKILL_VERSION?: string;
+    /**
+     * Legacy/reserved custom Skill id for Cloud Run advisory knowledge. Cloud
+     * Run is rollback fallback only; this env must not drive Cloudflare Chat
+     * per-turn agent creation.
+     *
+     * Provisioned via `wrangler secret put CLOUDRUN_SKILL_ID`.
+     */
+    CLOUDRUN_SKILL_ID?: string;
+    /**
+     * Optional pinned version for `CLOUDRUN_SKILL_ID`.
+     *
+     * Provisioned via `wrangler secret put CLOUDRUN_SKILL_VERSION`.
+     */
+    CLOUDRUN_SKILL_VERSION?: string;
+    /**
+     * Legacy/reserved custom Skill id for Cost Guard guidance. Cost Guard
+     * deterministic commands run in Worker code; do not use this env to create
+     * skill-specific Chat sessions.
+     *
+     * Provisioned via `wrangler secret put COST_GUARD_SKILL_ID`.
+     */
+    COST_GUARD_SKILL_ID?: string;
+    /**
+     * Optional pinned version for `COST_GUARD_SKILL_ID`.
+     *
+     * Provisioned via `wrangler secret put COST_GUARD_SKILL_VERSION`.
+     */
+    COST_GUARD_SKILL_VERSION?: string;
     /**
      * GCP project ID hosting Cloud Scheduler jobs (Issue #186
      * SCHEDULE_ACTION dispatch)。`cma-bot-mp-20260501` 既定。未設定だと

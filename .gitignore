@@ -207,3 +207,6 @@ frontend/static/redoc.standalone.js
 
 ### Superpowers ###
 .superpowers/
+
+### Local incident diagnostics ###
+.diagnostics/

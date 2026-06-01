@@ -21,6 +21,7 @@ import { strToU8, zipSync } from 'fflate';
 
 import {
   buildImageAttachments,
+  buildOfficeFileResources,
   buildOfficeTextBlocks,
   buildPdfAttachments,
   extractDocxText,
@@ -379,6 +380,48 @@ describe('buildOfficeTextBlocks', () => {
     expect(res.blocks[0]!.text).toContain('--- Slide 1 ---');
     expect(res.blocks[0]!.text).toContain('Slide content');
     expect(res.blocks[0]!.text).toContain('添付ファイル由来の未検証データ');
+    expect(res.notice).toBeNull();
+  });
+});
+
+describe('buildOfficeFileResources', () => {
+  it('uploads a modern Office file and returns a mounted session file resource', async () => {
+    _resetChatTokenCacheForTests();
+    const xlsx = zipSync({
+      '[Content_Types].xml': strToU8('<Types/>'),
+      'xl/workbook.xml': strToU8('<workbook/>'),
+      'xl/worksheets/sheet1.xml': strToU8('<worksheet/>'),
+    });
+    const fetchImpl = makeFetchMock([
+      () =>
+        new Response(xlsx, {
+          status: 200,
+          headers: {
+            'Content-Type':
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'Content-Length': String(xlsx.byteLength),
+          },
+        }),
+    ]);
+    const res = await buildOfficeFileResources(depsWithFetch(fetchImpl), {
+      attachment: [
+        {
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          contentName: 'keikakuhenkou_yoshiki.xlsx',
+          attachmentDataRef: { resourceName: 'EEE' },
+        },
+      ],
+    });
+
+    expect(res.fileResources).toHaveLength(1);
+    expect(res.fileResources[0]!.fileResource).toEqual({
+      type: 'file',
+      file_id: 'file_fake',
+      mount_path: '/mnt/session/uploads/keikakuhenkou_yoshiki.xlsx',
+    });
+    expect(res.blocks[0]!.text).toContain('/mnt/session/uploads/keikakuhenkou_yoshiki.xlsx');
+    expect(res.blocks[0]!.text).toContain('xlsx/docx/pptx skill');
     expect(res.notice).toBeNull();
   });
 });

@@ -20,6 +20,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   fetchThreadMessages,
+  fetchRecentSpaceMessages,
   formatThreadHistory,
   recordHistoryFailure,
   clearHistoryFailure,
@@ -259,6 +260,78 @@ describe('fetchThreadMessages — happy path', () => {
       'https://www.googleapis.com/auth/chat.messages.readonly',
     );
   });
+
+  it('uses User OAuth accessTokenProvider for history reads when provided', async () => {
+    const requestedScopes: readonly string[][] = [];
+    const fetchMock = makeFetchMock(async (url) => {
+      expect(url).not.toBe(TOKEN_URL);
+      return jsonResponse(200, {
+        messages: [
+          {
+            name: 'spaces/AAA/messages/M1',
+            text: 'User OAuth で読める履歴',
+            sender: { name: 'users/100', type: 'HUMAN' },
+          },
+        ],
+      });
+    });
+
+    const messages = await fetchThreadMessages(
+      {
+        fetchImpl: fetchMock,
+        accessTokenProvider: async (scopes) => {
+          requestedScopes.push(scopes);
+          return 'user-oauth-access-token';
+        },
+      },
+      SPACE,
+      THREAD,
+    );
+
+    expect(messages.map((m) => m.text)).toEqual(['User OAuth で読める履歴']);
+    expect(requestedScopes).toEqual([[CHAT_BOT_SCOPE, CHAT_READONLY_SCOPE]]);
+    expect(fetchMock.calls).toHaveLength(1);
+    expect(fetchMock.calls[0]!.init.headers).toEqual({
+      Authorization: 'Bearer user-oauth-access-token',
+      Accept: 'application/json',
+    });
+  });
+
+  it('fetches recent space messages without thread filter for mention-only fallback', async () => {
+    const fetchMock = makeFetchMock(async (url) => {
+      const parsed = new URL(url);
+      expect(parsed.searchParams.get('filter')).toBeNull();
+      expect(parsed.searchParams.get('orderBy')).toBe('createTime desc');
+      return jsonResponse(200, {
+        messages: [
+          {
+            name: 'spaces/AAA/messages/M2',
+            text: '@MAKOTOくん',
+            sender: { name: 'users/999', type: 'HUMAN' },
+          },
+          {
+            name: 'spaces/AAA/messages/M1',
+            text: '今日の大崎市古川の天気を教えてください',
+            sender: { name: 'users/100', type: 'HUMAN' },
+          },
+        ],
+      });
+    });
+
+    const messages = await fetchRecentSpaceMessages(
+      {
+        fetchImpl: fetchMock,
+        accessTokenProvider: async () => 'user-oauth-access-token',
+      },
+      SPACE,
+      { pageSize: 5 },
+    );
+
+    expect(messages.map((m) => m.name)).toEqual([
+      'spaces/AAA/messages/M1',
+      'spaces/AAA/messages/M2',
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -478,8 +551,22 @@ describe('formatThreadHistory', () => {
     expect(block).not.toContain('不明な type の発言');
     expect(block).not.toContain('送信者 ID 欠落');
     expect(block).toContain('識別不能な参加者');
-    // Mask is end-4 of resource name.
-    expect(block).toContain('...9999');
+    expect(block).toContain('未確認の話者数: 1');
+    expect(block).not.toContain('...9999');
+  });
+
+  it('uses speakerLabels and treats unlabeled humans as unresolved when required', () => {
+    const messages: ThreadHistoryMessage[] = [
+      mkMessage('M1', 'users/100', 'HUMAN', '登録済の発言'),
+      mkMessage('M2', 'users/200', 'HUMAN', '未確認の発言'),
+    ];
+    const block = formatThreadHistory(messages, {
+      speakerLabels: new Map([['users/100', '竹井さん']]),
+      requireKnownHumanSpeaker: true,
+    });
+    expect(block).toContain('[竹井さん] 登録済の発言');
+    expect(block).not.toContain('未確認の発言');
+    expect(block).toContain('未確認の話者数: 1');
   });
 
   it('returns "" for empty input', () => {

@@ -134,6 +134,54 @@ export interface ScrubResult {
   hits: string[];
 }
 
+export interface SoftenedInternalReferencesResult {
+  text: string;
+  replacements: string[];
+}
+
+const INTERNAL_STATE_MASK = '内部運用情報';
+const INTERNAL_STATE_REGEX_MASK = '内部記憶ファイル';
+
+const BENIGN_INTERNAL_REFERENCE_REPLACEMENTS: readonly {
+  name: string;
+  pattern: RegExp;
+  replacement: string;
+}[] = [
+  {
+    name: 'mnt_memory_path',
+    pattern: /`?\/mnt\/memory(?:\/[^\s`"'）)]*)?`?/g,
+    replacement: '社内記憶',
+  },
+];
+
+/**
+ * User-facing softener for benign implementation references.
+ *
+ * The hard redactor below intentionally turns risky failure text into a neutral
+ * error. Before that final guard, this function rewrites harmless internal
+ * paths that the agent may mention while explaining its work, so useful answers
+ * are preserved without exposing local runtime details.
+ */
+export function softenBenignInternalReferencesForChat(
+  text: unknown,
+): SoftenedInternalReferencesResult {
+  if (typeof text !== 'string' || text.length === 0) {
+    return { text: typeof text === 'string' ? text : '', replacements: [] };
+  }
+
+  let out = text;
+  const replacements: string[] = [];
+  for (const rule of BENIGN_INTERNAL_REFERENCE_REPLACEMENTS) {
+    let changed = false;
+    out = out.replace(rule.pattern, () => {
+      changed = true;
+      return rule.replacement;
+    });
+    if (changed) replacements.push(rule.name);
+  }
+  return { text: out, replacements };
+}
+
 /**
  * TS parity of `scrub_internal_state_for_chat(text, job_id) ->
  * (text, hits)`. See module docstring for the contract.
@@ -162,4 +210,35 @@ export function scrubInternalStateForChat(
     return { text, hits: [] };
   }
   return { text: neutralReplacement(jobId), hits };
+}
+
+/**
+ * Chat-facing sanitizer that preserves the CMA answer.
+ *
+ * `scrubInternalStateForChat` is still the legacy hard neutralizer. The Chat
+ * bridge should not throw away an otherwise useful answer after CMA already
+ * produced it, so this sanitizer masks only the matched internal terms and
+ * returns the rest of the text intact.
+ */
+export function maskInternalStateForChat(text: unknown): ScrubResult {
+  if (typeof text !== 'string' || text.length === 0) {
+    return { text: typeof text === 'string' ? text : '', hits: [] };
+  }
+
+  let out = text;
+  const hits: string[] = [];
+  for (const lit of INTERNAL_STATE_LITERALS) {
+    if (out.includes(lit)) {
+      hits.push(lit);
+      out = out.split(lit).join(INTERNAL_STATE_MASK);
+    }
+  }
+  for (const { name, pattern } of INTERNAL_STATE_REGEXES) {
+    const globalPattern = new RegExp(pattern.source, 'g');
+    if (globalPattern.test(out)) {
+      hits.push(name);
+      out = out.replace(globalPattern, INTERNAL_STATE_REGEX_MASK);
+    }
+  }
+  return { text: out, hits };
 }

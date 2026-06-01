@@ -21,6 +21,10 @@ declare namespace Cloudflare {
     // when unset; see `resolveAnthropicBaseURL` in src/anthropic.ts.
     ANTHROPIC_BASE_URL?: string;
 
+    // Optional bearer token enabling /debug/sessions/:id/events. Leave unset
+    // in normal operation; the endpoint returns 404 without this secret.
+    MAKOTO_DEBUG_TOKEN?: string;
+
     // Browser Rendering REST credentials. Either both are present (REST
     // path, faster, supports /markdown natively) or both are absent and
     // we fall back to the BROWSER binding via @cloudflare/puppeteer.

@@ -45,6 +45,15 @@ export interface MemoryStoreResourceParam {
   instructions?: string;
 }
 
+/** File uploaded through Anthropic Files API and mounted into a session. */
+export interface FileResourceParam {
+  type: 'file';
+  file_id: string;
+  mount_path?: string | null;
+}
+
+export type SessionResourceParam = MemoryStoreResourceParam | FileResourceParam;
+
 /**
  * `sender_email → user_slug → resources` resolution result. Built by the
  * per-user resolver (TS port of `SessionCredentialResolver.resolve`).

@@ -23,6 +23,8 @@ For all limits and quotas, retrieve from the product's `/platform/limits/` page.
 
 Run `wrangler types` after changing bindings in wrangler.jsonc.
 
+Before production deploy / rollback / restore, protect the whole currently serving surface, not only the local fix. Check the current deployment/version, source commit, included issues, and issues that would be dropped; stop and ask the user if the deploy could revert another issue's production fix.
+
 ## Node.js Compatibility
 
 https://developers.cloudflare.com/workers/runtime-apis/nodejs/

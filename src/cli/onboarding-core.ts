@@ -30,6 +30,7 @@ import {
   USER_SCOPED_STORES,
   actualStoreName,
 } from './store-config';
+import { MAKOTO_AGENT_TOOLS } from '../lib/makoto-capability-registry';
 
 // ---------------------------------------------------------------------------
 // Interfaces (= dependency boundary)
@@ -268,7 +269,7 @@ export async function copyAgent(opts: {
         `(SDK 仕様変更の可能性、Python l.4140-4144 と同じ fail-fast)`,
     );
   }
-  const templateTools = template.tools;
+  const templateTools = mergeMakotoAgentTools(template.tools);
   const templateSkills = template.skills;
 
   // Step 3: system + addendum
@@ -286,7 +287,7 @@ export async function copyAgent(opts: {
     model: templateModel,
     system: systemNew,
   };
-  if (templateTools !== undefined && templateTools !== null) {
+  if (templateTools.length > 0) {
     createParams.tools = templateTools;
   }
   if (
@@ -304,6 +305,28 @@ export async function copyAgent(opts: {
     displayName: opts.displayName,
     templateAgentId: opts.templateAgentId,
   };
+}
+
+function mergeMakotoAgentTools(templateTools: unknown): Array<Record<string, unknown>> {
+  const merged: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const add = (tool: unknown) => {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return;
+    const record = tool as Record<string, unknown>;
+    const key =
+      record.type === 'custom' && typeof record.name === 'string'
+        ? `custom:${record.name}`
+        : JSON.stringify(record);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(record);
+  };
+
+  if (Array.isArray(templateTools)) {
+    for (const tool of templateTools) add(tool);
+  }
+  for (const tool of MAKOTO_AGENT_TOOLS) add(tool);
+  return merged;
 }
 
 // ---------------------------------------------------------------------------

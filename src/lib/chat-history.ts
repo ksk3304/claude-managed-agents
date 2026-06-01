@@ -34,7 +34,6 @@
 
 import { assertBridgeEgressAllowed } from './egress-guard';
 import { getChatAccessToken, CHAT_BOT_SCOPE } from './chat-api';
-import type { ChatApiDeps } from './chat-api';
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
 
@@ -57,6 +56,9 @@ export const HISTORY_FAILURE_KV_TTL_SEC = 24 * 60 * 60;
 /** Chat REST read-only scope (= Python `SCOPES_CHAT_READONLY`). */
 export const CHAT_READONLY_SCOPE =
   'https://www.googleapis.com/auth/chat.messages.readonly';
+/** Chat REST app-auth readonly scope for public messages in a space. */
+export const CHAT_APP_MESSAGES_READONLY_SCOPE =
+  'https://www.googleapis.com/auth/chat.app.messages.readonly';
 
 /**
  * Normalised Chat message shape returned by `fetchThreadMessages`.
@@ -79,6 +81,21 @@ export interface ThreadHistoryMessage {
   createTime: string;
 }
 
+export interface ChatHistoryDeps {
+  /** Legacy fallback: Service Account JSON for Chat REST token minting. */
+  saKeyJson?: string;
+  /** Override `fetch` for tests. */
+  fetchImpl?: typeof fetch;
+  /** Override scopes when using the legacy SA token path. */
+  scopes?: readonly string[];
+  /**
+   * Preferred path for history reads: User OAuth token provider
+   * (`chat.messages.readonly`). Service Account cannot reliably read
+   * message history; callers should provide this when OAuth secrets exist.
+   */
+  accessTokenProvider?: (scopes: readonly string[]) => Promise<string>;
+}
+
 export interface FetchThreadMessagesOptions {
   /** Override page size (default `HISTORY_PAGE_SIZE`). */
   pageSize?: number;
@@ -95,6 +112,17 @@ export interface FetchThreadMessagesOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+export interface FetchRecentSpaceMessagesOptions {
+  /** Recent messages to request from Chat API (default 10). */
+  pageSize?: number;
+  /** Override max retry attempts (default `HISTORY_FETCH_MAX_ATTEMPTS`). */
+  maxAttempts?: number;
+  /** Override backoff schedule (ms, default `HISTORY_FETCH_BACKOFF_MS`). */
+  backoffMs?: readonly number[];
+  /** Sleep override for tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /** Failure raised when retry budget is exhausted. */
 export class ChatHistoryFetchError extends Error {
   readonly status: number | undefined;
@@ -105,6 +133,26 @@ export class ChatHistoryFetchError extends Error {
     this.attempts = attempts;
     if (status !== undefined) this.status = status;
   }
+}
+
+async function getLegacyChatAccessToken(
+  deps: ChatHistoryDeps,
+  scopes: readonly string[],
+): Promise<string> {
+  if (!deps.saKeyJson) {
+    throw new ChatHistoryFetchError(
+      'fetchThreadMessages missing auth: provide accessTokenProvider or saKeyJson',
+      0,
+    );
+  }
+  return getChatAccessToken(
+    {
+      saKeyJson: deps.saKeyJson,
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      ...(deps.scopes ? { scopes: deps.scopes } : {}),
+    },
+    scopes,
+  );
 }
 
 /**
@@ -127,7 +175,7 @@ export class ChatHistoryFetchError extends Error {
  * the permanent-failure path (= `recordHistoryFailure`).
  */
 export async function fetchThreadMessages(
-  deps: ChatApiDeps,
+  deps: ChatHistoryDeps,
   spaceName: string,
   threadName: string,
   options: FetchThreadMessagesOptions = {},
@@ -169,10 +217,11 @@ export async function fetchThreadMessages(
     let pageJson: unknown;
     let lastError: { message: string; status?: number } | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      // Always re-mint token here — Anthropic SDK does its own caching;
-      // here we lean on `getChatAccessToken`'s module-level cache so
-      // 2nd/3rd attempts within a page don't redundantly exchange JWTs.
-      const token = await getChatAccessToken(deps, scopes);
+      // Prefer User OAuth (chat.messages.readonly). Legacy SA token minting
+      // remains as a fallback for older tests / gradual deploys.
+      const token = deps.accessTokenProvider
+        ? await deps.accessTokenProvider(scopes)
+        : await getLegacyChatAccessToken(deps, scopes);
       let response: Response;
       try {
         response = await fetchImpl(url, {
@@ -246,24 +295,7 @@ export async function fetchThreadMessages(
     }) ?? {};
     const pageMsgs = Array.isArray(data.messages) ? data.messages : [];
     for (const m of pageMsgs) {
-      const sender = m.sender ?? {};
-      const senderId = typeof sender.name === 'string' ? sender.name : '';
-      const senderType = typeof sender.type === 'string' ? sender.type : '';
-      const argumentText =
-        typeof m.argumentText === 'string' ? m.argumentText.trim() : '';
-      const text = argumentText
-        ? argumentText
-        : stripMention(
-            typeof m.text === 'string' ? m.text : '',
-            Array.isArray(m.annotations) ? m.annotations : [],
-          );
-      messages.push({
-        name: typeof m.name === 'string' ? m.name : '',
-        senderId,
-        senderType,
-        text,
-        createTime: typeof m.createTime === 'string' ? m.createTime : '',
-      });
+      messages.push(normalizeChatApiMessage(m));
     }
 
     pageCount += 1;
@@ -293,6 +325,110 @@ export async function fetchThreadMessages(
   return messages;
 }
 
+/**
+ * Fetch the latest messages in a Chat space, newest-first from the API
+ * and returned chronological (old → new). This is the mention-only
+ * fallback for top-level non-mention messages: Chat interaction events
+ * often only reach the app when the bot is mentioned, so the local
+ * near-context cache can't be the only source of truth.
+ */
+export async function fetchRecentSpaceMessages(
+  deps: ChatHistoryDeps,
+  spaceName: string,
+  options: FetchRecentSpaceMessagesOptions = {},
+): Promise<ThreadHistoryMessage[]> {
+  if (!spaceName.startsWith('spaces/')) {
+    throw new Error(
+      `fetchRecentSpaceMessages: spaceName must start with 'spaces/' (got ${spaceName})`,
+    );
+  }
+
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const scopes = deps.scopes ?? [CHAT_BOT_SCOPE, CHAT_READONLY_SCOPE];
+  const pageSize = options.pageSize ?? 10;
+  const maxAttempts = options.maxAttempts ?? HISTORY_FETCH_MAX_ATTEMPTS;
+  const backoff = options.backoffMs ?? HISTORY_FETCH_BACKOFF_MS;
+  const sleep = options.sleep ?? defaultSleep;
+
+  const params = new URLSearchParams();
+  params.set('pageSize', String(pageSize));
+  params.set('orderBy', 'createTime desc');
+  const url = `${CHAT_API_BASE}/${spaceName}/messages?${params.toString()}`;
+  assertBridgeEgressAllowed(url, 'chat-history:fetchRecentSpaceMessages');
+
+  let lastError: { message: string; status?: number } | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const token = deps.accessTokenProvider
+      ? await deps.accessTokenProvider(scopes)
+      : await getLegacyChatAccessToken(deps, scopes);
+    let response: Response;
+    try {
+      response = await fetchImpl(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      });
+    } catch (err) {
+      lastError = {
+        message: `network ${err instanceof Error ? err.message : String(err)}`,
+      };
+      if (attempt >= maxAttempts) {
+        throw new ChatHistoryFetchError(
+          `fetchRecentSpaceMessages exhausted ${maxAttempts} attempts (network): ${lastError.message}`,
+          attempt,
+        );
+      }
+      await sleep(pickBackoff(backoff, attempt));
+      continue;
+    }
+
+    if (response.ok) {
+      let data: unknown;
+      try {
+        data = await response.json();
+      } catch (err) {
+        throw new ChatHistoryFetchError(
+          `fetchRecentSpaceMessages got non-JSON body: ${err instanceof Error ? err.message : String(err)}`,
+          attempt,
+          response.status,
+        );
+      }
+      const obj = (data as { messages?: ChatApiMessage[] }) ?? {};
+      const pageMsgs = Array.isArray(obj.messages) ? obj.messages : [];
+      const messages = pageMsgs.map(normalizeChatApiMessage).reverse();
+      console.log(
+        `[chat-history] fetchRecentSpaceMessages done msgs=${messages.length} space=${spaceName}`,
+      );
+      return messages;
+    }
+
+    const status = response.status;
+    const bodyText = await safeReadText(response);
+    if (isRetryableStatus(status) && attempt < maxAttempts) {
+      lastError = {
+        message: `status=${status} body=${bodyText.slice(0, 200)}`,
+        status,
+      };
+      await sleep(pickBackoff(backoff, attempt));
+      continue;
+    }
+    throw new ChatHistoryFetchError(
+      `fetchRecentSpaceMessages status=${status} attempts=${attempt} ` +
+        `space=${spaceName} body=${bodyText.slice(0, 300)}`,
+      attempt,
+      status,
+    );
+  }
+
+  throw new ChatHistoryFetchError(
+    `fetchRecentSpaceMessages internal: retry loop exited (${lastError?.message ?? 'no error'})`,
+    maxAttempts,
+    lastError?.status,
+  );
+}
+
 export interface FormatThreadHistoryOptions {
   /**
    * Resource name of the message currently being processed by the
@@ -303,6 +439,16 @@ export interface FormatThreadHistoryOptions {
   currentMessageName?: string;
   /** Override bot user resource name (= e.g. `users/123`) to mark as `[bot]`. */
   botUserName?: string;
+  /**
+   * Human sender resource name → display label. Usually built from the
+   * current space roster plus the per-space speaker alias ledger.
+   */
+  speakerLabels?: ReadonlyMap<string, string> | Record<string, string>;
+  /**
+   * When true, human messages without a roster/alias label are treated as
+   * unresolved instead of falling back to masked `user:...1234`.
+   */
+  requireKnownHumanSpeaker?: boolean;
 }
 
 /**
@@ -323,6 +469,7 @@ export interface FormatThreadHistoryOptions {
 export interface ThreadHistoryFormatResult {
   text: string;
   unresolvedCount: number;
+  unresolvedSpeakers: Array<{ senderId: string; text: string }>;
 }
 
 /**
@@ -345,18 +492,19 @@ export function formatThreadHistoryWithMeta(
   messages: readonly ThreadHistoryMessage[],
   options: FormatThreadHistoryOptions = {},
 ): ThreadHistoryFormatResult {
-  if (!messages.length) return { text: '', unresolvedCount: 0 };
+  if (!messages.length) return { text: '', unresolvedCount: 0, unresolvedSpeakers: [] };
   const current = options.currentMessageName ?? '';
   const botUser = options.botUserName ?? '';
   const lines: string[] = ['## スレッド過去履歴（時系列順）'];
   const unresolvedIds: string[] = [];
+  const unresolvedSpeakers: Array<{ senderId: string; text: string }> = [];
   const seenUnresolved = new Set<string>();
   let rendered = 0;
   for (const m of messages) {
     if (current && m.name === current) continue;
     const text = (m.text || '').trim();
     if (!text) continue;
-    const label = resolveSpeakerLabel(m, botUser);
+    const label = resolveSpeakerLabel(m, botUser, options);
     if (label === null) {
       // Unknown speaker (= no sender_id at all). Body is dropped so a
       // future speaker-resolver port can refine, not relax, the gate.
@@ -364,6 +512,7 @@ export function formatThreadHistoryWithMeta(
       if (cuid && !seenUnresolved.has(cuid)) {
         seenUnresolved.add(cuid);
         unresolvedIds.push(cuid);
+        unresolvedSpeakers.push({ senderId: cuid, text });
       }
       continue;
     }
@@ -373,20 +522,18 @@ export function formatThreadHistoryWithMeta(
 
   if (rendered === 0 && unresolvedIds.length === 0) {
     // Every message was either the current one or text-empty.
-    return { text: '', unresolvedCount: 0 };
+    return { text: '', unresolvedCount: 0, unresolvedSpeakers: [] };
   }
 
   let body = rendered > 0 ? lines.join('\n') : '';
   if (unresolvedIds.length > 0) {
-    const masked = unresolvedIds.map((cuid) => `...${cuid.slice(-4)}`);
     const warning =
       '\n\n## ⚠️ 識別不能な参加者の発言を履歴から除外\n' +
-      `- 未登録 chat_user_id 数: ${unresolvedIds.length} ` +
-      `(末尾4桁: ${masked.join(', ')})\n` +
+      `- 未確認の話者数: ${unresolvedIds.length}\n` +
       '- 上記発言は本文を履歴から物理除外済。\n';
     body = body ? body + warning : warning.trimStart();
   }
-  return { text: body, unresolvedCount: unresolvedIds.length };
+  return { text: body, unresolvedCount: unresolvedIds.length, unresolvedSpeakers };
 }
 
 /**
@@ -517,6 +664,27 @@ interface ChatApiMessage {
   }>;
 }
 
+function normalizeChatApiMessage(m: ChatApiMessage): ThreadHistoryMessage {
+  const sender = m.sender ?? {};
+  const senderId = typeof sender.name === 'string' ? sender.name : '';
+  const senderType = typeof sender.type === 'string' ? sender.type : '';
+  const argumentText =
+    typeof m.argumentText === 'string' ? m.argumentText.trim() : '';
+  const text = argumentText
+    ? argumentText
+    : stripMention(
+        typeof m.text === 'string' ? m.text : '',
+        Array.isArray(m.annotations) ? m.annotations : [],
+      );
+  return {
+    name: typeof m.name === 'string' ? m.name : '',
+    senderId,
+    senderType,
+    text,
+    createTime: typeof m.createTime === 'string' ? m.createTime : '',
+  };
+}
+
 function isRetryableStatus(status: number): boolean {
   // Python `_is_retryable_history_error` distinguishes by exception
   // type. In TS we only have status codes — 429 + 5xx are retryable,
@@ -569,6 +737,7 @@ function stripMention(
 function resolveSpeakerLabel(
   m: ThreadHistoryMessage,
   botUserName: string,
+  options: FormatThreadHistoryOptions,
 ): string | null {
   const senderId = m.senderId || '';
   const senderType = (m.senderType || '').toUpperCase();
@@ -576,9 +745,25 @@ function resolveSpeakerLabel(
   if (botUserName && senderId === botUserName) return 'bot';
   if (senderType === 'BOT') return 'bot';
   if (senderType === 'HUMAN') {
+    const knownLabel = lookupSpeakerLabel(options.speakerLabels, senderId);
+    if (knownLabel) return knownLabel;
+    if (options.requireKnownHumanSpeaker) return null;
     // Mirror Python's privacy-preserving masking: end-4 of resource name.
     return `user:...${senderId.slice(-4)}`;
   }
   // Unknown type → treat as unresolved.
   return null;
+}
+
+function lookupSpeakerLabel(
+  labels: FormatThreadHistoryOptions['speakerLabels'],
+  senderId: string,
+): string {
+  if (!labels || !senderId) return '';
+  const maybeMap = labels as { get?: unknown };
+  if (typeof maybeMap.get === 'function') {
+    return (labels as ReadonlyMap<string, string>).get(senderId) ?? '';
+  }
+  const value = (labels as Record<string, string>)[senderId];
+  return typeof value === 'string' ? value : '';
 }
