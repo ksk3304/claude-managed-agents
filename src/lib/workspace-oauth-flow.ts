@@ -98,7 +98,7 @@ export async function handleWorkspaceOAuthStart(
 export async function handleWorkspaceOAuthDeviceStart(
   request: Request,
   env: Env,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = defaultFetch,
 ): Promise<Response> {
   const url = new URL(request.url);
   const adminToken = resolveWorkspaceOAuthAdminToken(env);
@@ -156,7 +156,7 @@ export async function handleWorkspaceOAuthDeviceStart(
 export async function handleWorkspaceOAuthDevicePoll(
   request: Request,
   env: Env,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = defaultFetch,
 ): Promise<Response> {
   const url = new URL(request.url);
   const adminToken = resolveWorkspaceOAuthAdminToken(env);
@@ -195,7 +195,7 @@ export async function handleWorkspaceOAuthDevicePoll(
 export async function handleWorkspaceOAuthCallback(
   request: Request,
   env: Env,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = defaultFetch,
 ): Promise<Response> {
   const url = new URL(request.url);
   const state = url.searchParams.get('state') ?? '';
@@ -391,6 +391,8 @@ function stateKey(state: string): string {
 function deviceKey(state: string): string {
   return `${DEVICE_PREFIX}:${state}`;
 }
+
+const defaultFetch: typeof fetch = (input, init) => fetch(input, init);
 
 function isValidUserSlug(value: string): boolean {
   return /^[a-z0-9_-]{1,64}$/.test(value);
