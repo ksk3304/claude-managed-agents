@@ -497,9 +497,9 @@ async function handleAdminMakotoTool(request: Request, env: Env): Promise<Respon
   const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
   if (got !== expected) return new Response("not found", { status: 404 });
 
-  let body: { user_slug?: string; tool?: string; input?: unknown };
+  let body: { user_slug?: string; tool?: string; input?: unknown; bound_message_id?: string };
   try {
-    body = (await request.json()) as { user_slug?: string; tool?: string; input?: unknown };
+    body = (await request.json()) as { user_slug?: string; tool?: string; input?: unknown; bound_message_id?: string };
   } catch {
     return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
   }
@@ -511,7 +511,7 @@ async function handleAdminMakotoTool(request: Request, env: Env): Promise<Respon
   const result = await dispatchMakotoTool(tool, body.input ?? {}, {
     env,
     userSlug,
-    boundMessageId: "admin-makoto-tool",
+    boundMessageId: (body.bound_message_id || "admin-makoto-tool").trim(),
     callerSessionId: "admin-makoto-tool",
   });
   return Response.json(result);
