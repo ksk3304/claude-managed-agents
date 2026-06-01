@@ -1525,17 +1525,7 @@ export async function handleChatEvent(
     finalMarkerExtraction.text,
     emailParsed.markers.length,
   );
-  const markerLeakScrubbed = scrubActionMarkerLeakForChat(
-    displayText,
-    emailParsed.markers.length,
-  );
-  if (markerLeakScrubbed.scrubbed) {
-    console.warn(
-      `[chat-event] action-marker leak scrubbed eventKey=${eventKey} ` +
-        `reason=${markerLeakScrubbed.reason}`,
-    );
-  }
-  const softened = softenBenignInternalReferencesForChat(markerLeakScrubbed.text);
+  const softened = softenBenignInternalReferencesForChat(displayText);
   if (softened.replacements.length > 0) {
     console.warn(
       `[chat-event] benign internal references softened eventKey=${eventKey} ` +
@@ -1973,27 +1963,6 @@ function formatEmailDispatchSummaries(summaries: EmailDispatchSummary[]): string
       return lines.join('\n');
     })
     .join('\n\n');
-}
-
-function scrubActionMarkerLeakForChat(
-  text: string,
-  parsedEmailMarkerCount: number,
-): { text: string; scrubbed: boolean; reason: string } {
-  if (parsedEmailMarkerCount > 0) {
-    return { text, scrubbed: false, reason: '' };
-  }
-  const normalized = text.toLowerCase();
-  const leaks =
-    normalized.includes('email_send') ||
-    text.includes('bot 側') ||
-    text.includes('bot側') ||
-    text.includes('マーカー');
-  if (!leaks) return { text, scrubbed: false, reason: '' };
-  return {
-    text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',
-    scrubbed: true,
-    reason: 'action_marker_terms',
-  };
 }
 
 function normalizeEmailPreviewEscapedNewlines(
