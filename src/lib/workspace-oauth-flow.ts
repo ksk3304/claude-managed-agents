@@ -4,8 +4,10 @@ import { bootstrapUser } from './workspace-oauth';
 
 const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_DEVICE_CODE_URL = 'https://oauth2.googleapis.com/device/code';
 
 const STATE_PREFIX = 'oauth:workspace:state';
+const DEVICE_PREFIX = 'oauth:workspace:device';
 const STATE_TTL_SECONDS = 10 * 60;
 const DEFAULT_SCOPES = [
   'https://www.googleapis.com/auth/calendar',
@@ -30,6 +32,27 @@ interface GoogleTokenResponse {
   token_type?: string;
   error?: string;
   error_description?: string;
+}
+
+interface GoogleDeviceCodeResponse {
+  device_code?: string;
+  user_code?: string;
+  verification_url?: string;
+  verification_uri?: string;
+  expires_in?: number;
+  interval?: number;
+  error?: string;
+  error_description?: string;
+}
+
+interface WorkspaceDeviceState {
+  state: string;
+  user_slug: string;
+  device_code: string;
+  user_code: string;
+  verification_url: string;
+  scopes: string[];
+  created_at_ms: number;
 }
 
 export async function handleWorkspaceOAuthStart(
@@ -72,6 +95,103 @@ export async function handleWorkspaceOAuthStart(
   return Response.redirect(auth.toString(), 302);
 }
 
+export async function handleWorkspaceOAuthDeviceStart(
+  request: Request,
+  env: Env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const adminToken = resolveWorkspaceOAuthAdminToken(env);
+  if (!adminToken) return new Response('not found', { status: 404 });
+  if ((url.searchParams.get('token') ?? '') !== adminToken) {
+    return new Response('not found', { status: 404 });
+  }
+  const userSlug = url.searchParams.get('user_slug') ?? env.DEFAULT_USER_SLUG ?? '';
+  if (!isValidUserSlug(userSlug)) {
+    return Response.json({ ok: false, error: 'invalid user_slug' }, { status: 400 });
+  }
+  let device: GoogleDeviceCodeResponse;
+  try {
+    device = await requestDeviceCode({
+      clientId: requireOAuthClientId(env),
+      scopes: resolveWorkspaceOAuthScopes(env),
+      fetchImpl,
+    });
+  } catch (err) {
+    return Response.json(
+      { ok: false, error: err instanceof Error ? err.message : String(err) },
+      { status: 500 },
+    );
+  }
+  if (!device.device_code || !device.user_code || !(device.verification_url || device.verification_uri)) {
+    return Response.json({ ok: false, error: 'Google device response malformed' }, { status: 500 });
+  }
+  const state = crypto.randomUUID();
+  const scopes = resolveWorkspaceOAuthScopes(env);
+  const verificationUrl = device.verification_url || device.verification_uri || '';
+  const entry: WorkspaceDeviceState = {
+    state,
+    user_slug: userSlug,
+    device_code: device.device_code,
+    user_code: device.user_code,
+    verification_url: verificationUrl,
+    scopes,
+    created_at_ms: Date.now(),
+  };
+  await env.MAKOTO_KV.put(deviceKey(state), JSON.stringify(entry), {
+    expirationTtl: Math.min(Math.max(device.expires_in ?? STATE_TTL_SECONDS, 60), 1800),
+  });
+  return Response.json({
+    ok: true,
+    state,
+    user_code: device.user_code,
+    verification_url: verificationUrl,
+    verification_uri: verificationUrl,
+    expires_in: device.expires_in,
+    interval: device.interval,
+    poll_url: `${url.origin}/webhooks/oauth/google/workspace/device/poll?token=${encodeURIComponent(adminToken)}&state=${encodeURIComponent(state)}`,
+  });
+}
+
+export async function handleWorkspaceOAuthDevicePoll(
+  request: Request,
+  env: Env,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const adminToken = resolveWorkspaceOAuthAdminToken(env);
+  if (!adminToken) return new Response('not found', { status: 404 });
+  if ((url.searchParams.get('token') ?? '') !== adminToken) {
+    return new Response('not found', { status: 404 });
+  }
+  const state = url.searchParams.get('state') ?? '';
+  if (!state) return Response.json({ ok: false, error: 'missing state' }, { status: 400 });
+  const raw = await env.MAKOTO_KV.get(deviceKey(state));
+  if (!raw) return Response.json({ ok: false, error: 'device state expired' }, { status: 400 });
+  const entry = JSON.parse(raw) as WorkspaceDeviceState;
+  let token: GoogleTokenResponse;
+  try {
+    token = await pollDeviceToken({
+      deviceCode: entry.device_code,
+      clientId: requireOAuthClientId(env),
+      clientSecret: requireOAuthClientSecret(env),
+      fetchImpl,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('authorization_pending') || message.includes('slow_down')) {
+      return Response.json({ ok: false, pending: true, error: message }, { status: 202 });
+    }
+    return Response.json({ ok: false, error: message }, { status: 500 });
+  }
+  if (!token.refresh_token) {
+    return Response.json({ ok: false, error: 'Google did not return refresh_token' }, { status: 400 });
+  }
+  await env.MAKOTO_KV.delete(deviceKey(state));
+  await storeWorkspaceRefreshToken(env, entry.user_slug, token.refresh_token, entry.scopes, fetchImpl);
+  return Response.json({ ok: true, user_slug: entry.user_slug, scope: token.scope ?? '' });
+}
+
 export async function handleWorkspaceOAuthCallback(
   request: Request,
   env: Env,
@@ -112,7 +232,69 @@ export async function handleWorkspaceOAuthCallback(
     return oauthHtml('Google did not return refresh_token. Revoke app access and retry.', 400);
   }
 
-  const lease = getOAuthLease(env, entry.user_slug);
+  await storeWorkspaceRefreshToken(env, entry.user_slug, token.refresh_token, entry.scopes, fetchImpl);
+
+  return oauthHtml(
+    `Workspace OAuth registered for ${escapeHtml(entry.user_slug)}. You can close this tab.`,
+    200,
+  );
+}
+
+async function requestDeviceCode(input: {
+  clientId: string;
+  scopes: string[];
+  fetchImpl: typeof fetch;
+}): Promise<GoogleDeviceCodeResponse> {
+  assertBridgeEgressAllowed(GOOGLE_DEVICE_CODE_URL, 'workspace-oauth:device-code');
+  const resp = await input.fetchImpl(GOOGLE_DEVICE_CODE_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: input.clientId,
+      scope: input.scopes.join(' '),
+    }).toString(),
+  });
+  const body = (await resp.json().catch(() => ({}))) as GoogleDeviceCodeResponse;
+  if (!resp.ok) {
+    const msg = body.error_description || body.error || `HTTP ${resp.status}`;
+    throw new Error(`Google device code failed: ${msg}`);
+  }
+  return body;
+}
+
+async function pollDeviceToken(input: {
+  deviceCode: string;
+  clientId: string;
+  clientSecret: string;
+  fetchImpl: typeof fetch;
+}): Promise<GoogleTokenResponse> {
+  assertBridgeEgressAllowed(GOOGLE_TOKEN_URL, 'workspace-oauth:device-token');
+  const resp = await input.fetchImpl(GOOGLE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: input.clientId,
+      client_secret: input.clientSecret,
+      device_code: input.deviceCode,
+      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    }).toString(),
+  });
+  const body = (await resp.json().catch(() => ({}))) as GoogleTokenResponse;
+  if (!resp.ok) {
+    const msg = body.error_description || body.error || `HTTP ${resp.status}`;
+    throw new Error(`Google device token failed: ${msg}`);
+  }
+  return body;
+}
+
+async function storeWorkspaceRefreshToken(
+  env: Env,
+  userSlug: string,
+  refreshToken: string,
+  scopes: string[],
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  const lease = getOAuthLease(env, userSlug);
   await bootstrapUser(
     {
       db: env.DB,
@@ -123,23 +305,18 @@ export async function handleWorkspaceOAuthCallback(
       oauthLease: lease,
       fetchImpl,
     },
-    entry.user_slug,
-    token.refresh_token,
+    userSlug,
+    refreshToken,
     {
       callerSessionId: 'workspace-oauth-callback',
-      notes: `cloudflare_callback scopes=${entry.scopes.join(',')}`,
+      notes: `cloudflare_callback scopes=${scopes.join(',')}`,
     },
   );
   await lease.invalidate({
-    userSlug: entry.user_slug,
+    userSlug,
     callerSessionId: 'workspace-oauth-callback',
     reason: 'workspace_oauth_reauthorized',
   });
-
-  return oauthHtml(
-    `Workspace OAuth registered for ${escapeHtml(entry.user_slug)}. You can close this tab.`,
-    200,
-  );
 }
 
 async function exchangeCodeForToken(input: {
@@ -209,6 +386,10 @@ function requireOAuthClientSecret(env: Env): string {
 
 function stateKey(state: string): string {
   return `${STATE_PREFIX}:${state}`;
+}
+
+function deviceKey(state: string): string {
+  return `${DEVICE_PREFIX}:${state}`;
 }
 
 function isValidUserSlug(value: string): boolean {

@@ -45,6 +45,8 @@ import {
 } from "./lib/observability";
 import {
   handleWorkspaceOAuthCallback,
+  handleWorkspaceOAuthDevicePoll,
+  handleWorkspaceOAuthDeviceStart,
   handleWorkspaceOAuthStart,
 } from "./lib/workspace-oauth-flow";
 
@@ -91,6 +93,20 @@ export default {
       request.method === "GET"
     ) {
       return handleWorkspaceOAuthCallback(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/oauth/google/workspace/device/start" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthDeviceStart(request, env);
+    }
+
+    if (
+      url.pathname === "/webhooks/oauth/google/workspace/device/poll" &&
+      request.method === "GET"
+    ) {
+      return handleWorkspaceOAuthDevicePoll(request, env);
     }
 
     // AgentMail inbound webhook (svix protocol).
