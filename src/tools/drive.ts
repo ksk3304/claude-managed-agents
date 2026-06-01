@@ -390,6 +390,13 @@ export interface DriveCreateFileResult {
   [extra: string]: unknown;
 }
 
+export interface DriveUploadBinaryFileInput {
+  name: string;
+  content: ArrayBuffer;
+  mimeType: string;
+  parents?: string[];
+}
+
 /**
  * Create a new Drive file with the given UTF-8 text body. Uses Drive's
  * multipart upload endpoint so we can post metadata and content in a
@@ -483,6 +490,72 @@ export async function driveCreateFile(
     const snippet = await safeErrorSnippet(resp);
     throw new GoogleApiToolError(
       `drive_create_file HTTP ${resp.status}: ${snippet}`,
+      { status: resp.status, bodySnippet: snippet },
+    );
+  }
+  return (await resp.json()) as DriveCreateFileResult;
+}
+
+/**
+ * Internal binary upload helper for Worker-side artifacts (session outputs).
+ * Unlike `drive_create_file`, this is not exposed as an agent custom tool:
+ * the caller already has bytes from a trusted bridge-side source.
+ */
+export async function driveUploadBinaryFile(
+  input: DriveUploadBinaryFileInput,
+  deps: DriveToolDeps,
+): Promise<DriveCreateFileResult> {
+  const name = input.name.trim();
+  if (!name) {
+    throw new ToolSchemaError('drive_upload_binary_file: name is required');
+  }
+  const mimeType = input.mimeType.trim() || 'application/octet-stream';
+  let parents: string[] | undefined;
+  if (input.parents !== undefined) {
+    parents = input.parents.map((p) => {
+      if (typeof p !== 'string' || !/^[A-Za-z0-9_-]+$/.test(p)) {
+        throw new ToolSchemaError(
+          `drive_upload_binary_file: parents id ${JSON.stringify(String(p).slice(0, 32))} must match [A-Za-z0-9_-]+`,
+        );
+      }
+      return p;
+    });
+  }
+
+  const boundary = `boundary_${crypto.randomUUID().replace(/-/g, '')}`;
+  const meta: Record<string, unknown> = { name, mimeType };
+  if (parents) meta.parents = parents;
+  const metaJson = JSON.stringify(meta);
+  const prelude =
+    `--${boundary}\r\n` +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    metaJson +
+    `\r\n--${boundary}\r\n` +
+    `Content-Type: ${mimeType}\r\n\r\n`;
+  const closing = `\r\n--${boundary}--`;
+  const body = new Blob([prelude, input.content, closing], {
+    type: `multipart/related; boundary=${boundary}`,
+  });
+
+  const params = new URLSearchParams({
+    uploadType: 'multipart',
+    fields: 'id,name,mimeType,webViewLink,webContentLink,parents',
+    supportsAllDrives: 'true',
+  });
+  const url = `${DRIVE_UPLOAD_API_BASE}/files?${params.toString()}`;
+  const resp = await googleApiFetch(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    },
+    fetchOpts(deps),
+  );
+  if (!resp.ok) {
+    const snippet = await safeErrorSnippet(resp);
+    throw new GoogleApiToolError(
+      `drive_upload_binary_file HTTP ${resp.status}: ${snippet}`,
       { status: resp.status, bodySnippet: snippet },
     );
   }
