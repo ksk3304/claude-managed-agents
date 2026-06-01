@@ -31,12 +31,8 @@ interface ParityFixture {
 }
 
 describe('INTERNAL_STATE_PATTERNS canonical registry', () => {
-  it('exposes a non-empty list of pattern names', () => {
-    expect(INTERNAL_STATE_PATTERNS.length).toBeGreaterThan(0);
-  });
-  it('includes the headline literals', () => {
-    // These are the most-visible internal-state phrases — sanity check.
-    expect(INTERNAL_STATE_PATTERNS).toContain('memory store');
+  it('is empty until a specific blocker is intentionally reintroduced', () => {
+    expect(INTERNAL_STATE_PATTERNS).toEqual([]);
   });
 });
 
@@ -51,30 +47,30 @@ describe('scrubInternalStateForChat', () => {
     expect(r.text).toBe('Hello world');
     expect(r.hits).toEqual([]);
   });
-  it('replaces with the neutral template + jobId on any HIT', () => {
+  it('passes through legacy internal-state wording because no patterns are registered', () => {
     const r = scrubInternalStateForChat('memory store にアクセス', 'job-X');
-    expect(r.text).toBe('[job-X] 今回のタスクは完了できませんでした。担当者が確認します。');
-    expect(r.hits).toEqual(['memory store']);
+    expect(r.text).toBe('memory store にアクセス');
+    expect(r.hits).toEqual([]);
   });
 });
 
 describe('softenBenignInternalReferencesForChat', () => {
-  it('rewrites memory runtime paths before hard scrub', () => {
+  it('currently passes memory runtime paths through unchanged', () => {
     const softened = softenBenignInternalReferencesForChat(
       'まず `/mnt/memory/` に格納されている記憶を確認しました。',
     );
-    expect(softened.text).toBe('まず 社内記憶 に格納されている記憶を確認しました。');
-    expect(softened.replacements).toEqual(['mnt_memory_path']);
+    expect(softened.text).toBe('まず `/mnt/memory/` に格納されている記憶を確認しました。');
+    expect(softened.replacements).toEqual([]);
     expect(scrubInternalStateForChat(softened.text, 'job-1').hits).toEqual([]);
   });
 
-  it('does not hide hard failure wording from the neutral redactor', () => {
+  it('does not neutralize legacy hard failure wording while the pattern list is empty', () => {
     const softened = softenBenignInternalReferencesForChat(
       'memory store が未 attach のため対応できません',
     );
     const scrubbed = scrubInternalStateForChat(softened.text, 'job-1');
-    expect(scrubbed.hits).toEqual(['未 attach', 'memory store']);
-    expect(scrubbed.text).toContain('今回のタスクは完了できませんでした');
+    expect(scrubbed.hits).toEqual([]);
+    expect(scrubbed.text).toBe('memory store が未 attach のため対応できません');
   });
 });
 
