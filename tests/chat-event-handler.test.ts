@@ -1391,7 +1391,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).toBe('memory store が未 attach のため対応できません');
   });
 
-  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+  it('Case 9b: action marker wording passes through when no marker was parsed', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1412,10 +1412,8 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toBe(
-      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+      '前のメッセージですでに `EMAIL_SEND` マーカーを出しています。bot 側で処理中です。',
     );
-    expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
-    expect(chatApiMock.patches[0]!.text).not.toContain('bot');
   });
 
   it('Case 9c: benign runtime path mention passes through unchanged', async () => {

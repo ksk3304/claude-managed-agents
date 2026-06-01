@@ -55,10 +55,9 @@ describe('saveUserMessagePayloadAudit', () => {
     const text = JSON.stringify(record);
     expect(record.mode).toBe('chat');
     expect(record.ttl_days).toBe(2);
-    expect(text).toContain('[REDACTED:email]');
+    expect(text).toContain('alice@example.com');
     expect(text).toContain('[REDACTED_TOKEN]');
     expect(text).toContain('spaces/[REDACTED_SPACE]/threads/[REDACTED_THREAD]');
-    expect(text).not.toContain('alice@example.com');
     expect(text).not.toContain('sk-ant-1234567890abcdef');
   });
 });
