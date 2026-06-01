@@ -20,9 +20,9 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe('AgentMailClient.sendMessage', () => {
-  it('POSTs to /v0/inboxes/{inbox}/messages with the right body', async () => {
+  it('POSTs to /v0/inboxes/{inbox}/messages/send with the right body', async () => {
     const fetchMock = makeFetchMock(async (url, init) => {
-      expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/messages`);
+      expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/messages/send`);
       expect(init.method).toBe('POST');
       expect((init.headers as Record<string, string>)['authorization']).toBe(
         `Bearer ${API_KEY}`,
@@ -111,10 +111,12 @@ describe('AgentMailClient.sendMessage', () => {
 });
 
 describe('AgentMailClient.replyMessage', () => {
-  it('targets the /reply endpoint under the parent message id', async () => {
+  it('targets the /reply endpoint under the parent message id with text only', async () => {
     let url = '';
-    const fetchMock = makeFetchMock(async (u) => {
+    let body: Record<string, unknown> | null = null;
+    const fetchMock = makeFetchMock(async (u, init) => {
       url = u;
+      body = JSON.parse(init.body as string);
       return jsonResponse(200, { message_id: 'reply_1' });
     });
     const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
@@ -126,6 +128,7 @@ describe('AgentMailClient.replyMessage', () => {
       parentMessageId: 'parent_msg',
     });
     expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/messages/parent_msg/reply`);
+    expect(body).toEqual({ text: 'b' });
   });
 });
 

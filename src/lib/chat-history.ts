@@ -34,7 +34,6 @@
 
 import { assertBridgeEgressAllowed } from './egress-guard';
 import { getChatAccessToken, CHAT_BOT_SCOPE } from './chat-api';
-import type { ChatApiDeps } from './chat-api';
 
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
 
@@ -52,6 +51,8 @@ export const HISTORY_FAILURE_PERMANENT_THRESHOLD = 3;
 export const KV_HISTORY_FAIL_PREFIX = 'history:fail';
 /** KV key prefix for per-thread permanent-failure flag (TTL 24h). */
 export const KV_HISTORY_PERM_PREFIX = 'history:perm';
+/** KV key prefix for the last per-thread failure reason (TTL 24h). */
+export const KV_HISTORY_ERROR_PREFIX = 'history:error';
 /** TTL for both counter + permanent flag KV keys. */
 export const HISTORY_FAILURE_KV_TTL_SEC = 24 * 60 * 60;
 /** Chat REST read-only scope (= Python `SCOPES_CHAT_READONLY`). */
@@ -77,6 +78,24 @@ export interface ThreadHistoryMessage {
   text: string;
   /** Raw `createTime` ISO8601 (informational; may be empty when API omits it). */
   createTime: string;
+}
+
+export interface ChatHistoryDeps {
+  /**
+   * Preferred production path: user OAuth access token with
+   * `chat.messages.readonly`. Service-account JWT tokens cannot read
+   * Chat message history in all Workspace configurations.
+   */
+  accessToken?: string;
+  /**
+   * Legacy/test fallback. Kept so unit tests and emergency rollback can
+   * still exercise the old service-account exchange path.
+   */
+  saKeyJson?: string;
+  /** Override `fetch` for tests. */
+  fetchImpl?: typeof fetch;
+  /** Override scopes for the legacy service-account fallback. */
+  scopes?: readonly string[];
 }
 
 export interface FetchThreadMessagesOptions {
@@ -127,7 +146,7 @@ export class ChatHistoryFetchError extends Error {
  * the permanent-failure path (= `recordHistoryFailure`).
  */
 export async function fetchThreadMessages(
-  deps: ChatApiDeps,
+  deps: ChatHistoryDeps,
   spaceName: string,
   threadName: string,
   options: FetchThreadMessagesOptions = {},
@@ -172,7 +191,7 @@ export async function fetchThreadMessages(
       // Always re-mint token here — Anthropic SDK does its own caching;
       // here we lean on `getChatAccessToken`'s module-level cache so
       // 2nd/3rd attempts within a page don't redundantly exchange JWTs.
-      const token = await getChatAccessToken(deps, scopes);
+      const token = await getHistoryAccessToken(deps, scopes);
       let response: Response;
       try {
         response = await fetchImpl(url, {
@@ -293,6 +312,27 @@ export async function fetchThreadMessages(
   return messages;
 }
 
+async function getHistoryAccessToken(
+  deps: ChatHistoryDeps,
+  scopes: readonly string[],
+): Promise<string> {
+  if (deps.accessToken) return deps.accessToken;
+  if (!deps.saKeyJson) {
+    throw new ChatHistoryFetchError(
+      'fetchThreadMessages requires accessToken or saKeyJson',
+      0,
+    );
+  }
+  return getChatAccessToken(
+    {
+      saKeyJson: deps.saKeyJson,
+      fetchImpl: deps.fetchImpl,
+      scopes: deps.scopes,
+    },
+    scopes,
+  );
+}
+
 export interface FormatThreadHistoryOptions {
   /**
    * Resource name of the message currently being processed by the
@@ -410,6 +450,7 @@ export function formatThreadHistory(
  * KV layout:
  *   - `history:fail:<thread>` — counter (string-encoded integer), TTL 24h
  *   - `history:perm:<thread>` — "1" once threshold tripped, TTL 24h
+ *   - `history:error:<thread>` — last failure reason, TTL 24h
  *
  * NOTE: this is best-effort. KV is eventually consistent, and the
  * read-modify-write here can race when two events for the same thread
@@ -419,9 +460,17 @@ export function formatThreadHistory(
 export async function recordHistoryFailure(
   kv: KVNamespace,
   threadName: string,
+  reason?: string,
 ): Promise<{ count: number; permanent: boolean; firstPermanentTrip: boolean }> {
   const counterKey = `${KV_HISTORY_FAIL_PREFIX}:${threadName}`;
   const permKey = `${KV_HISTORY_PERM_PREFIX}:${threadName}`;
+  if (reason) {
+    await kv.put(
+      `${KV_HISTORY_ERROR_PREFIX}:${threadName}`,
+      reason.slice(0, 1000),
+      { expirationTtl: HISTORY_FAILURE_KV_TTL_SEC },
+    );
+  }
   const prevRaw = await kv.get(counterKey);
   const prev = prevRaw ? Number.parseInt(prevRaw, 10) : 0;
   const count = (Number.isFinite(prev) && prev > 0 ? prev : 0) + 1;
@@ -449,6 +498,7 @@ export async function clearHistoryFailure(
 ): Promise<void> {
   await kv.delete(`${KV_HISTORY_FAIL_PREFIX}:${threadName}`);
   await kv.delete(`${KV_HISTORY_PERM_PREFIX}:${threadName}`);
+  await kv.delete(`${KV_HISTORY_ERROR_PREFIX}:${threadName}`);
 }
 
 /** Read current counter (test / diagnostic helper). */

@@ -22,7 +22,7 @@ import {
 import { agentmailDispatch } from "./queue/agentmail-dispatch";
 import type { AgentMailQueueMessage } from "./webhooks/agentmail";
 import { handleGoogleChatWebhook } from "./webhooks/google-chat";
-import type { ChatQueueMessage } from "./webhooks/google-chat";
+import type { ChatEventPayload, ChatQueueMessage } from "./webhooks/google-chat";
 import { handleChatQueue } from "./queue/chat-event-handler";
 import { ThreadLock } from "./durable-objects/thread-lock";
 import { OAuthLease } from "./durable-objects/oauth-lease";
@@ -32,7 +32,17 @@ import {
 } from "./storage";
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
+import {
+  enqueueMorningBriefSeto,
+  MORNING_BRIEF_SETO_CRON,
+} from "./scheduled/morning-brief";
 import { buildAnthropicClient } from "./lib/session";
+import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
+import {
+  recordChatWebhookPayload,
+  recordRuntimeEvent,
+  pruneObservability,
+} from "./lib/observability";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -83,33 +93,60 @@ export default {
       return handleGoogleChatWebhook(request, env);
     }
 
+    // Issue #206 observability smoke endpoint. This deliberately bypasses
+    // Google Chat OIDC and exists only for operator-triggered smoke tests.
+    // No secret = 404, so production keeps the route inert by default.
+    if (
+      url.pathname === "/webhooks/issue-206/chat-observe" &&
+      request.method === "POST"
+    ) {
+      return handleIssue206ChatObserve(request, env);
+    }
+
     return new Response("not found", { status: 404 });
   },
 
   // Cron dispatcher — wrangler.jsonc `triggers.crons` 経由で複数 schedule を
   // 受ける. `controller.cron` で経路を分岐する:
   //   - `0 4 * * *` (4 AM UTC) → 既存 daily prune (dedupe / webhook_seen)
-  //   - `0 14 * * *` (14:00 UTC = 23:00 JST) → daily-report (前日 JST の
+  //   - `30 15 * * *` (15:30 UTC = 00:30 JST) → daily-report (前日 JST の
   //     セッションログを Memory Store に集約・要約・書き込み)
+  //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
+  //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
   async scheduled(
     controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    if (controller.cron === "0 14 * * *") {
+    if (controller.cron === "30 15 * * *") {
       ctx.waitUntil(runDailyReportCron(env));
+      return;
+    }
+    if (controller.cron === MORNING_BRIEF_SETO_CRON) {
+      ctx.waitUntil(enqueueMorningBriefSeto(env));
       return;
     }
     // default = prune cron (`0 4 * * *`). 旧 path を保持.
     const cutoff = Date.now() - ONE_DAY_MS;
+    const eventKey = `prune:${controller.cron}:${Date.now()}`;
     ctx.waitUntil(
       (async () => {
+        await recordRuntimeEvent(env, {
+          eventKey,
+          eventType: "cron_prune_start",
+          source: "cron.prune",
+          detail: { cron: controller.cron, cutoff },
+        });
+        const detail: Record<string, unknown> = { cron: controller.cron, cutoff };
         try {
           const result = await pruneOlderThan(env.DB, cutoff);
+          detail.sentMessages = result.sentMessages;
           console.log(
             `[cron] prune sentMessages=${result.sentMessages} cutoff=${new Date(cutoff).toISOString()}`,
           );
         } catch (error) {
+          detail.sentMessagesError =
+            error instanceof Error ? error.message : String(error);
           console.error("[cron] prune failed", error);
         }
         // AgentMail bridge prunes — kept on the same daily tick so
@@ -119,12 +156,34 @@ export default {
         try {
           const dedupePruned = await pruneExpiredDedupe(env.DB);
           const seenPruned = await pruneExpiredAgentMailWebhookSeen(env.DB);
+          const observabilityPruned = await pruneObservability(env);
+          detail.dedupePruned = dedupePruned;
+          detail.webhookSeenPruned = seenPruned;
+          detail.observabilityPruned = observabilityPruned;
           console.log(
             `[cron] agentmail-prune dedupe=${dedupePruned} webhook_seen=${seenPruned}`,
           );
+          console.log(
+            `[cron] observability-prune webhook_payloads=${observabilityPruned.webhookPayloads} ` +
+              `runtime_events=${observabilityPruned.runtimeEvents} ` +
+              `session_binds=${observabilityPruned.sessionBinds} ` +
+              `payload_audit=${observabilityPruned.payloadAudit}`,
+          );
         } catch (error) {
+          detail.agentmailPruneError =
+            error instanceof Error ? error.message : String(error);
           console.error("[cron] agentmail prune failed", error);
         }
+        const hasError =
+          typeof detail.sentMessagesError === "string" ||
+          typeof detail.agentmailPruneError === "string";
+        await recordRuntimeEvent(env, {
+          eventKey,
+          eventType: hasError ? "cron_prune_failed" : "cron_prune_done",
+          level: hasError ? "error" : "info",
+          source: "cron.prune",
+          detail,
+        });
       })(),
     );
   },
@@ -169,7 +228,7 @@ export default {
 // ----------------------------------------------------------------------------
 
 /**
- * `0 14 * * *` (= 23:00 JST) tick で起動する daily-report バッチ.
+ * `30 15 * * *` (= 00:30 JST) tick で起動する daily-report バッチ.
  * `src/scheduled/daily-report.ts:generateDailyReports` に処理を委譲する.
  * Anthropic client の組み立て / env override 解決 / 起動ログだけここで行う.
  */
@@ -182,21 +241,136 @@ async function runDailyReportCron(env: Env): Promise<void> {
   const model = env.DAILY_REPORT_MODEL || "claude-haiku-4-5";
   const dateLabel = env.DAILY_REPORT_DATE || defaultDateLabel(new Date());
   const dryRun = env.DAILY_REPORT_DRY_RUN === "1";
+  const eventKey = `daily_report:${dateLabel}:${Date.now()}`;
   console.log(
     `[cron] daily-report start date=${dateLabel} model=${model} dry_run=${dryRun}`,
   );
+  await recordRuntimeEvent(env, {
+    eventKey,
+    eventType: "daily_report_start",
+    source: "cron.daily-report",
+    detail: { dateLabel, model, dryRun },
+  });
   try {
     const result = await generateDailyReports({
       kv: env.MAKOTO_KV,
       client,
       dateLabel,
       model,
+      environmentId: env.ENVIRONMENT_ID,
       dryRun,
     });
     console.log(
       `[cron] daily-report done date=${dateLabel} routes=${JSON.stringify(result)}`,
     );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      eventType: "daily_report_done",
+      source: "cron.daily-report",
+      detail: { dateLabel, model, dryRun, result },
+    });
   } catch (error) {
     console.error("[cron] daily-report failed", error);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      eventType: "daily_report_failed",
+      level: "error",
+      source: "cron.daily-report",
+      detail: {
+        dateLabel,
+        model,
+        dryRun,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
+}
+
+interface Issue206DebugBody {
+  runId?: string;
+  text?: string;
+  senderEmail?: string;
+  senderName?: string;
+  spaceName?: string;
+  threadName?: string;
+  messageName?: string;
+}
+
+async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Response> {
+  const expected = (env.MAKOTO_DEBUG_TOKEN ?? "").trim();
+  if (!expected) return new Response("not found", { status: 404 });
+  const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
+  if (got !== expected) return new Response("not found", { status: 404 });
+
+  let body: Issue206DebugBody;
+  try {
+    body = (await request.json()) as Issue206DebugBody;
+  } catch {
+    return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  const runId = safeDebugId(body.runId || `issue206-${Date.now()}`);
+  const spaceName = body.spaceName || "spaces/issue206-smoke";
+  const threadName = body.threadName || `${spaceName}/threads/${runId}`;
+  const messageName = body.messageName || `${spaceName}/messages/${runId}`;
+  const senderEmail = body.senderEmail || "issue206-smoke@example.com";
+  const event: ChatEventPayload = {
+    type: "MESSAGE",
+    eventTime: new Date().toISOString(),
+    space: { name: spaceName, type: "DM", displayName: "Issue 206 smoke" },
+    user: { name: body.senderName || "users/issue206", email: senderEmail },
+    message: {
+      name: messageName,
+      sender: {
+        name: body.senderName || "users/issue206",
+        displayName: "Issue 206 Smoke",
+        email: senderEmail,
+      },
+      text: body.text || "#206 observability smoke",
+      thread: { name: threadName },
+      annotations: [],
+      attachment: [],
+    },
+  };
+  const eventKey = `chat:msgname:${messageName}`;
+  const owner = newClaimOwner("issue206-debug");
+  const claim = await tryClaim(env.DB, eventKey, owner);
+  if (claim.state === "DONE_DUPLICATE" || claim.state === "LEASE_ALIVE") {
+    return Response.json({ ok: true, duplicate: true, eventKey, claimState: claim.state });
+  }
+  if (claim.owner === undefined || claim.version === undefined) {
+    return Response.json({ ok: false, error: "unexpected claim state" }, { status: 500 });
+  }
+  await recordChatWebhookPayload(env, eventKey, event);
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId: messageName,
+    eventType: "debug_chat_observe_enqueued",
+    source: "issue-206-debug-endpoint",
+    detail: { run_id: runId, text_chars: event.message?.text?.length ?? 0 },
+  });
+  const queueMsg: ChatQueueMessage = {
+    eventKey,
+    receivedAtMs: Date.now(),
+    claim: { owner: claim.owner, version: claim.version },
+    payload: event,
+  };
+  try {
+    await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
+  } catch (err) {
+    await releaseClaim(env.DB, eventKey, claim.owner, claim.version);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: messageName,
+      eventType: "debug_chat_observe_enqueue_failed",
+      level: "error",
+      source: "issue-206-debug-endpoint",
+      detail: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return Response.json({ ok: false, eventKey, error: "queue send failed" }, { status: 500 });
+  }
+  return Response.json({ ok: true, eventKey, sessionLookup: { spaceName, threadName, senderEmail } });
+}
+
+function safeDebugId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.:-]/g, "-").slice(0, 80) || "issue206-smoke";
 }

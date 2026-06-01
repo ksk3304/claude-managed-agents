@@ -82,6 +82,17 @@ declare namespace Cloudflare {
      */
     WORKER_INSTANCE_ID?: string;
 
+    /** Incident/debug-only payload audit switch. Normal operation leaves this unset/off. */
+    CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Reactive Chat session watchdog override in seconds. Unset = 600. */
+    CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
+    /** Anthropic custom Skill id for outbound mail composition. */
+    MAIL_SEND_SKILL_ID?: string;
+    /** Optional pinned version for MAIL_SEND_SKILL_ID. */
+    MAIL_SEND_SKILL_VERSION?: string;
+    /** Secret-gated debug endpoint token. Unset means debug endpoints return 404. */
+    MAKOTO_DEBUG_TOKEN?: string;
+
     /**
      * Optional default user_slug for the Chat reactive path. When set,
      * `chat-event-handler.ts` step 5 falls back to
@@ -94,6 +105,22 @@ declare namespace Cloudflare {
      * (`memory-attach.ts:resolveSenderToResources` comment).
      */
     DEFAULT_USER_SLUG?: string;
+    /**
+     * When "1", Chat reactive path creates chat-only pending mappings under
+     * `chat_pending_user_mapping:*` for first-time senders that miss
+     * `user_mapping:<email>` but can fall back to `DEFAULT_USER_SLUG`.
+     * Pending mappings are untrusted: normal replies are allowed, external
+     * tools remain gated. Default unset/off preserves current production
+     * behaviour.
+     */
+    CHAT_AUTO_PENDING_USER_MAPPING_ENABLED?: string;
+    /** Operator Google Chat space for Cost Guard warning notifications. */
+    COST_GUARD_OPERATOR_SPACE?: string;
+    COST_GUARD_ENABLED?: string;
+    COST_GUARD_SESSION_THRESHOLDS_USD?: string;
+    COST_GUARD_SESSION_STEP_USD?: string;
+    COST_GUARD_USD_TO_JPY?: string;
+    COST_GUARD_SESSION_PRICING_MODEL?: string;
 
     /**
      * KV namespace for the MAKOTO bridge: sender→user_slug→agent_id

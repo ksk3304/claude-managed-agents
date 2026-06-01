@@ -16,6 +16,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   buildAnthropicClient,
+  sendAndStream,
   sendAndStreamWithToolDispatch,
   type ToolDispatcher,
 } from '../src/lib/session';
@@ -179,6 +180,46 @@ describe('sendAndStreamWithToolDispatch', () => {
     });
     expect(r.assistantText).toContain('了解です。');
     expect(r.assistantText).toContain('作成しました！');
+    expect(r.stopReason).toBe('end_turn');
+  });
+
+  it('ignores a stale idle boundary before the newly-sent turn starts', async () => {
+    const client = makeFakeClient({
+      events: [
+        { type: 'session.status_running' },
+        { type: 'session.thread_status_running' },
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: 'previous prompt' }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'previous text' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+        { type: 'session.status_running' },
+        { type: 'session.thread_status_running' },
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: 'recover' }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'recovered text' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_recovery',
+      userMessage: 'recover',
+      toolDispatcher: dispatcher,
+      startAfterUserMessageEcho: true,
+    });
+    expect(r.assistantText).toBe('recovered text');
+    expect(r.assistantText).not.toContain('previous text');
+    expect(r.terminalEventType).toBe('session.status_idle');
     expect(r.stopReason).toBe('end_turn');
   });
 
@@ -350,5 +391,27 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.assistantText).toBe('done.');
     expect(r.terminalEventType).toBe('session.status_idle');
     expect(r.stopReason).toBe('end_turn');
+  });
+});
+
+describe('sendAndStream', () => {
+  it('accumulates agent.message content blocks into assistantText', async () => {
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.message',
+          content: [
+            { type: 'text', text: 'Hello, ' },
+            { type: 'text', text: 'world.' },
+          ],
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+    const r = await sendAndStream(client, {
+      sessionId: 'sesn_1',
+      userMessage: 'hi',
+    });
+    expect(r.assistantText).toBe('Hello, world.');
   });
 });

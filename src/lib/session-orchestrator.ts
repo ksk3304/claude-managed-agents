@@ -23,7 +23,7 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { getOrCreateResources, skillsHash, type AgentCacheBindings } from './agent-cache';
+import { skillsHash } from './agent-cache';
 import {
   buildAllManagedAgentSkills,
   ensureManagedAgentSkills,
@@ -51,13 +51,22 @@ import {
   type SpeakerEnvelopeOption,
   type CapEnvelopeOption,
 } from './user-message-envelope';
+import {
+  recordPayloadAudit,
+  recordRuntimeEvent,
+  recordSessionBind,
+  sessionKeyHash,
+} from './observability';
 
-/** KV key prefix for thread → session lookup. TTL 24h. */
+/** Historical broad scope prefix. Do not use for Google Chat reactive session lookup. */
+export const KV_CHAT_SCOPE_SESSION_PREFIX = 'chat_scope_session';
+/** KV key prefix for sender + space + thread → session lookup. TTL 24h. */
 export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
+const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
  * `_session_key_for_thread` (Python l.494-512) と byte 等価な KV key を
@@ -77,6 +86,32 @@ export function chatThreadSessionKey(
   if (!email || !space || !thread) return null;
   const suffix = skillsKey && skillsKey !== 'none' ? `:skills-${skillsKey}` : '';
   return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}${suffix}`;
+}
+
+/**
+ * Grill Me 正本の session key。社員 agent を owner とし、DM / space scope
+ * 単位で継続する。DM の user_id は現入力では email までしか来ないため、
+ * senderEmail を scope_id として使う。
+ */
+export function chatScopeSessionKey(
+  agentId: string,
+  spaceType: string,
+  senderEmail: string,
+  spaceName: string,
+): string | null {
+  const agent = (agentId || '').trim();
+  const normalizedSpaceType = (spaceType || '').trim().toUpperCase();
+  const email = (senderEmail || '').trim().toLowerCase();
+  const space = (spaceName || '').trim();
+  if (!agent) return null;
+
+  if (normalizedSpaceType === 'DM') {
+    if (!email) return null;
+    return `${KV_CHAT_SCOPE_SESSION_PREFIX}:${agent}:dm:${email}`;
+  }
+
+  if (!space) return null;
+  return `${KV_CHAT_SCOPE_SESSION_PREFIX}:${agent}:space:${space}`;
 }
 
 /**
@@ -109,24 +144,17 @@ export interface OrchestrateChatTurnInput {
    * または未指定なら従来通り text-only。
    */
   extraContentBlocks?: UserMessageContentBlock[];
+  /**
+   * true のとき、thread KV の既存 session を読まず、作成した session も
+   * thread KV に保存しない。Google Chat 通常経路では使わない。
+   */
+  forceFreshSession?: boolean;
   /** Override KV (test 用)。未指定なら env.MAKOTO_KV を使う. */
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
-  /**
-   * Action skill (= attach_memory=false) 起動時に true で渡す (Issue #186
-   * 既知 #4 intent-detector 統合)。
-   *
-   * true のとき:
-   *   - KV thread session lookup を skip (= 既存 session を再利用しない)
-   *   - sessions.create で生成した新 sessionId を KV put しない
-   *     (= 次ターン以降も ephemeral 経路を踏ませる)
-   *
-   * 効果: Cloud Run `cma_gchat_bot.py:_handle_event:l.4002-4013` 等価。
-   * 「スレッド 2 通目以降の "メールして" が前セッションの memory + bash
-   * 前提で暴走する」(incident 2026-05-08 同根) を防ぐ。
-   */
-  forceFreshSession?: boolean;
+  /** Session watchdog override (test / incident-debug 用)。 */
+  sessionWatchdogSec?: number;
   /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
@@ -156,10 +184,14 @@ export interface OrchestrateChatTurnInput {
    * で完全差し替え (Python recovery semantics)。未指定 = 通常 turn (旧挙動互換).
    */
   cap?: CapEnvelopeOption;
+  /** Observability correlation id: `chat:msgname:<message.name>`. */
+  eventKey?: string;
+  /** Google Chat message resource name. */
+  messageId?: string;
   /**
-   * External Anthropic Skills to attach by creating / reusing a dedicated
-   * Managed Agent via `agent-cache`. Empty/undefined keeps the Console-mapped
-   * `userMapping.agent_id` path unchanged.
+   * Deprecated compatibility field. Attached skills must already live on the
+   * employee agent (`userMapping.agent_id`); this orchestrator no longer creates
+   * per-skill agents/environments.
    */
   attachedSkills?: Array<Record<string, unknown>> | null;
 }
@@ -205,6 +237,26 @@ export class OrchestratorFailure extends Error {
     this.reason = reason;
     this.cause = cause;
   }
+}
+
+export function resolveReactiveSessionWatchdogSec(
+  raw: string | undefined,
+): number | undefined {
+  const value = (raw ?? '').trim();
+  if (value === '') return undefined;
+  const parsed = Number(value);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < 0 ||
+    parsed > DEFAULT_SESSION_WATCHDOG_SEC
+  ) {
+    console.warn(
+      `[chat-event] invalid CMA_REACTIVE_SESSION_WATCHDOG_SEC=${JSON.stringify(value)} ` +
+        `fallback=${DEFAULT_SESSION_WATCHDOG_SEC}`,
+    );
+    return undefined;
+  }
+  return parsed;
 }
 
 /**
@@ -289,18 +341,21 @@ export async function orchestrateChatTurn(
   }
 
   // ---- thread session 解決 ----
-  // `forceFreshSession=true` のときは KV lookup を skip (= 既存 session を
-  // 再利用しない、Issue #186 既知 #4 intent-detector 統合)。Cloud Run
-  // `_handle_event:l.4002-4013` 等価で「スレッド 2 通目以降の メールして」
-  // が前セッションの memory + bash 前提で暴走する」を防ぐ。
-  const sessionKey = chatThreadSessionKey(
-    input.senderEmail,
-    input.spaceName,
-    input.threadName,
-    attachedSkillsHash,
-  );
+  // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
+  // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
+  // 古い CMA session を継続してしまうため、scope key への fallback はしない。
+  // skills hash を suffix に含め、document skills 付与前の session を再利用しない。
+  const forceFreshSession = input.forceFreshSession === true;
+  const sessionKey = forceFreshSession
+    ? null
+    : chatThreadSessionKey(
+        input.senderEmail,
+        input.spaceName,
+        input.threadName,
+        attachedSkillsHash,
+      );
   let sessionId: string | null = null;
-  if (sessionKey !== null && !input.forceFreshSession) {
+  if (sessionKey !== null) {
     try {
       sessionId = await kv.get(sessionKey);
     } catch (err) {
@@ -316,53 +371,14 @@ export async function orchestrateChatTurn(
   if (sessionId === null) {
     const resources: MemoryStoreResourceParam[] =
       input.userMapping.memory_attachments.map(toResourceParam);
-    let agentId = input.userMapping.agent_id;
-    let environmentId = input.env.ENVIRONMENT_ID;
+    const agentId = input.userMapping.agent_id;
+    const environmentId = input.env.ENVIRONMENT_ID;
     const attachedSkills = input.attachedSkills ?? null;
-
     if (hasAttachedSkills(attachedSkills)) {
-      try {
-        const skillResources = await getOrCreateResources(
-          {
-            DB: input.env.DB as unknown as AgentCacheBindings['DB'],
-            MAKOTO_KV: input.env.MAKOTO_KV as unknown as AgentCacheBindings['MAKOTO_KV'],
-          },
-          async (createOpts) => {
-            const agent = await client.beta.agents.create({
-              name: createOpts.agentName,
-              model: createOpts.model,
-              system: createOpts.system,
-              tools: createOpts.tools as unknown as Anthropic.Beta.Agents.AgentCreateParams['tools'],
-              skills: createOpts.skills as unknown as Anthropic.Beta.Agents.AgentCreateParams['skills'],
-            });
-            const environment = await client.beta.environments.create({
-              name: createOpts.environmentName,
-            });
-            return { agent_id: agent.id, environment_id: environment.id };
-          },
-          {
-            agentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            environmentName: `makoto-kun-${input.userMapping.user_slug}-mail-send`,
-            system: systemPromptInfo.systemPrompt,
-            skills: attachedSkills,
-            userSlug: input.userMapping.user_slug,
-          },
-        );
-        agentId = skillResources.agent_id;
-        environmentId = skillResources.environment_id;
-        console.log(
-          `[chat-event] attached-skill agent resolved agent=${agentId} ` +
-            `env=${environmentId} source=${skillResources.source} user=${input.userMapping.user_slug}`,
-        );
-      } catch (err) {
-        throw new OrchestratorFailure(
-          'sessions_create_failed',
-          `attached skill agent create failed for user=${input.userMapping.user_slug}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          err,
-        );
-      }
+      console.warn(
+        `[chat-event] attachedSkills ignored user=${input.userMapping.user_slug}; ` +
+          'using mapped employee agent/session',
+      );
     }
 
     try {
@@ -374,7 +390,9 @@ export async function orchestrateChatTurn(
     } catch (err) {
       throw new OrchestratorFailure(
         'sessions_create_failed',
-        `sessions.create failed for agent=${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+        `sessions.create failed for agent=${input.userMapping.agent_id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
         err,
       );
     }
@@ -384,10 +402,7 @@ export async function orchestrateChatTurn(
         `user=${input.userMapping.user_slug} space=${input.spaceName}` +
         (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
-    // `forceFreshSession=true` のときは KV put も skip (= 次ターン以降も
-    // 毎回 ephemeral 経路を踏ませる)。Cloud Run `_handle_event:l.4010-4013`
-    // 「session_key = None で thread_sessions に保存しない」と等価。
-    if (sessionKey !== null && !input.forceFreshSession) {
+    if (sessionKey !== null) {
       try {
         await kv.put(sessionKey, sessionId, {
           expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
@@ -404,6 +419,33 @@ export async function orchestrateChatTurn(
       `[chat-event] continuing session=${sessionId} agent=${input.userMapping.agent_id} ` +
         `user=${input.userMapping.user_slug} space=${input.spaceName}`,
     );
+  }
+
+  if (input.eventKey) {
+    await recordSessionBind(input.env, {
+      senderEmail: input.senderEmail,
+      spaceName: input.spaceName,
+      threadName: input.threadName,
+      sessionId,
+      eventKey: input.eventKey,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      isNewSession,
+    });
+    await recordRuntimeEvent(input.env, {
+      eventKey: input.eventKey,
+      sessionId,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      eventType: isNewSession ? 'cma_session_created' : 'cma_session_continued',
+      source: 'session-orchestrator',
+      detail: {
+        force_fresh_session: forceFreshSession,
+        session_key_kind: sessionKey === null ? 'none' : 'chat_thread',
+        thread_name_present: Boolean(input.threadName),
+        has_thread_session_key: sessionKey !== null,
+      },
+    });
   }
 
   // ---- user message envelope ----
@@ -439,16 +481,105 @@ export async function orchestrateChatTurn(
       ? userMessageText
       : [{ type: 'text', text: userMessageText }, ...extraBlocks];
 
+  if (input.eventKey) {
+    const session_key_hash = sessionKeyHash(
+      input.senderEmail,
+      input.spaceName,
+      input.threadName,
+    );
+    await recordRuntimeEvent(input.env, {
+      eventKey: input.eventKey,
+      sessionId,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      eventType: 'prompt_envelope_built',
+      source: 'session-orchestrator',
+      detail: {
+        body_chars: input.bodyText.length,
+        history_chars: input.historyBlock?.length ?? 0,
+        speaker_context_chars: input.speakerContextBlock?.length ?? 0,
+        roster_chars: input.rosterBlock?.length ?? 0,
+        extra_content_blocks: extraBlocks.length,
+        envelope_chars: userMessageText.length,
+        has_intent: Boolean(input.intent),
+      },
+    });
+    await recordPayloadAudit(input.env, {
+      sessionId,
+      eventKey: input.eventKey,
+      messageId: input.messageId ?? null,
+      userSlug: input.userMapping.user_slug,
+      sessionKeyHash: session_key_hash,
+      payload: {
+        user_message: userMessage,
+        envelope_stats: {
+          body_chars: input.bodyText.length,
+          history_chars: input.historyBlock?.length ?? 0,
+          speaker_context_chars: input.speakerContextBlock?.length ?? 0,
+          envelope_chars: userMessageText.length,
+          extra_content_blocks: extraBlocks.length,
+        },
+      },
+    });
+  }
+
   // ---- stream consume ----
   let streamResult: SendAndStreamResult;
+  const sessionWatchdogSec =
+    input.sessionWatchdogSec ??
+    resolveReactiveSessionWatchdogSec(input.env.CMA_REACTIVE_SESSION_WATCHDOG_SEC);
   try {
     streamResult = await sendAndStreamWithToolDispatch(client, {
       sessionId,
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+      sessionWatchdogSec,
+      payloadAudit: {
+        kv,
+        enabled: input.env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+        ttlDays: input.env.CMA_AUDIT_TTL_DAYS,
+        maxTextChars: input.env.CMA_AUDIT_MAX_TEXT_CHARS,
+        mode: 'chat',
+        context: {
+          sender_email: input.senderEmail,
+          space_name: input.spaceName,
+          space_type: input.spaceType,
+          thread_name: input.threadName ?? '',
+          agent_id: input.userMapping.agent_id,
+        },
+      },
     });
+    if (input.eventKey) {
+      await recordRuntimeEvent(input.env, {
+        eventKey: input.eventKey,
+        sessionId,
+        messageId: input.messageId ?? null,
+        userSlug: input.userMapping.user_slug,
+        eventType: 'cma_events_send_completed',
+        source: 'session-orchestrator',
+        detail: {
+          assistant_chars: streamResult.assistantText.length,
+          terminal_event_type: streamResult.terminalEventType ?? null,
+          stop_reason: streamResult.stopReason ?? null,
+          session_watchdog_sec:
+            sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
+        },
+      });
+    }
   } catch (err) {
+    if (input.eventKey) {
+      await recordRuntimeEvent(input.env, {
+        eventKey: input.eventKey,
+        sessionId,
+        messageId: input.messageId ?? null,
+        userSlug: input.userMapping.user_slug,
+        eventType: 'cma_events_send_failed',
+        level: 'error',
+        source: 'session-orchestrator',
+        detail: { error: err instanceof Error ? err.message : String(err) },
+      });
+    }
     throw new OrchestratorFailure(
       'stream_failed',
       `sendAndStreamWithToolDispatch failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,

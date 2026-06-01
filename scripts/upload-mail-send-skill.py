@@ -24,12 +24,17 @@ BETA_HEADER = "skills-2025-10-02"
 
 
 def load_api_key() -> str:
-    sibling = Path(__file__).resolve().parents[2] / "makoto-prime" / "scripts"
-    if sibling.exists():
-        sys.path.insert(0, str(sibling))
-        import cma_lib  # type: ignore
+    root = Path(__file__).resolve()
+    candidates = [
+        root.parents[2] / "makoto-prime" / "scripts",
+        root.parents[3] / "makoto-prime" / "scripts",
+    ]
+    for sibling in candidates:
+        if sibling.exists():
+            sys.path.insert(0, str(sibling))
+            import cma_lib  # type: ignore
 
-        return cma_lib.load_api_key()
+            return cma_lib.load_api_key()
 
     import os
 

@@ -28,6 +28,7 @@ import {
   handleHistoryFetchPermanentFailure,
   ChatHistoryFetchError,
   HISTORY_FAILURE_PERMANENT_THRESHOLD,
+  KV_HISTORY_ERROR_PREFIX,
   CHAT_READONLY_SCOPE,
   type ThreadHistoryMessage,
 } from '../src/lib/chat-history';
@@ -132,6 +133,36 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('fetchThreadMessages — happy path', () => {
+  it('uses a provided user OAuth access token without service-account exchange', async () => {
+    const fetchMock = makeFetchMock(async (url, init) => {
+      if (url === TOKEN_URL) {
+        throw new Error('service-account token exchange should not run');
+      }
+      expect(init.headers).toEqual({
+        Authorization: 'Bearer user-oauth-token',
+        Accept: 'application/json',
+      });
+      return jsonResponse(200, {
+        messages: [
+          {
+            name: 'spaces/AAA/messages/M1',
+            text: 'ユーザーOAuthで読める',
+            sender: { name: 'users/100', type: 'HUMAN' },
+          },
+        ],
+      });
+    });
+
+    const messages = await fetchThreadMessages(
+      { accessToken: 'user-oauth-token', fetchImpl: fetchMock },
+      SPACE,
+      THREAD,
+    );
+
+    expect(fetchMock.calls.length).toBe(1);
+    expect(messages.map((m) => m.text)).toEqual(['ユーザーOAuthで読める']);
+  });
+
   it('returns chronologically-ordered messages with text + sender info', async () => {
     const fetchMock = routeFetch((page) => {
       // desc page from the API: newest first.
@@ -400,17 +431,29 @@ describe('recordHistoryFailure — KV counter + permanent flag', () => {
 
   it('clearHistoryFailure resets both counter and perm flag', async () => {
     const kv = makeKv();
-    await recordHistoryFailure(kv, THREAD);
+    await recordHistoryFailure(kv, THREAD, 'first failure reason');
     await recordHistoryFailure(kv, THREAD);
     await recordHistoryFailure(kv, THREAD);
     expect(await isHistoryPermanentlyFailed(kv, THREAD)).toBe(true);
     expect(await getHistoryFailureCount(kv, THREAD)).toBe(
       HISTORY_FAILURE_PERMANENT_THRESHOLD,
     );
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(
+      'first failure reason',
+    );
 
     await clearHistoryFailure(kv, THREAD);
     expect(await isHistoryPermanentlyFailed(kv, THREAD)).toBe(false);
     expect(await getHistoryFailureCount(kv, THREAD)).toBe(0);
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(null);
+  });
+
+  it('recordHistoryFailure stores the latest failure reason with the counter', async () => {
+    const kv = makeKv();
+    await recordHistoryFailure(kv, THREAD, 'status=403 insufficient scopes');
+    expect(await kv.get(`${KV_HISTORY_ERROR_PREFIX}:${THREAD}`)).toBe(
+      'status=403 insufficient scopes',
+    );
   });
 
   it('handleHistoryFetchPermanentFailure stamps the perm key', async () => {

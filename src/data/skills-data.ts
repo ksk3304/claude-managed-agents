@@ -29,7 +29,9 @@ export const SLASH_SKILLS_DATA: SkillsData = {
     },
     '/costguard': {
       name: 'Cost Guard',
-      description: '予算ガード状態確認。/costguard または /costguard status',
+      description:
+        '予算ガード状態確認・管理。「コストガード見せて」「安全装置を10分止めて」等の自然文でも可',
+      attach_memory: false,
     },
     '/help': {
       name: 'ヘルプ',

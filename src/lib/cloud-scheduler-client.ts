@@ -4,8 +4,7 @@
  *
  * Cloud Run 側 `scripts/scheduled_job_manager.py` の TS port。bot
  * (Cloudflare Worker) からは CRUD だけ呼び、Cloud Scheduler 自体は GCP
- * project `cma-bot-mp-20260501` / region `asia-northeast1` に残置 (=
- * 安価 ~$0.1/月、Cloud Run scheduler-worker も idle 化で残置)。
+ * project `cma-bot-mp-20260501` / region `asia-northeast1` に残置する。
  *
  * 設計責務:
  *   1. SA JWT 経由で `https://oauth2.googleapis.com/token` から
@@ -62,10 +61,8 @@ export const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platf
 /** Python `_TIMEZONE` と byte 等価 (= "Asia/Tokyo")。 */
 export const SCHEDULER_TIMEZONE = DEFAULT_TIMEZONE;
 
-/** Cloud Run 側 `_PUBSUB_TOPIC_BASE` (= "cma-scheduled-jobs")。本実装では
- *  handler 名 → topic 名 の組み立てに使う prefix を caller から渡す
- *  (default `cma-scheduler-`) ので、ここでは reference のみ。 */
-const _CLOUD_RUN_BASE_TOPIC = 'cma-scheduled-jobs';
+/** Cloud Run 側 `_PUBSUB_TOPIC_BASE` (= "cma-scheduled-jobs") と同じ既存 topic。 */
+const DEFAULT_SCHEDULER_TOPIC = 'cma-scheduled-jobs';
 
 /** `attemptDeadline` 秒数 (Python l.121 default 120s と byte 等価)。 */
 const PUBLISH_ATTEMPT_DEADLINE_SEC = 120;
@@ -78,14 +75,13 @@ export interface CloudSchedulerDeps {
   /** Cloud Scheduler ロケーション (env `GCP_SCHEDULER_LOCATION`)。 */
   location: string;
   /**
-   * handler 名 → topic 名 の組み立て prefix。`<prefix><handler>` で
-   * `projects/<project>/topics/<prefix><handler>` を構築する。
-   * 既定: `'cma-scheduler-'`。
-   *
-   * Cloud Run 側は単一 topic `cma-scheduled-jobs` + attribute `handler`
-   * 区別だが、Cloudflare 側は将来の "handler ごとに topic を分ける"
-   * 設計余地を残すため、本 client は prefix + handler の **複数 topic**
-   * モデルを採る (Day 4 ユーザー手作業で実 topic と grant を整える)。
+   * Scheduler job が publish する Pub/Sub topic。既定は既存本番と同じ
+   * 単一 topic `cma-scheduled-jobs`。handler 分岐は attributes.handler で行う。
+   */
+  schedulerTopicName?: string;
+  /**
+   * Legacy override: handler 名 → topic 名 の組み立て prefix。指定時のみ
+   * `<prefix><handler>` の複数 topic モデルを使う。
    */
   handlerTopicPrefix?: string;
   /** Override `fetch` for tests. */
@@ -135,7 +131,10 @@ interface ListJobsResponse {
 export function createCloudSchedulerManager(
   deps: CloudSchedulerDeps,
 ): ScheduleJobManager {
-  const handlerTopicPrefix = deps.handlerTopicPrefix ?? 'cma-scheduler-';
+  const topicConfig =
+    deps.handlerTopicPrefix !== undefined
+      ? { mode: 'prefix' as const, prefix: deps.handlerTopicPrefix }
+      : { mode: 'single' as const, topicName: deps.schedulerTopicName ?? DEFAULT_SCHEDULER_TOPIC };
 
   return {
     async list_jobs(): Promise<ScheduleJob[]> {
@@ -162,7 +161,7 @@ export function createCloudSchedulerManager(
         handler,
         payload,
         description: options.description ?? '',
-        handlerTopicPrefix,
+        topicConfig,
       });
     },
     async pause_job(jobId: string): Promise<void> {
@@ -186,7 +185,7 @@ export function createCloudSchedulerManager(
         handler?: string | undefined;
       },
     ): Promise<void> {
-      await updateJobRaw(deps, jobId, patch, handlerTopicPrefix);
+      await updateJobRaw(deps, jobId, patch, topicConfig);
     },
   };
 }
@@ -209,8 +208,20 @@ function jobName(deps: CloudSchedulerDeps, jobId: string): string {
   return `${parentPath(deps)}/jobs/${jobId}`;
 }
 
-function topicName(deps: CloudSchedulerDeps, handler: string, prefix: string): string {
-  return `projects/${deps.project}/topics/${prefix}${handler}`;
+type SchedulerTopicConfig =
+  | { mode: 'single'; topicName: string }
+  | { mode: 'prefix'; prefix: string };
+
+function topicName(
+  deps: CloudSchedulerDeps,
+  handler: string,
+  topicConfig: SchedulerTopicConfig,
+): string {
+  const name =
+    topicConfig.mode === 'prefix'
+      ? `${topicConfig.prefix}${handler}`
+      : topicConfig.topicName;
+  return `projects/${deps.project}/topics/${name}`;
 }
 
 async function authedFetch(
@@ -305,7 +316,7 @@ interface CreateJobInput {
   handler: string;
   payload: Record<string, unknown>;
   description: string;
-  handlerTopicPrefix: string;
+  topicConfig: SchedulerTopicConfig;
 }
 
 async function createJobRaw(
@@ -338,7 +349,7 @@ function buildJobBody(
     schedule: input.cron,
     timeZone: DEFAULT_TIMEZONE,
     pubsubTarget: {
-      topicName: topicName(deps, input.handler, input.handlerTopicPrefix),
+      topicName: topicName(deps, input.handler, input.topicConfig),
       data: dataB64,
       attributes: {
         handler: input.handler,
@@ -406,7 +417,7 @@ async function updateJobRaw(
     description?: string | undefined;
     handler?: string | undefined;
   },
-  handlerTopicPrefix: string,
+  topicConfig: SchedulerTopicConfig,
 ): Promise<void> {
   // Python l.133-206 `update_job` 等価。
   const existing = await getJobRaw(deps, jobId);
@@ -450,7 +461,7 @@ async function updateJobRaw(
       topicName:
         // Python l.176 と同等: 既存 topicName を保持しつつ、無ければ default
         // で組み立て直す。
-        curTarget.topicName ?? topicName(deps, curHandler, handlerTopicPrefix),
+        curTarget.topicName ?? topicName(deps, curHandler, topicConfig),
       data: dataB64,
       attributes: {
         handler: curHandler,
@@ -721,5 +732,5 @@ function base64DecodeUtf8(b64: string): string {
  */
 export { _resetChatTokenCacheForTests as _resetSchedulerClientCacheForTests } from './chat-api';
 
-// `_CLOUD_RUN_BASE_TOPIC` は reference 用に残置 (= drift 検知の手がかり)。
-void _CLOUD_RUN_BASE_TOPIC;
+// Keep the default topic name referenced in module scope for drift checks.
+void DEFAULT_SCHEDULER_TOPIC;

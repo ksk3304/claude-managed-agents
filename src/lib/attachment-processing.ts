@@ -88,6 +88,39 @@ export const MAX_IMAGE_ATTACHMENT_COUNT = 10;
 export const MAX_PDF_ATTACHMENT_BYTES = 500 * 1024 * 1024;
 /** 1 メッセージで受け付ける PDF 冊数の上限。 */
 export const MAX_PDF_ATTACHMENT_COUNT = 5;
+/** PDF preflight: 自動読取する 1 PDF file size 上限。 */
+export const PDF_PREFLIGHT_TIER_A_PER_FILE_BYTES = 25 * 1024 * 1024;
+/** PDF preflight: 自動読取する合計 file size 上限。 */
+export const PDF_PREFLIGHT_TIER_A_TOTAL_BYTES = 50 * 1024 * 1024;
+/** PDF preflight: Worker 上で直接扱う hard block file size 上限。 */
+export const PDF_PREFLIGHT_HARD_PER_FILE_BYTES = 100 * 1024 * 1024;
+/** PDF preflight: Worker 上で直接扱う hard block 合計 size 上限。 */
+export const PDF_PREFLIGHT_HARD_TOTAL_BYTES = 100 * 1024 * 1024;
+/** PDF preflight: 自動読取する PDF 冊数上限。 */
+export const PDF_PREFLIGHT_TIER_A_COUNT = 3;
+/** PDF preflight: 自動読取する総ページ数上限。 */
+export const PDF_PREFLIGHT_TIER_A_PAGES = 50;
+/** PDF preflight: Google Chat reactive 経路で扱う総ページ数上限。 */
+export const PDF_PREFLIGHT_HARD_PAGES = 100;
+export const PDF_PREFLIGHT_TOKEN_LOW_PER_PAGE = 1_500;
+export const PDF_PREFLIGHT_TOKEN_HIGH_PER_PAGE = 3_000;
+export const PDF_PREFLIGHT_TOKENIZER_SAFETY_FACTOR = 1.35;
+export const PDF_PREFLIGHT_PROMPT_OVERHEAD_TOKENS = 50_000;
+export const PDF_PREFLIGHT_DEFAULT_SESSION_HARD_CAP_USD = 8;
+export const PDF_PREFLIGHT_DEFAULT_MODEL = 'claude-opus-4-7';
+
+export const PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK: Readonly<Record<string, number>> = {
+  'claude-opus-4-7': 5,
+  'claude-opus-4-6': 5,
+  'claude-opus-4-5': 5,
+  'claude-opus-4-1': 15,
+  'claude-opus-4': 15,
+  'claude-sonnet-4-6': 3,
+  'claude-sonnet-4-5': 3,
+  'claude-sonnet-4': 3,
+  'claude-haiku-4-5': 1,
+  'claude-haiku-3-5': 0.8,
+};
 
 /** 1 Office ファイルあたりのサイズ上限。 */
 export const MAX_OFFICE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
@@ -204,6 +237,39 @@ export interface AttachmentBuildResult<B> {
   blocks: B[];
   notice: string | null;
   uploadedFileIds: string[];
+}
+
+export type PdfPreflightTier = 'tier_a' | 'tier_b' | 'tier_c';
+export type PdfPreflightResult = 'allow' | 'confirm' | 'block';
+
+export interface PdfPreflightOptions {
+  model?: string | null;
+  sessionHardCapUsd?: number | null;
+  modelInputUsdPerMtok?: number | null;
+}
+
+export interface PdfPreflightReport {
+  result: PdfPreflightResult;
+  tier: PdfPreflightTier;
+  pdfCount: number;
+  totalPages: number | null;
+  totalBytes: number;
+  maxPdfBytes: number;
+  pageCountAvailable: boolean;
+  encryptedOrPasswordProtected: boolean;
+  estimatedTokensLow: number | null;
+  estimatedTokensHigh: number | null;
+  estimatedCostLowUsd: number | null;
+  estimatedCostHighUsd: number | null;
+  sessionHardCapUsd: number;
+  model: string;
+  modelInputUsdPerMtok: number;
+  reasons: string[];
+}
+
+export interface PdfAttachmentBuildResult extends AttachmentBuildResult<DocumentBlock> {
+  preflight: PdfPreflightReport | null;
+  deterministicReply: string | null;
 }
 
 // ============================================================================
@@ -698,6 +764,197 @@ export async function buildImageAttachments(
 // PDF attachments builder (Python `_build_pdf_attachments` 等価)
 // ============================================================================
 
+interface DownloadedPdf {
+  name: string;
+  ctype: string;
+  data: Uint8Array;
+  bytes: number;
+  pageCount: number | null;
+  encrypted: boolean;
+}
+
+function resolvePdfInputPriceUsdPerMtok(options: PdfPreflightOptions = {}): {
+  model: string;
+  inputUsdPerMtok: number;
+} {
+  const model = (options.model || PDF_PREFLIGHT_DEFAULT_MODEL).trim()
+    || PDF_PREFLIGHT_DEFAULT_MODEL;
+  if (typeof options.modelInputUsdPerMtok === 'number'
+    && Number.isFinite(options.modelInputUsdPerMtok)
+    && options.modelInputUsdPerMtok > 0) {
+    return { model, inputUsdPerMtok: options.modelInputUsdPerMtok };
+  }
+  if (PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[model]) {
+    return { model, inputUsdPerMtok: PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[model] };
+  }
+  for (const [key, value] of Object.entries(PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK)) {
+    if (model.includes(key)) return { model, inputUsdPerMtok: value };
+  }
+  return {
+    model,
+    inputUsdPerMtok: PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[PDF_PREFLIGHT_DEFAULT_MODEL]!,
+  };
+}
+
+function resolvePdfSessionHardCapUsd(options: PdfPreflightOptions = {}): number {
+  const cap = options.sessionHardCapUsd;
+  if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0) return cap;
+  return PDF_PREFLIGHT_DEFAULT_SESSION_HARD_CAP_USD;
+}
+
+export function inspectPdfPageCount(data: Uint8Array): {
+  pageCount: number | null;
+  encrypted: boolean;
+} {
+  const text = new TextDecoder('latin1', { fatal: false, ignoreBOM: false }).decode(data);
+  if (!text.startsWith('%PDF-') && !text.includes('%PDF-')) {
+    return { pageCount: null, encrypted: false };
+  }
+  const encrypted = /\/Encrypt\b/.test(text);
+  const matches = text.match(/\/Type\s*\/Page\b(?!s)/g);
+  const pageCount = matches?.length ? matches.length : null;
+  return { pageCount, encrypted };
+}
+
+function estimatePdfTokensAndCost(
+  totalPages: number,
+  inputUsdPerMtok: number,
+): Pick<
+  PdfPreflightReport,
+  'estimatedTokensLow' | 'estimatedTokensHigh' | 'estimatedCostLowUsd' | 'estimatedCostHighUsd'
+> {
+  const estimatedTokensLow = Math.ceil(
+    totalPages * PDF_PREFLIGHT_TOKEN_LOW_PER_PAGE * PDF_PREFLIGHT_TOKENIZER_SAFETY_FACTOR
+      + PDF_PREFLIGHT_PROMPT_OVERHEAD_TOKENS,
+  );
+  const estimatedTokensHigh = Math.ceil(
+    totalPages * PDF_PREFLIGHT_TOKEN_HIGH_PER_PAGE * PDF_PREFLIGHT_TOKENIZER_SAFETY_FACTOR
+      + PDF_PREFLIGHT_PROMPT_OVERHEAD_TOKENS,
+  );
+  return {
+    estimatedTokensLow,
+    estimatedTokensHigh,
+    estimatedCostLowUsd: estimatedTokensLow / 1_000_000 * inputUsdPerMtok,
+    estimatedCostHighUsd: estimatedTokensHigh / 1_000_000 * inputUsdPerMtok,
+  };
+}
+
+function buildPdfPreflightReport(
+  pdfs: DownloadedPdf[],
+  options: PdfPreflightOptions = {},
+  initialReasons: string[] = [],
+  pdfCount: number = pdfs.length,
+): PdfPreflightReport {
+  const sessionHardCapUsd = resolvePdfSessionHardCapUsd(options);
+  const { model, inputUsdPerMtok } = resolvePdfInputPriceUsdPerMtok(options);
+  const totalBytes = pdfs.reduce((sum, pdf) => sum + pdf.bytes, 0);
+  const maxPdfBytes = pdfs.reduce((max, pdf) => Math.max(max, pdf.bytes), 0);
+  const pageCountAvailable = pdfs.every((pdf) => pdf.pageCount !== null);
+  const encryptedOrPasswordProtected = pdfs.some((pdf) => pdf.encrypted);
+  const totalPages = pageCountAvailable
+    ? pdfs.reduce((sum, pdf) => sum + (pdf.pageCount ?? 0), 0)
+    : null;
+  const estimates = totalPages === null
+    ? {
+        estimatedTokensLow: null,
+        estimatedTokensHigh: null,
+        estimatedCostLowUsd: null,
+        estimatedCostHighUsd: null,
+      }
+    : estimatePdfTokensAndCost(totalPages, inputUsdPerMtok);
+  const reasons = [...initialReasons];
+
+  if (!pageCountAvailable) reasons.push('page_count_unavailable');
+  if (encryptedOrPasswordProtected) reasons.push('encrypted_or_password_protected');
+  if (pdfCount > MAX_PDF_ATTACHMENT_COUNT) reasons.push('pdf_count_over_hard_limit');
+  if (totalPages !== null && totalPages > PDF_PREFLIGHT_HARD_PAGES) {
+    reasons.push('total_pages_over_hard_limit');
+  }
+  if (maxPdfBytes > PDF_PREFLIGHT_HARD_PER_FILE_BYTES) {
+    reasons.push('per_file_bytes_over_hard_limit');
+  }
+  if (totalBytes > PDF_PREFLIGHT_HARD_TOTAL_BYTES) {
+    reasons.push('total_bytes_over_hard_limit');
+  }
+  const hardBlock = reasons.some((reason) =>
+    [
+      'download_failed',
+      'page_count_unavailable',
+      'encrypted_or_password_protected',
+      'pdf_count_over_hard_limit',
+      'total_pages_over_hard_limit',
+      'per_file_bytes_over_hard_limit',
+      'total_bytes_over_hard_limit',
+    ].includes(reason),
+  );
+  if (hardBlock) {
+    return {
+      result: 'block',
+      tier: 'tier_c',
+      pdfCount,
+      totalPages,
+      totalBytes,
+      maxPdfBytes,
+      pageCountAvailable,
+      encryptedOrPasswordProtected,
+      ...estimates,
+      sessionHardCapUsd,
+      model,
+      modelInputUsdPerMtok: inputUsdPerMtok,
+      reasons,
+    };
+  }
+
+  return {
+    result: 'allow',
+    tier: 'tier_a',
+    pdfCount,
+    totalPages,
+    totalBytes,
+    maxPdfBytes,
+    pageCountAvailable,
+    encryptedOrPasswordProtected,
+    ...estimates,
+    sessionHardCapUsd,
+    model,
+    modelInputUsdPerMtok: inputUsdPerMtok,
+    reasons,
+  };
+}
+
+function formatUsd(value: number | null): string {
+  if (value === null) return '不明';
+  return `$${value.toFixed(value < 1 ? 3 : 2)}`;
+}
+
+function formatIntRange(low: number | null, high: number | null): string {
+  if (low === null || high === null) return '不明';
+  return `${low.toLocaleString('ja-JP')}-${high.toLocaleString('ja-JP')}`;
+}
+
+function buildPdfDeterministicReply(report: PdfPreflightReport): string | null {
+  if (report.result === 'allow') return null;
+  if (report.result === 'confirm') {
+    return [
+      'PDFが大きいため、このまま全文解析すると時間・費用・要約漏れのリスクがあります。',
+      `概算: ${report.totalPages ?? '不明'}ページ、入力 token 約 ${formatIntRange(
+        report.estimatedTokensLow,
+        report.estimatedTokensHigh,
+      )}、費用 約 ${formatUsd(report.estimatedCostLowUsd)}-${formatUsd(report.estimatedCostHighUsd)}。`,
+      '必要なページ範囲、章、知りたい観点を指定して、PDFを再添付してください。',
+      '例: 1-20ページだけ要約 / 第3章の論点だけ抽出 / 表だけ見てください。',
+    ].join('\n');
+  }
+  return [
+    'このPDFは直接添付としては大きすぎます。',
+    `概算: ${report.totalPages ?? '不明'}ページ、入力 token 約 ${formatIntRange(
+      report.estimatedTokensLow,
+      report.estimatedTokensHigh,
+    )}、費用 約 ${formatUsd(report.estimatedCostLowUsd)}-${formatUsd(report.estimatedCostHighUsd)}。`,
+    '分割PDF、ページ範囲指定、またはDrive上で対象範囲を絞って再依頼してください。',
+  ].join('\n');
+}
+
 /**
  * messagePayload の attachment[] から PDF のみ document content block を構築。
  *
@@ -711,24 +968,30 @@ export async function buildImageAttachments(
 export async function buildPdfAttachments(
   deps: AttachmentDeps,
   message: ChatMessageWithAttachment,
-): Promise<AttachmentBuildResult<DocumentBlock>> {
+  preflightOptions: PdfPreflightOptions = {},
+): Promise<PdfAttachmentBuildResult> {
   const blocks: DocumentBlock[] = [];
   const uploadedFileIds: string[] = [];
   const attachments = message.attachment ?? [];
   if (attachments.length === 0) {
-    return { blocks, notice: null, uploadedFileIds };
+    return { blocks, notice: null, uploadedFileIds, preflight: null, deterministicReply: null };
   }
 
   let skippedCountOverflow = 0;
   let skippedSizeOver = 0;
   let skippedDownloadFailed = 0;
   let skippedUploadFailed = 0;
+  const downloadedPdfs: DownloadedPdf[] = [];
+  const preflightReasons: string[] = [];
+  let acceptedPdfCount = 0;
+  let totalPdfCount = 0;
 
   for (const att of attachments) {
     const ctype = (att.contentType || '').toLowerCase();
     const name = att.contentName || att.name || '';
     const source = att.source || '';
     if (!SUPPORTED_PDF_MIME.includes(ctype)) continue;
+    totalPdfCount += 1;
     const ref = att.attachmentDataRef?.resourceName;
     if (!ref) {
       console.log(
@@ -737,34 +1000,63 @@ export async function buildPdfAttachments(
       );
       continue;
     }
-    if (blocks.length >= MAX_PDF_ATTACHMENT_COUNT) {
+    if (acceptedPdfCount >= MAX_PDF_ATTACHMENT_COUNT) {
       skippedCountOverflow += 1;
+      preflightReasons.push('pdf_count_over_hard_limit');
       console.log(
         `[attachment] pdf skipped (count limit ${MAX_PDF_ATTACHMENT_COUNT}): ` +
           `name=${JSON.stringify(name)} type=${ctype}`,
       );
       continue;
     }
+    acceptedPdfCount += 1;
 
     let data: Uint8Array;
     try {
-      const dl = await downloadChatMedia(deps, ref, { sizeCap: MAX_PDF_ATTACHMENT_BYTES });
+      const dl = await downloadChatMedia(deps, ref, {
+        sizeCap: PDF_PREFLIGHT_HARD_PER_FILE_BYTES,
+      });
       data = dl.data;
     } catch (err) {
       if (err instanceof ContentLengthOverError) {
         skippedSizeOver += 1;
+        preflightReasons.push('per_file_bytes_over_hard_limit');
         console.log(
           `[attachment] pdf skipped (size over): name=${JSON.stringify(name)} ` +
             `bytes=${err.actual} max=${MAX_PDF_ATTACHMENT_BYTES}`,
         );
       } else {
         skippedDownloadFailed += 1;
+        preflightReasons.push('download_failed');
         console.warn(
           `[attachment] pdf download failed: name=${JSON.stringify(name)} err=${errString(err)}`,
         );
       }
       continue;
     }
+
+    const inspection = inspectPdfPageCount(data);
+    downloadedPdfs.push({
+      name,
+      ctype,
+      data,
+      bytes: data.byteLength,
+      pageCount: inspection.pageCount,
+      encrypted: inspection.encrypted,
+    });
+  }
+
+  const preflight = downloadedPdfs.length > 0 || preflightReasons.length > 0
+    ? buildPdfPreflightReport(downloadedPdfs, preflightOptions, preflightReasons, totalPdfCount)
+    : null;
+  const deterministicReply = preflight ? buildPdfDeterministicReply(preflight) : null;
+  if (preflight && preflight.result !== 'allow') {
+    const notice = deterministicReply;
+    return { blocks, notice, uploadedFileIds, preflight, deterministicReply };
+  }
+
+  for (const pdf of downloadedPdfs) {
+    const { data, name, ctype } = pdf;
 
     if (data.byteLength <= INLINE_VS_FILES_THRESHOLD_BYTES) {
       const b64 = uint8ToBase64(data);
@@ -821,7 +1113,7 @@ export async function buildPdfAttachments(
     );
   }
   const notice = noticeParts.length > 0 ? `_(注: ${noticeParts.join(' / ')})_` : null;
-  return { blocks, notice, uploadedFileIds };
+  return { blocks, notice, uploadedFileIds, preflight, deterministicReply };
 }
 
 // ============================================================================
@@ -1389,14 +1681,17 @@ function uint8ToBase64(data: Uint8Array): string {
 export async function buildAllAttachmentBlocks(
   deps: AttachmentDeps,
   message: ChatMessageWithAttachment,
+  options: { pdfPreflight?: PdfPreflightOptions } = {},
 ): Promise<{
   extraBlocks: Array<ImageBlock | DocumentBlock | TextBlock>;
   notice: string | null;
   uploadedFileIds: string[];
+  pdfPreflight: PdfPreflightReport | null;
+  deterministicReply: string | null;
   cleanup: () => Promise<void>;
 }> {
   const image = await buildImageAttachments(deps, message);
-  const pdf = await buildPdfAttachments(deps, message);
+  const pdf = await buildPdfAttachments(deps, message, options.pdfPreflight ?? {});
   const office = await buildOfficeTextBlocks(deps, message);
 
   const extraBlocks: Array<ImageBlock | DocumentBlock | TextBlock> = [
@@ -1416,7 +1711,14 @@ export async function buildAllAttachmentBlocks(
     }
   };
 
-  return { extraBlocks, notice, uploadedFileIds: allUploaded, cleanup };
+  return {
+    extraBlocks,
+    notice,
+    uploadedFileIds: allUploaded,
+    pdfPreflight: pdf.preflight,
+    deterministicReply: pdf.deterministicReply,
+    cleanup,
+  };
 }
 
 // fflate Unzipped 型を re-export しないが、test 側から使えるよう exposed names を保つ。

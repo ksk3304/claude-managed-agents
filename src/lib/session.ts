@@ -23,6 +23,10 @@ import { ANTHROPIC_BETA, resolveAnthropicApiKey } from '../anthropic';
 import type { MemoryStoreResourceParam } from '../types/memory';
 import type { EmailSendMarker } from '../types/agentmail';
 import { parseEmailSendMarkers } from './email-send-marker';
+import {
+  saveUserMessagePayloadAudit,
+  type PayloadAuditConfig,
+} from './payload-audit';
 
 /**
  * Build an Anthropic SDK client. Mirrors `email-handler.ts:emailClient`
@@ -81,6 +85,47 @@ export async function createSessionWithResources(
   return created.id;
 }
 
+export interface ManagedSessionUsageSnapshot {
+  usage: Record<string, unknown> | null;
+  model?: string | null;
+}
+
+export async function retrieveSessionUsageSnapshot(
+  client: Anthropic,
+  sessionId: string,
+): Promise<ManagedSessionUsageSnapshot | null> {
+  try {
+    const sessions = client.beta.sessions as unknown as {
+      retrieve: (
+        id: string,
+        params?: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>;
+    };
+    if (typeof sessions.retrieve !== 'function') return null;
+    const session = await sessions.retrieve(sessionId, {
+      betas: [ANTHROPIC_BETA],
+    });
+    const usage =
+      session.usage && typeof session.usage === 'object'
+        ? (session.usage as Record<string, unknown>)
+        : null;
+    const model =
+      typeof session.model === 'string'
+        ? session.model
+        : typeof (session.agent as Record<string, unknown> | undefined)?.model === 'string'
+          ? ((session.agent as Record<string, unknown>).model as string)
+          : null;
+    return { usage, model };
+  } catch (err) {
+    console.warn(
+      `[session] sessions.retrieve usage failed sessionId=${sessionId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
+}
+
 /**
  * User message content block — the SDK accepts an array of typed blocks
  * (`text` / `image` / `document` / etc) on `user.message`. The bridge
@@ -102,6 +147,8 @@ export interface SendAndStreamInput {
   userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
 }
 
 export interface SendAndStreamResult {
@@ -128,6 +175,10 @@ export interface SendAndStreamResult {
    *     external `timeoutMs` AbortError thrown by `Promise.race`).
    */
   stopReason?: string;
+  /** Number of tool-use events observed while draining the stream. */
+  toolUseCount: number;
+  /** Tool names observed in tool-use events, de-duplicated in encounter order. */
+  toolUseNames: string[];
 }
 
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
@@ -161,13 +212,15 @@ export async function sendAndStream(
   // document) rather than a raw string; we wrap into a single text
   // block here. Verified against
   // @anthropic-ai/sdk BetaManagedAgentsTextBlock shape.
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
@@ -180,14 +233,21 @@ export async function sendAndStream(
 
   let assistantText = '';
   let terminalEventType: string | undefined;
+  let toolUseCount = 0;
+  const toolUseNames: string[] = [];
 
   const drain = (async () => {
     for await (const ev of stream as unknown as AsyncIterable<Record<string, unknown>>) {
       const evType = typeof ev.type === 'string' ? ev.type : '';
-      // Accumulate any string-typed `text` or `delta` field. SDK
-      // gives us `*.text_delta` per token and `*.text` for the final
-      // assembled block — accept either.
-      const text = pickString(ev, 'text') ?? pickString(ev, 'delta');
+      if (isToolUseEventType(evType)) {
+        toolUseCount += 1;
+        const name = toolNameFromSessionEvent(ev);
+        if (name && !toolUseNames.includes(name)) toolUseNames.push(name);
+      }
+      // Accumulate text-bearing events. The Managed Agents stream often
+      // emits final assistant text as `agent.message` with `content[]`
+      // blocks rather than top-level `text` / `delta`.
+      const text = textFromSessionEvent(ev);
       if (text) assistantText += text;
 
       if (evType === 'session.status_idle' || evType === 'session.status_terminated') {
@@ -208,6 +268,8 @@ export async function sendAndStream(
     assistantText,
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
+    toolUseCount,
+    toolUseNames,
   };
 }
 
@@ -230,6 +292,48 @@ function toUserMessageContent(
 function pickString(ev: Record<string, unknown>, key: string): string | undefined {
   const v = ev[key];
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+function textFromSessionEvent(ev: Record<string, unknown>): string | undefined {
+  const evType = typeof ev.type === 'string' ? ev.type : '';
+  if (evType === 'agent.message') {
+    const content = (ev as { content?: Array<Record<string, unknown>> }).content;
+    if (Array.isArray(content)) {
+      const parts: string[] = [];
+      for (const block of content) {
+        const t = pickString(block, 'text');
+        if (t) parts.push(t);
+      }
+      if (parts.length > 0) return parts.join('');
+    }
+  }
+  return pickString(ev, 'text') ?? pickString(ev, 'delta');
+}
+
+function isToolUseEventType(evType: string): boolean {
+  return evType === 'agent.tool_use' || evType === 'agent.custom_tool_use';
+}
+
+function toolNameFromSessionEvent(ev: Record<string, unknown>): string | undefined {
+  const direct = pickString(ev, 'name');
+  if (direct) return direct;
+  const toolUse = ev.tool_use;
+  if (toolUse && typeof toolUse === 'object') {
+    const name = pickString(toolUse as Record<string, unknown>, 'name');
+    if (name) return name;
+  }
+  return undefined;
+}
+
+function userMessageContentText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const text = pickString(block as Record<string, unknown>, 'text');
+    if (text) parts.push(text);
+  }
+  return parts.join('');
 }
 
 // ============================================================================
@@ -271,6 +375,8 @@ export interface SendAndStreamWithToolDispatchInput {
    */
   userMessage: string | UserMessageContentBlock[];
   toolDispatcher: ToolDispatcher;
+  /** Optional short-lived audit of the exact user.message payload. */
+  payloadAudit?: PayloadAuditConfig;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
   /**
@@ -305,6 +411,13 @@ export interface SendAndStreamWithToolDispatchInput {
    * returns partial results instead of throwing.
    */
   sessionWatchdogSec?: number;
+  /**
+   * Ignore replayed historical session events until the stream echoes the
+   * exact user.message we just sent. Use for follow-up turns such as cap
+   * recovery where Managed Agents can replay the previous turn before the
+   * newly-sent prompt starts.
+   */
+  startAfterUserMessageEcho?: boolean;
 }
 
 const DEFAULT_MAX_TOOL_CALLS = 32;
@@ -347,13 +460,15 @@ export async function sendAndStreamWithToolDispatch(
   // `sendAndStream`: wrap a string into a single text block, otherwise
   // pass the typed content array straight through (= image / document
   // attachments are pre-built by the caller, see attachment-processing.ts).
+  const userMessageEvents = [
+    {
+      type: 'user.message',
+      content: toUserMessageContent(input.userMessage),
+    },
+  ];
+  await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
   await client.beta.sessions.events.send(input.sessionId, {
-    events: [
-      {
-        type: 'user.message',
-        content: toUserMessageContent(input.userMessage),
-      },
-    ],
+    events: userMessageEvents,
     betas: [ANTHROPIC_BETA],
   } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
 
@@ -365,6 +480,7 @@ export async function sendAndStreamWithToolDispatch(
   let terminalEventType: string | undefined;
   let stopReason: string | undefined;
   let toolCalls = 0;
+  const toolUseNames: string[] = [];
   let requiresActionIters = 0;
   const pendingCustomToolUses = new Map<
     string,
@@ -372,6 +488,11 @@ export async function sendAndStreamWithToolDispatch(
   >();
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
+  let currentTurnStarted = false;
+  let seenUserMessageEcho = input.startAfterUserMessageEcho !== true;
+  const sentUserMessageText = input.startAfterUserMessageEcho
+    ? userMessageContentText(userMessageEvents[0]!.content)
+    : '';
 
   /**
    * Fire `user.interrupt` so the agent stops generating. Mirrors the
@@ -416,6 +537,25 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       const evType = typeof ev.type === 'string' ? ev.type : '';
+      if (!seenUserMessageEcho) {
+        if (
+          evType === 'user.message' &&
+          userMessageContentText((ev as { content?: unknown }).content) === sentUserMessageText
+        ) {
+          seenUserMessageEcho = true;
+          currentTurnStarted = true;
+        }
+        continue;
+      }
+      if (
+        evType === 'session.status_running' ||
+        evType === 'session.thread_status_running' ||
+        evType === 'user.message' ||
+        evType === 'span.model_request_start' ||
+        evType.startsWith('agent.')
+      ) {
+        currentTurnStarted = true;
+      }
 
       // 1. text-bearing events — accumulate into assistantText.
       // Anthropic Managed Agents の実 event shape (Python `cma_lib.py:2730-2734`
@@ -425,24 +565,7 @@ export async function sendAndStreamWithToolDispatch(
       // block の text field** を集計する必要がある (= 2026-05-26 reactive
       // bot 実機検証で発覚、空 assistantText → empty clean text → 投稿
       // skip の根本原因)。
-      let text: string | undefined;
-      if (evType === 'agent.message') {
-        const content = (ev as { content?: Array<Record<string, unknown>> })
-          .content;
-        if (Array.isArray(content)) {
-          const parts: string[] = [];
-          for (const block of content) {
-            const t = pickString(block, 'text');
-            if (t) parts.push(t);
-          }
-          if (parts.length > 0) text = parts.join('');
-        }
-      }
-      // fallback: top-level の `text` / `delta` (= 旧仕様 / partial delta
-      // event、念のため残置で後方互換)
-      if (!text) {
-        text = pickString(ev, 'text') ?? pickString(ev, 'delta');
-      }
+      const text = textFromSessionEvent(ev);
       if (text) assistantText += text;
 
       // 2a. built-in tool use — bash / web_search / code_execution. The
@@ -452,6 +575,8 @@ export async function sendAndStreamWithToolDispatch(
       // motivating case for this guard.
       if (evType === 'agent.tool_use') {
         builtinToolCalls += 1;
+        const name = toolNameFromSessionEvent(ev);
+        if (name && !toolUseNames.includes(name)) toolUseNames.push(name);
         if (builtinToolCalls > maxBuiltinToolCalls) {
           console.warn(
             `[session] tool_call_cap reached (count=${builtinToolCalls}, max=${maxBuiltinToolCalls}); sending interrupt`,
@@ -484,6 +609,7 @@ export async function sendAndStreamWithToolDispatch(
         }
         const toolUseId = pickString(ev, 'id') ?? '';
         const toolName = pickString(ev, 'name') ?? 'unknown';
+        if (toolName && !toolUseNames.includes(toolName)) toolUseNames.push(toolName);
         const toolInput = (ev as { input?: unknown }).input;
         if (toolUseId) {
           pendingCustomToolUses.set(toolUseId, { name: toolName, input: toolInput });
@@ -494,6 +620,13 @@ export async function sendAndStreamWithToolDispatch(
       // 3. terminal events.
       if (evType === 'session.status_idle') {
         terminalEventType = evType;
+        if (!currentTurnStarted && assistantText.length === 0 && pendingCustomToolUses.size === 0) {
+          // A new stream can replay the previous turn's idle boundary just
+          // before the run triggered by our freshly-sent user.message starts.
+          // Ignore that stale boundary; otherwise cap recovery can return
+          // empty even though the recovery turn later produces text.
+          continue;
+        }
         // Python `_stop_reason_type(event)` reads `event.stop_reason.type`.
         // The SDK exposes it on the event as either a nested object
         // ({type:'end_turn'}) or a bare string depending on shape.
@@ -618,6 +751,8 @@ export async function sendAndStreamWithToolDispatch(
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
     stopReason,
+    toolUseCount: builtinToolCalls + toolCalls,
+    toolUseNames,
   };
 }
 

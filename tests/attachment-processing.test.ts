@@ -26,6 +26,7 @@ import {
   extractDocxText,
   extractPptxText,
   extractXlsxText,
+  inspectPdfPageCount,
   isOfficeZipSafe,
   INLINE_VS_FILES_THRESHOLD_BYTES,
   MAX_OFFICE_UNCOMPRESSED_BYTES,
@@ -121,6 +122,20 @@ function depsWithFetch(fetchImpl: typeof fetch): AttachmentDeps {
     // (`getChatAccessToken` 経路はネット呼ばないため fake で完結する)。
     tokenProvider: async () => 'fake-token',
   };
+}
+
+function makeMinimalPdf(pageCount: number): Uint8Array {
+  const objects: string[] = [
+    '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+    `2 0 obj << /Type /Pages /Count ${pageCount} /Kids [${Array.from(
+      { length: pageCount },
+      (_, i) => `${i + 3} 0 R`,
+    ).join(' ')}] >> endobj`,
+  ];
+  for (let i = 0; i < pageCount; i += 1) {
+    objects.push(`${i + 3} 0 obj << /Type /Page /Parent 2 0 R >> endobj`);
+  }
+  return strToU8(`%PDF-1.4\n${objects.join('\n')}\n%%EOF`);
 }
 
 // ============================================================================
@@ -279,7 +294,7 @@ describe('buildImageAttachments', () => {
 describe('buildPdfAttachments', () => {
   it('returns inline document block for a small PDF', async () => {
     _resetChatTokenCacheForTests();
-    const fakePdf = new Uint8Array([0x25, 0x50, 0x44, 0x46]); // "%PDF"
+    const fakePdf = makeMinimalPdf(2);
     const fetchImpl = makeFetchMock([
       () =>
         new Response(fakePdf, {
@@ -302,7 +317,109 @@ describe('buildPdfAttachments', () => {
     expect(res.blocks.length).toBe(1);
     expect(res.blocks[0]!.type).toBe('document');
     expect(res.blocks[0]!.source.type).toBe('base64');
+    expect(res.preflight?.result).toBe('allow');
+    expect(res.preflight?.tier).toBe('tier_a');
+    expect(res.preflight?.totalPages).toBe(2);
     expect(res.notice).toBeNull();
+  });
+
+  it('does not stop a 51-page PDF by page count alone', async () => {
+    _resetChatTokenCacheForTests();
+    const fakePdf = makeMinimalPdf(51);
+    const fetchImpl = makeFetchMock([
+      () =>
+        new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/pdf',
+            'Content-Length': String(fakePdf.byteLength),
+          },
+        }),
+    ]);
+    const res = await buildPdfAttachments(depsWithFetch(fetchImpl), {
+      attachment: [
+        {
+          contentType: 'application/pdf',
+          contentName: 'medium.pdf',
+          attachmentDataRef: { resourceName: 'MEDIUM' },
+        },
+      ],
+    });
+    expect(res.blocks.length).toBe(1);
+    expect(res.preflight?.result).toBe('allow');
+    expect(res.preflight?.tier).toBe('tier_a');
+    expect(res.preflight?.totalPages).toBe(51);
+    expect(res.deterministicReply).toBeNull();
+  });
+
+  it('hard-blocks PDFs over 100 pages', async () => {
+    _resetChatTokenCacheForTests();
+    const fakePdf = makeMinimalPdf(101);
+    const fetchImpl = makeFetchMock([
+      () =>
+        new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/pdf',
+            'Content-Length': String(fakePdf.byteLength),
+          },
+        }),
+    ]);
+    const res = await buildPdfAttachments(depsWithFetch(fetchImpl), {
+      attachment: [
+        {
+          contentType: 'application/pdf',
+          contentName: 'large.pdf',
+          attachmentDataRef: { resourceName: 'LARGE' },
+        },
+      ],
+    });
+    expect(res.blocks).toEqual([]);
+    expect(res.preflight?.result).toBe('block');
+    expect(res.preflight?.tier).toBe('tier_c');
+    expect(res.preflight?.reasons).toContain('total_pages_over_hard_limit');
+    expect(res.deterministicReply).toMatch(/大きすぎます/);
+  });
+
+  it('hard-blocks PDFs whose page count is unavailable', async () => {
+    _resetChatTokenCacheForTests();
+    const fakePdf = strToU8('%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n%%EOF');
+    const fetchImpl = makeFetchMock([
+      () =>
+        new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/pdf',
+            'Content-Length': String(fakePdf.byteLength),
+          },
+        }),
+    ]);
+    const res = await buildPdfAttachments(depsWithFetch(fetchImpl), {
+      attachment: [
+        {
+          contentType: 'application/pdf',
+          contentName: 'unknown.pdf',
+          attachmentDataRef: { resourceName: 'UNKNOWN' },
+        },
+      ],
+    });
+    expect(res.blocks).toEqual([]);
+    expect(res.preflight?.result).toBe('block');
+    expect(res.preflight?.reasons).toContain('page_count_unavailable');
+  });
+
+  it('extracts PDF page count and encryption marker', () => {
+    expect(inspectPdfPageCount(makeMinimalPdf(3))).toEqual({
+      pageCount: 3,
+      encrypted: false,
+    });
+    const encrypted = strToU8(
+      '%PDF-1.4\n1 0 obj << /Type /Page >> endobj\ntrailer << /Encrypt 9 0 R >>\n%%EOF',
+    );
+    expect(inspectPdfPageCount(encrypted)).toEqual({
+      pageCount: 1,
+      encrypted: true,
+    });
   });
 
   it('returns empty result when message has no attachment field', async () => {

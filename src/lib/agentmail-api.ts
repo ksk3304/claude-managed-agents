@@ -108,16 +108,16 @@ export class AgentMailClient {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   /**
-   * `POST /inboxes/{inboxId}/messages` — fresh outbound message.
+   * `POST /inboxes/{inboxId}/messages/send` — fresh outbound message.
    * Returns the AgentMail message_id (opaque) and the RFC 822
    * Message-ID that ended up on the wire.
    */
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-    const path = `/inboxes/${encodeURIComponent(input.inboxId)}/messages`;
+    const path = `/inboxes/${encodeURIComponent(input.inboxId)}/messages/send`;
     return this.postSend(path, input);
   }
 
@@ -130,7 +130,7 @@ export class AgentMailClient {
     const path = `/inboxes/${encodeURIComponent(input.inboxId)}/messages/${encodeURIComponent(
       input.parentMessageId,
     )}/reply`;
-    return this.postSend(path, input);
+    return this.postReply(path, input.body);
   }
 
   /**
@@ -189,6 +189,18 @@ export class AgentMailClient {
       id?: string;
       rfc822_message_id?: string;
     }>('POST', path, body);
+    return {
+      message_id: r.message_id ?? r.id ?? '',
+      rfc822_message_id: r.rfc822_message_id ?? '',
+    };
+  }
+
+  private async postReply(path: string, text: string): Promise<SendMessageResult> {
+    const r = await this.request<{
+      message_id?: string;
+      id?: string;
+      rfc822_message_id?: string;
+    }>('POST', path, { text });
     return {
       message_id: r.message_id ?? r.id ?? '',
       rfc822_message_id: r.rfc822_message_id ?? '',
