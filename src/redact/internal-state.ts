@@ -143,21 +143,15 @@ const BENIGN_INTERNAL_REFERENCE_REPLACEMENTS: readonly {
   name: string;
   pattern: RegExp;
   replacement: string;
-}[] = [
-  {
-    name: 'mnt_memory_path',
-    pattern: /`?\/mnt\/memory(?:\/[^\s`"'）)]*)?`?/g,
-    replacement: '社内記憶',
-  },
-];
+}[] = [];
 
 /**
  * User-facing softener for benign implementation references.
  *
  * The hard redactor below intentionally turns risky failure text into a neutral
  * error. Before that final guard, this function rewrites harmless internal
- * paths that the agent may mention while explaining its work, so useful answers
- * are preserved without exposing local runtime details.
+ * paths that the agent may mention while explaining its work. The replacement
+ * table is currently empty by policy, so this is a passthrough hook.
  */
 export function softenBenignInternalReferencesForChat(
   text: unknown,

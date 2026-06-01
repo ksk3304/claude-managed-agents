@@ -1364,7 +1364,7 @@ describe('handleChatEvent', () => {
     }
   });
 
-  it('Case 9: 内部状態漏洩語 → scrubInternalStateForChat で redaction', async () => {
+  it('Case 9: legacy internal-state wording passes through when no patterns are registered', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1374,7 +1374,6 @@ describe('handleChatEvent', () => {
       sessionId: 'sesn_9',
       events: [
         {
-          // 「memory store が未 attach」は internal_state_patterns.json の literal HIT
           type: 'agent.message.text',
           text: 'memory store が未 attach のため対応できません',
         },
@@ -1384,13 +1383,12 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    // placeholder POST 1 件 → 最終 redaction 結果は PATCH で書き換え。
+    // placeholder POST 1 件 → 最終 reply は元テキストで PATCH。
     const post = chatApiMock.posts.find((p) => p.spaceName === 'spaces/AAA');
     expect(post).toBeDefined();
     expect(post!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('今回のタスクは完了できませんでした');
-    expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
+    expect(chatApiMock.patches[0]!.text).toBe('memory store が未 attach のため対応できません');
   });
 
   it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
@@ -1420,7 +1418,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).not.toContain('bot');
   });
 
-  it('Case 9c: benign runtime path mention is softened, not neutralized', async () => {
+  it('Case 9c: benign runtime path mention passes through unchanged', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1440,9 +1438,8 @@ describe('handleChatEvent', () => {
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('社内記憶');
+    expect(chatApiMock.patches[0]!.text).toContain('/mnt/memory');
     expect(chatApiMock.patches[0]!.text).toContain('調査プロセス');
-    expect(chatApiMock.patches[0]!.text).not.toContain('/mnt/memory');
     expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
   });
 
