@@ -1781,7 +1781,7 @@ describe('handleChatEvent', () => {
     expect(allTexts.some((t) => t.includes('ゲストモード'))).toBe(true);
   });
 
-  it('default fallback actor は応答のみ許可し EMAIL/SCHEDULE/CHAT_POST を gate する', async () => {
+  it('default fallback actor でも CHAT_POST は許可し EMAIL/SCHEDULE は gate する', async () => {
     const env = buildEnv({
       envOverrides: {
         DEFAULT_USER_SLUG: 'guest',
@@ -1817,7 +1817,7 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
-    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(false);
+    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
     expect(chatApiMock.patches[0]!.text).toContain(
@@ -1831,7 +1831,7 @@ describe('handleChatEvent', () => {
       .filter((row) => row.event_type === 'external_tool_gated')
       .map((row) => JSON.parse(String(row.detail_json)).tool_family)
       .sort();
-    expect(families).toEqual(['CHAT_POST', 'EMAIL_SEND', 'SCHEDULE_ACTION']);
+    expect(families).toEqual(['EMAIL_SEND', 'SCHEDULE_ACTION']);
   });
 
   it('auto pending sender mapping は chat 専用 prefix に作成し外部ツールを gate する', async () => {
@@ -1892,7 +1892,7 @@ describe('handleChatEvent', () => {
       display_name: 'Intern User',
       mapping_source: 'chat_auto_pending',
     });
-    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(false);
+    expect(chatApiMock.posts.some((p) => p.spaceName === 'spaces/OTHER')).toBe(true);
     expect(chatApiMock.patches[0]!.text).toContain('初回ユーザーにも応答します');
     expect(chatApiMock.patches[0]!.text).toContain('メール送信失敗');
 

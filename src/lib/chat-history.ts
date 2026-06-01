@@ -349,15 +349,14 @@ export interface FormatThreadHistoryOptions {
  * Structured result of formatting thread history. Mirrors the spirit of
  * Python `_format_thread_history`'s implicit metadata (the count is
  * embedded in the warning text). The TS port surfaces it explicitly so
- * the speaker-gate wire-up can branch on `unresolvedCount > 0` without
- * regex-parsing the rendered body.
+ * callers can record `unresolvedCount > 0` without regex-parsing the rendered
+ * body.
  *
  * - `text`: same string as `formatThreadHistory` returns (= chronological
  *   markdown block, possibly with `⚠️` notice appended; `''` when input
  *   is empty / fully filtered).
  * - `unresolvedCount`: distinct count of unknown-speaker chat_user_ids
- *   encountered (de-duplicated). Used by `src/lib/speaker-gate.ts` to
- *   decide whether CHAT_POST / external tools should be gated. Zero when
+ *   encountered (de-duplicated). Used for observability. Zero when
  *   every history line resolved to a known label (or when input was empty).
  */
 export interface ThreadHistoryFormatResult {
@@ -378,8 +377,7 @@ export interface ThreadHistoryFormatResult {
  * checks `.text.length === 0` and skips prepend in that case.
  *
  * `unresolvedCount` is the de-duplicated count of unknown-speaker
- * chat_user_ids; surfaces "履歴に未登録者が実在" to the speaker-gate
- * wire-up (= `hasUnresolvedSpeakers` in `_compute_chat_post_gate`).
+ * chat_user_ids; surfaces "履歴に未登録者が実在" for observability.
  */
 export function formatThreadHistoryWithMeta(
   messages: readonly ThreadHistoryMessage[],
@@ -431,8 +429,8 @@ export function formatThreadHistoryWithMeta(
 
 /**
  * Backward-compatible string-only wrapper around
- * `formatThreadHistoryWithMeta`. Callers that need the unresolved count
- * (= speaker-gate wire-up) should use the `WithMeta` variant directly.
+ * `formatThreadHistoryWithMeta`. Callers that need the unresolved count should
+ * use the `WithMeta` variant directly.
  */
 export function formatThreadHistory(
   messages: readonly ThreadHistoryMessage[],
