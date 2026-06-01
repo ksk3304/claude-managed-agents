@@ -30,8 +30,7 @@
  *     永続層の未実装ゆえ 503 拒否)。
  *   - cap-recovery 完全実装 (cap 超過後の memory snapshot 経路)
  *   - Cold continuation の SignalB 経由 thread-self-scan
- *   - 外部ツール gate の actor 駆動完全実装 (= `_compute_external_tool_gate`
- *     wire-up。CHAT_POST は gate せず marker dispatch する)
+ *   - 外部ツール gate の actor 駆動完全実装
  *
  * Failure isolation:
  *   - LLM stream throw   → msg.retry() 経由で event 再配送 (= claim を release
@@ -109,7 +108,6 @@ import { readChatSenderMappingWithAutoPending } from '../lib/memory-attach';
 import {
   handleScheduleActionMarker,
   parseScheduleActionMarkers,
-  stripScheduleActionMarkers,
 } from '../lib/schedule-action-marker';
 import {
   handleNaturalScheduleCommand,
@@ -453,7 +451,7 @@ export async function handleChatEvent(
         sender_name_hash: stableHash(sender.name),
         mapping_source: mappingResolution.source,
         default_slug: userMapping.user_slug,
-        external_tools_allowed: false,
+        external_tools_allowed: true,
       },
     });
   }
@@ -1216,19 +1214,12 @@ export async function handleChatEvent(
             }
           : {}),
         toolDispatcher: (toolName, toolInput) =>
-          actorTrusted
-            ? dispatchMakotoTool(toolName, toolInput, {
-                env,
-                userSlug: userMapping.user_slug,
-                boundMessageId: '',
-                callerSessionId: sessionIdRef.current,
-              })
-            : gateExternalToolCall(env, {
-                eventKey,
-                messageId: message.name,
-                userSlug: userMapping.user_slug,
-                toolName,
-              }),
+          dispatchMakotoTool(toolName, toolInput, {
+            env,
+            userSlug: userMapping.user_slug,
+            boundMessageId: '',
+            callerSessionId: sessionIdRef.current,
+          }),
         eventKey,
         messageId: message.name,
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
@@ -1441,7 +1432,6 @@ export async function handleChatEvent(
     sessionId,
     userMapping.agent_id,
     claim,
-    { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
 
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
@@ -1468,7 +1458,6 @@ export async function handleChatEvent(
     message.name,
     threadName,
     chatPostResult.cleanedText,
-    { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
 
   // 7d. current space 投稿 (clean 後本文)
@@ -1653,44 +1642,6 @@ export async function handleChatEvent(
 // helper: dispatch EMAIL_SEND markers
 // ---------------------------------------------------------------------------
 
-interface ActorGateOptions {
-  actorTrusted: boolean;
-  messageId: string | null;
-  userSlug: string;
-}
-
-async function gateExternalToolCall(
-  env: Env,
-  input: {
-    eventKey: string;
-    messageId: string | null;
-    userSlug: string;
-    toolName: string;
-  },
-): Promise<{ ok: false; payload: { error: string; tool: string; message: string } }> {
-  await recordRuntimeEvent(env, {
-    eventKey: input.eventKey,
-    messageId: input.messageId,
-    userSlug: input.userSlug,
-    eventType: 'external_tool_gated',
-    level: 'warn',
-    source: 'chat-event-handler',
-    detail: {
-      tool_family: 'custom_tool',
-      tool: input.toolName,
-      actor_source: 'default_user_fallback',
-    },
-  });
-  return {
-    ok: false,
-    payload: {
-      error: 'external_tool_gated',
-      tool: input.toolName,
-      message: '外部連携操作は登録済みユーザーの現在発話でのみ実行します。',
-    },
-  };
-}
-
 /**
  * Inline 実装 (= agentmail-dispatch.ts と同等 logic だが import せず別実装)。
  * 理由: agentmail-dispatch.ts は AgentMail webhook 経路専用 (inbox_id を webhook
@@ -1704,31 +1655,8 @@ async function dispatchEmailMarkers(
   sessionId: string,
   agentId: string,
   claim: { owner: string; version: number },
-  gate: ActorGateOptions,
 ): Promise<EmailDispatchSummary[]> {
   if (markers.length === 0) return [];
-  if (!gate.actorTrusted) {
-    await recordRuntimeEvent(env, {
-      eventKey,
-      sessionId,
-      messageId: gate.messageId,
-      userSlug: gate.userSlug,
-      eventType: 'external_tool_gated',
-      level: 'warn',
-      source: 'chat-event-handler',
-      detail: {
-        tool_family: 'EMAIL_SEND',
-        marker_count: markers.length,
-        actor_source: 'default_user_fallback',
-      },
-    });
-    return markers.map((m) => ({
-      status: 'failed',
-      to: m.to,
-      subject: m.subject,
-      reason: '外部連携操作は登録済みユーザーの現在発話でのみ実行します',
-    }));
-  }
   const summaries: EmailDispatchSummary[] = [];
   const apiKey = env.AGENTMAIL_API_KEY;
   const inboxId = env.AGENTMAIL_DEFAULT_INBOX_ID;
@@ -2186,27 +2114,7 @@ async function dispatchScheduleActionMarkers(
   messageId: string,
   threadName: string | null,
   inputText: string,
-  gate: ActorGateOptions,
 ): Promise<ScheduleDispatchResult> {
-  const gatedMarkers = gate.actorTrusted ? [] : parseScheduleActionMarkers(inputText);
-  if (!gate.actorTrusted && gatedMarkers.length > 0) {
-    await recordRuntimeEvent(env, {
-      eventKey,
-      messageId: gate.messageId,
-      userSlug: gate.userSlug,
-      eventType: 'external_tool_gated',
-      level: 'warn',
-      source: 'chat-event-handler',
-      detail: {
-        tool_family: 'SCHEDULE_ACTION',
-        marker_count: gatedMarkers.length,
-        actor_source: 'default_user_fallback',
-      },
-    });
-    const prefix = stripScheduleActionMarkers(inputText).trim();
-    const notice = '外部連携操作は登録済みユーザーの現在発話でのみ実行します。';
-    return { cleanedText: prefix ? `${prefix}\n${notice}` : notice };
-  }
   const saKey = env.CHAT_SA_KEY_JSON;
   const project = env.GCP_SCHEDULER_PROJECT;
   const location = env.GCP_SCHEDULER_LOCATION;
@@ -2966,9 +2874,8 @@ async function deletePendingPdfPreflightApproval(
 // Done (Issue #186 既知 #4): intent-detector 統合 (= bodyText intent prefix。
 //   Grill Me 正本に合わせ /mail でも同じ社員 agent / session を継続)。
 // Done (#198): Cold continuation の SignalB 経由 thread-self-scan.
-// Removed (2026-06-01): CHAT_POST 未解決 speaker gate。別 space 投稿機能を
-//    不要に堰き止めるため、CHAT_POST marker は通常 dispatch 経路へ流す。
-//    EMAIL_SEND / SCHEDULE_ACTION の actor gate は別判断として残す。
+// Removed (2026-06-01): actor gate。別 space 投稿 / メール / 予定 / custom tool は
+//    ユーザー指示どおり実行し、認証や権限不足は各 tool の実行結果で返す。
 // Done (#198/#186): CHAT_POST alias resolver port (= `chat-alias-resolver.ts`).
 // Done (#198/#186): user_mapping default fallback (= `readUserMappingWithDefault`).
 // Done (#198/#186): annotation-based mention detection (= `isMentioningBot`).
