@@ -41,6 +41,61 @@ describe("findSessionByRfc822MessageId", () => {
     expect(hit).toEqual({ sessionId: "session_1", agentId: "agent_1" });
   });
 
+  it("records auto_reply_policy for audit", async () => {
+    const env = makeEnv();
+    await recordSentMessage(
+      env.DB,
+      "msg_policy",
+      "session_1",
+      "agent_1",
+      "alice@example.com",
+      "rfc-policy@example.com",
+      "agentmail_auto_reply",
+    );
+    expect(env.DB._tables.sent_messages.get("msg_policy")?.auto_reply_policy).toBe(
+      "agentmail_auto_reply",
+    );
+  });
+
+  it("normalizes explicit RFC822 ids before storing", async () => {
+    const env = makeEnv();
+    await recordSentMessage(
+      env.DB,
+      "msg_explicit",
+      "session_1",
+      "agent_1",
+      "alice@example.com",
+      "<OUT-1@Example.COM>",
+    );
+    expect(env.DB._tables.sent_messages.get("msg_explicit")?.rfc822_msgid).toBe(
+      "out-1@example.com",
+    );
+    await expect(findSessionByRfc822MessageId(env.DB, "out-1@example.com")).resolves.toEqual({
+      sessionId: "session_1",
+      agentId: "agent_1",
+    });
+  });
+
+  it("falls back to RFC822-shaped AgentMail message_id when the explicit field is absent", async () => {
+    const env = makeEnv();
+    await recordSentMessage(
+      env.DB,
+      "<0100019e7eb025d0-5aa36622-a034-4379-9e14-869a97ef51c3-000000@email.amazonses.com>",
+      "session_1",
+      "agent_1",
+      "alice@example.com",
+    );
+    expect(Array.from(env.DB._tables.sent_messages.values())[0]?.rfc822_msgid).toBe(
+      "0100019e7eb025d0-5aa36622-a034-4379-9e14-869a97ef51c3-000000@email.amazonses.com",
+    );
+  });
+
+  it("does not treat opaque AgentMail ids as RFC822 ids", async () => {
+    const env = makeEnv();
+    await recordSentMessage(env.DB, "msg_out_1", "session_1", "agent_1", "alice@example.com");
+    expect(env.DB._tables.sent_messages.get("msg_out_1")?.rfc822_msgid).toBeNull();
+  });
+
   it("returns null when no row matches the message id", async () => {
     const env = makeEnv();
     const miss = await findSessionByRfc822MessageId(env.DB, "never-recorded@example.com");

@@ -51,17 +51,16 @@
  *        successor can take over.
  *
  * Thread history fetching (= prior messages on the same thread, used
- * to seed `buildContinuationPrompt`) is NOT implemented in this layer.
- * `buildContinuationPrompt(inbound, [])` is passed an empty history
- * for now — the agent gets only the most-recent inbound, plus the
- * persona's own memory. A follow-up issue tracks history population
- * from D1 / AgentMail `listMessages`.
+ * to seed `buildContinuationPrompt`) is implemented on continuation
+ * paths. SignalB thread self-scan also reuses the fetched AgentMail
+ * thread when RFC 822 headers do not map to a known D1 row.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 — 層 7-2 dispatch body + 層 7-3 wire-up)
  * Spec: plan-draft.md §step 9 dispatch + impl-mid-3 §3.2 案 B
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import { threadSelfScan, type AgentMailThread } from '../lib/agentmail-signal-b';
 import { ChatApiError, postChatMessage } from '../lib/chat-api';
 import {
   buildAutoreplyNotificationText,
@@ -75,7 +74,12 @@ import {
 import { extractBody, extractThreadRefs, reChainDepth } from '../lib/email-thread';
 import { parseAssistantText } from '../lib/email-send-marker';
 import { fetchMailThreadMessages } from '../lib/mail-history';
-import { resolveSenderToResources } from '../lib/memory-attach';
+import {
+  readUserMappingWithDefault,
+  readUserMappingByAgentId,
+  resolveSenderToResources,
+} from '../lib/memory-attach';
+import { toResourceParam, type MemoryStoreResourceParam } from '../types/memory';
 import {
   buildAnthropicClient,
   createSessionWithResources,
@@ -85,6 +89,7 @@ import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
 import { executeWithCommit } from '../lib/three-stage-precheck';
+import { assertBridgeEgressAllowed } from '../lib/egress-guard';
 import type { AgentMailMessage, EmailSendMarker } from '../types/agentmail';
 import { dispatchMakotoTool } from '../dispatch/makoto-tool-dispatcher';
 import type {
@@ -102,17 +107,30 @@ const SESSION_STREAM_TIMEOUT_MS = 110_000;
  * the claim + DO lock are acquired.
  */
 export const agentmailDispatch: AgentMailDispatcher = async (context) => {
-  // 1. Sender resolution.
+  // 1. Sender + thread identity.
   const { env, event, message, rfc822MsgId, claim, eventKey } = context;
   const sender = typeof message.from === 'string' ? message.from : '';
   if (!sender) {
     return { kind: 'skipped', reason: 'no_sender' };
   }
-  const resolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
-  if (!resolution) {
-    return { kind: 'skipped', reason: 'unknown_sender' };
+
+  // RFC 822 thread resolve must run before sender mapping. External
+  // counterparties replying to MAKOTO-sent mail are often absent from
+  // `user_mapping:<email>`; the sent_messages row is the authority for
+  // continuation routing.
+  const refs = extractThreadRefs(message);
+  let sessionId: string | null = null;
+  let sessionAgentId: string | null = null;
+  for (let i = refs.references.length - 1; i >= 0; i--) {
+    const candidate = refs.references[i];
+    if (!candidate) continue;
+    const found = await findSessionByRfc822MessageId(env.DB, candidate);
+    if (found) {
+      sessionId = found.sessionId;
+      sessionAgentId = found.agentId;
+      break;
+    }
   }
-  const { user_slug: userSlug, agent_id: agentId, resources } = resolution;
 
   // 2. Anthropic client.
   const client = buildAnthropicClient(env);
@@ -125,24 +143,45 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
 
-  // 3. Thread resolve via In-Reply-To / References. The references
-  // array is oldest-first; we scan in reverse so the most-recent
-  // ancestor matches first (= least chance of routing into a
-  // long-stale session).
-  const refs = extractThreadRefs(message);
-  let sessionId: string | null = null;
-  for (let i = refs.references.length - 1; i >= 0; i--) {
-    const candidate = refs.references[i];
-    if (!candidate) continue;
-    const found = await findSessionByRfc822MessageId(env.DB, candidate);
-    if (found && found.agentId === agentId) {
-      sessionId = found.sessionId;
-      break;
-    }
-  }
+  const inboxIdForThread = extractInboxId(event);
+  const threadId =
+    typeof message.thread_id === 'string' && message.thread_id.length > 0
+      ? message.thread_id
+      : '';
 
   // 4. Continuation vs first-contact branch.
-  const isContinuation = sessionId !== null || reChainDepth(message.subject) >= 1;
+  // SignalB: when RFC 822 headers do not map to D1 but the AgentMail
+  // thread itself contains a bot-authored message, keep the inbound on
+  // the continuation path. This mirrors Python `_thread_self_scan`.
+  let signalBHistory: AgentMailMessage[] = [];
+  let signalBHasSelf = false;
+  if (sessionId === null && inboxIdForThread && threadId) {
+    const scan = await threadSelfScan(
+      (inboxId, tid) => fetchAgentMailThread(env, inboxId, tid),
+      inboxIdForThread,
+      threadId,
+      {
+        warn: (msg) =>
+          console.warn(
+            `[agentmail-dispatch] signalB eventKey=${eventKey} ${msg}`,
+          ),
+      },
+    );
+    signalBHasSelf = scan.selfPresent;
+    signalBHistory = scan.messages;
+    console.log(
+      `[agentmail-dispatch] signalB eventKey=${eventKey} thread_id=${threadId} self=${scan.selfPresent} messages=${scan.messages.length} senders_self=${scan.sendersSelf}`,
+    );
+    if (scan.selfPresent && sessionId === null) {
+      const recovered = await findSessionInThreadHistory(env.DB, scan.messages);
+      if (recovered) {
+        sessionId = recovered.sessionId;
+        sessionAgentId = recovered.agentId;
+      }
+    }
+  }
+  const isContinuation =
+    sessionId !== null || signalBHasSelf || reChainDepth(message.subject) >= 1;
 
   // 4a. Cold inbound notify-only path (Issue #186 #2). When the
   // operator has wired a notify space + Chat SA key, defer cold
@@ -162,6 +201,35 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   ) {
     await tryNotifyInbound(env, message, false, eventKey);
     return { kind: 'committed' };
+  }
+
+  const senderResolution = await resolveSenderToResources(env.MAKOTO_KV, sender);
+  let userSlug = senderResolution?.user_slug ?? '';
+  let agentId = senderResolution?.agent_id ?? '';
+  let resources: MemoryStoreResourceParam[] = senderResolution?.resources ?? [];
+
+  if (sessionId !== null && sessionAgentId) {
+    const owner = await readUserMappingByAgentId(env.MAKOTO_KV, sessionAgentId);
+    agentId = sessionAgentId;
+    userSlug = owner?.mapping.user_slug ?? userSlug;
+    if (!userSlug) {
+      userSlug = `agent-${sessionAgentId.slice(-8)}`;
+      console.warn(
+        `[agentmail-dispatch] continuation owner mapping missing eventKey=${eventKey} agent=${sessionAgentId}`,
+      );
+    } else if (senderResolution && senderResolution.agent_id !== sessionAgentId) {
+      console.warn(
+        `[agentmail-dispatch] continuation sender mapping differs eventKey=${eventKey} sender_agent=${senderResolution.agent_id} owner_agent=${sessionAgentId}`,
+      );
+    }
+  } else if (!senderResolution) {
+    const fallback = await resolveDefaultMailOwner(env);
+    if (!fallback) {
+      return { kind: 'skipped', reason: 'no_mail_owner_mapping' };
+    }
+    userSlug = fallback.userSlug;
+    agentId = fallback.agentId;
+    resources = fallback.resources;
   }
 
   let userMessage: string;
@@ -186,7 +254,11 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     console.log(
       `[agentmail-dispatch] created session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey}`,
     );
-    userMessage = buildInitialUserMessage(message, isContinuation);
+    if (isContinuation) {
+      userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, signalBHistory)}`;
+    } else {
+      userMessage = buildInitialUserMessage(message, false);
+    }
   } else {
     // Existing session — fetch prior thread messages so the
     // continuation prompt carries full context into the agent. Mirrors
@@ -199,15 +271,10 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     // pre-fetch behaviour). We deliberately don't gate the reply on
     // this fetch — a stuck threads endpoint should never block the
     // agent from at least responding to the latest inbound.
-    const inboxIdForHistory = extractInboxId(event);
-    const threadId =
-      typeof message.thread_id === 'string' && message.thread_id.length > 0
-        ? message.thread_id
-        : '';
     let history: AgentMailMessage[] = [];
-    if (inboxIdForHistory && threadId) {
+    if (inboxIdForThread && threadId) {
       try {
-        history = await fetchMailThreadMessages(env, inboxIdForHistory, threadId);
+        history = await fetchMailThreadMessages(env, inboxIdForThread, threadId);
       } catch (err) {
         // Defensive: `fetchMailThreadMessages` is documented to swallow
         // every error, but if a future change ever bubbles one we still
@@ -223,7 +290,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     } else {
       console.warn(
         `[agentmail-dispatch] mail history skipped eventKey=${eventKey} reason=${
-          !inboxIdForHistory ? 'no_inbox_id' : 'no_thread_id'
+          !inboxIdForThread ? 'no_inbox_id' : 'no_thread_id'
         }`,
       );
     }
@@ -247,6 +314,19 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           callerSessionId: sessionId!,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
+      payloadAudit: {
+        kv: env.MAKOTO_KV,
+        enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+        ttlDays: env.CMA_AUDIT_TTL_DAYS,
+        maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+        mode: 'agentmail',
+        context: {
+          event_key: eventKey,
+          sender_email: sender,
+          user_slug: userSlug,
+          agent_id: agentId,
+        },
+      },
     });
   } catch (err) {
     console.error(
@@ -260,12 +340,20 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   }
 
   // 6. Parse EMAIL_SEND markers + log any failures.
-  const { markers, failures, cleanedText } = parseAssistantText(streamResult.assistantText);
+  const parsedAssistant = parseAssistantText(streamResult.assistantText);
+  let { markers } = parsedAssistant;
+  const { failures, cleanedText } = parsedAssistant;
   if (failures.length > 0) {
     for (const f of failures) {
       console.warn(
         `[agentmail-dispatch] EMAIL_SEND parse failure eventKey=${eventKey} reason=${f.reason} raw=${f.raw.slice(0, 200)}`,
       );
+    }
+  }
+  if (markers.length === 0 && isContinuation && cleanedText.trim().length > 0) {
+    const continuationReply = buildContinuationReplyMarker(message, cleanedText);
+    if (continuationReply) {
+      markers = [continuationReply];
     }
   }
   if (markers.length === 0) {
@@ -308,7 +396,12 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   }
   const amClientOpts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
   const amClient = new AgentMailClient(env.AGENTMAIL_API_KEY, amClientOpts);
-  const parentMessageId = typeof message.id === 'string' ? message.id : '';
+  const parentMessageId =
+    typeof message.id === 'string' && message.id.length > 0
+      ? message.id
+      : typeof message.message_id === 'string' && message.message_id.length > 0
+        ? message.message_id
+        : '';
 
   const successfullySentBodies: string[] = [];
   for (const m of markers) {
@@ -376,6 +469,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           agentId,
           m.to,
           sendResult.rfc822_message_id || undefined,
+          'agentmail_auto_reply',
         );
       }
     } catch (err) {
@@ -501,6 +595,39 @@ function buildInitialUserMessage(msg: AgentMailMessage, isContinuationByDepth: b
   ].join('\n');
 }
 
+function buildContinuationReplyMarker(
+  msg: AgentMailMessage,
+  body: string,
+): EmailSendMarker | null {
+  const to = extractEmailAddress(msg.from);
+  if (!to) return null;
+  const subject = normalizeReplySubject(typeof msg.subject === 'string' ? msg.subject : '');
+  const parent =
+    typeof msg.id === 'string' && msg.id.length > 0
+      ? msg.id
+      : typeof msg.message_id === 'string' && msg.message_id.length > 0
+        ? msg.message_id
+        : undefined;
+  return {
+    to,
+    subject,
+    body: body.trim(),
+    ...(parent ? { in_reply_to_message_id: parent } : {}),
+  };
+}
+
+function extractEmailAddress(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const m = raw.match(/<([^>]+)>/);
+  const candidate = (m ? m[1] : raw).trim();
+  return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(candidate) ? candidate : '';
+}
+
+function normalizeReplySubject(subject: string): string {
+  const s = subject.trim() || '(no subject)';
+  return /^\s*re\s*:/i.test(s) ? s : `Re: ${s}`;
+}
+
 /**
  * Pull `inbox_id` out of the webhook envelope. AgentMail payload format
  * (https://docs.agentmail.to/events): `inbox_id` lives at
@@ -519,6 +646,74 @@ function extractInboxId(event: AgentMailDispatchContext['event']): string {
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return '';
+}
+
+async function fetchAgentMailThread(
+  env: AgentMailDispatchContext['env'],
+  inboxId: string,
+  threadId: string,
+): Promise<AgentMailThread> {
+  if (!env.AGENTMAIL_API_KEY) {
+    throw new Error('no_agentmail_api_key');
+  }
+  const baseUrl = (env.AGENTMAIL_API_BASE_URL ?? 'https://api.agentmail.to/v0').replace(/\/$/, '');
+  const url = `${baseUrl}/inboxes/${encodeURIComponent(inboxId)}/threads/${encodeURIComponent(threadId)}`;
+  assertBridgeEgressAllowed(url, 'agentmail-dispatch:signalB');
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${env.AGENTMAIL_API_KEY}`,
+      accept: 'application/json',
+    },
+  });
+  if (!resp.ok) {
+    throw new Error(`AgentMail thread fetch failed: ${resp.status}`);
+  }
+  const text = await resp.text();
+  return text.length === 0 ? {} : (JSON.parse(text) as AgentMailThread);
+}
+
+async function findSessionInThreadHistory(
+  db: D1Database,
+  messages: AgentMailMessage[],
+): Promise<{ sessionId: string; agentId: string } | null> {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg) continue;
+    const refs = extractThreadRefs(msg);
+    const candidates = [
+      ...(typeof msg.message_id === 'string' ? [msg.message_id] : []),
+      ...(typeof msg.rfc822_message_id === 'string' ? [msg.rfc822_message_id] : []),
+      ...refs.references,
+    ];
+    for (const candidate of candidates) {
+      const found = await findSessionByRfc822MessageId(db, envNormalizeMessageId(candidate));
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function resolveDefaultMailOwner(
+  env: AgentMailDispatchContext['env'],
+): Promise<{
+  userSlug: string;
+  agentId: string;
+  resources: MemoryStoreResourceParam[];
+} | null> {
+  const r = await readUserMappingWithDefault(env.MAKOTO_KV, '', env.DEFAULT_USER_SLUG);
+  if (!r) return null;
+  return {
+    userSlug: r.mapping.user_slug,
+    agentId: r.mapping.agent_id,
+    resources: r.mapping.memory_attachments.map(toResourceParam),
+  };
+}
+
+function envNormalizeMessageId(raw: string): string {
+  let s = raw.trim();
+  if (s.startsWith('<') && s.endsWith('>')) s = s.slice(1, -1).trim();
+  return s.toLowerCase();
 }
 
 /**

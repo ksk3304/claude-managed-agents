@@ -100,6 +100,15 @@ function makeDeps(fetchImpl: typeof fetch) {
   };
 }
 
+function makeDefaultDeps(fetchImpl: typeof fetch) {
+  return {
+    saKeyJson: fixtureSaKeyJson(),
+    project: 'test-proj',
+    location: 'asia-northeast1',
+    fetchImpl,
+  };
+}
+
 beforeEach(() => {
   _resetSchedulerClientCacheForTests();
 });
@@ -253,6 +262,25 @@ describe('get_job', () => {
 // ---------------------------------------------------------------------------
 
 describe('create_job', () => {
+  it('uses the existing single scheduled-jobs topic by default', async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchMock = makeFetchMock(async (url, init) => {
+      if (url === TOKEN_URL) return tokenResponse();
+      captured = JSON.parse(init.body as string);
+      return jsonResponse(200, { name: `${PARENT}/jobs/new-job` });
+    });
+    const mgr = createCloudSchedulerManager(makeDefaultDeps(fetchMock as unknown as typeof fetch));
+    await mgr.create_job(
+      'new-job',
+      '0 10 * * *',
+      'cma_session',
+      { prompt: 'hello' },
+      { description: 'morning report' },
+    );
+    const target = captured!.pubsubTarget as { topicName: string };
+    expect(target.topicName).toBe('projects/test-proj/topics/cma-scheduled-jobs');
+  });
+
   it('POSTs to the parent jobs/ collection with base64 payload + topicName built from handler', async () => {
     let captured: Record<string, unknown> | null = null;
     const fetchMock = makeFetchMock(async (url, init) => {

@@ -18,6 +18,10 @@ import {
   readCounter,
   checkBudget,
   wrapChatSender,
+  evaluateSessionCostAfterTurn,
+  handlePendingSessionApproval,
+  projectSessionCostForPdfPreflight,
+  usdFromUsage,
   DEFAULT_LIMITS,
   _internals,
   type CostGuardDeps,
@@ -25,8 +29,14 @@ import {
 } from '../src/lib/cost-guard';
 import { makeKv } from './makoto-helpers';
 
-const { KIND_ANTHROPIC_CALL, KIND_ANTHROPIC_COST_USD, KIND_CHAT_POST, PREFIX } =
-  _internals;
+const {
+  KIND_ANTHROPIC_CALL,
+  KIND_ANTHROPIC_COST_USD,
+  KIND_CHAT_POST,
+  KIND_EXTERNAL_API_CALL,
+  PREFIX,
+  resetCostGuardConfigCacheForTest,
+} = _internals;
 
 function fixedNow(iso: string): () => Date {
   return () => new Date(iso);
@@ -37,6 +47,62 @@ function makeDeps(overrides: Partial<CostGuardDeps> = {}): CostGuardDeps {
     kv: makeKv(),
     now: fixedNow('2026-05-15T12:00:00Z'),
     ...overrides,
+  };
+}
+
+function makeCostGuardDb(): D1Database & {
+  _rows: Map<string, { kind: string; bucket: string; value: number }>;
+  _config: Map<string, Record<string, unknown>>;
+} {
+  const rows = new Map<string, { kind: string; bucket: string; value: number }>();
+  const config = new Map<string, Record<string, unknown>>();
+  const keyFor = (kind: string, bucket: string) => `${kind}:${bucket}`;
+  return {
+    _rows: rows,
+    _config: config,
+    prepare(sql: string) {
+      let params: unknown[] = [];
+      const stmt = {
+        bind(...bound: unknown[]) {
+          params = bound;
+          return stmt;
+        },
+        async first<T>() {
+          if (/^SELECT enabled, paused_until_ms, limits_json/i.test(sql.trim())) {
+            const [id] = params as [string];
+            return (config.get(id) as T) ?? null;
+          }
+          if (/^SELECT value FROM cost_guard_counters/i.test(sql.trim())) {
+            const [kind, bucket] = params as [string, string];
+            const row = rows.get(keyFor(kind, bucket));
+            return (row ? { value: row.value } : null) as T | null;
+          }
+          if (/^INSERT INTO cost_guard_counters/i.test(sql.trim())) {
+            const [kind, bucket, by] = params as [string, string, number];
+            const key = keyFor(kind, bucket);
+            const prev = rows.get(key);
+            const value = (prev?.value ?? 0) + by;
+            rows.set(key, { kind, bucket, value });
+            return { value } as T;
+          }
+          throw new Error(`unexpected SQL: ${sql}`);
+        },
+        async run() {
+          return { success: true, meta: {}, results: [] };
+        },
+        async all<T>() {
+          return { success: true, meta: {}, results: [] as T[] };
+        },
+        raw: async () => [],
+      };
+      return stmt;
+    },
+    batch: async () => [],
+    exec: async () => ({ count: 0, duration: 0 }),
+    dump: async () => new ArrayBuffer(0),
+  } as unknown as D1Database & {
+    _rows: Map<string, { kind: string; bucket: string; value: number }>;
+    _config: Map<string, Record<string, unknown>>;
   };
 }
 
@@ -57,6 +123,16 @@ describe('incrementCounter — basic increment and key shape', () => {
     const raw = await deps.kv.get(`${PREFIX}:chat_post:2026-05-15`);
     expect(raw).not.toBeNull();
     expect(JSON.parse(raw!)).toEqual({ v: 1 });
+  });
+
+  it('uses D1 counters first when DB is provided', async () => {
+    const db = makeCostGuardDb();
+    const deps = makeDeps({ db });
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 2);
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 3);
+    expect(await readCounter(deps, KIND_EXTERNAL_API_CALL)).toBe(5);
+    expect(db._rows.get('external_api_call:2026-05-15')?.value).toBe(5);
+    expect(await deps.kv.get(`${PREFIX}:external_api_call:2026-05-15`)).toBeNull();
   });
 
   it('sums repeated increments into the same bucket', async () => {
@@ -158,8 +234,10 @@ describe('checkBudget', () => {
     const deps = makeDeps();
     const status = await checkBudget(deps);
     expect(status.current).toEqual({
+      anthropicMonthlyCalls: 0,
       anthropicMonthlyUsd: 0,
       chatDailyCount: 0,
+      externalApiDailyCount: 0,
     });
     expect(status.exceeded).toEqual([]);
     expect(status.limit).toEqual(DEFAULT_LIMITS);
@@ -172,6 +250,14 @@ describe('checkBudget', () => {
     expect(status.current.anthropicMonthlyUsd).toBeCloseTo(1.5, 6);
     expect(status.exceeded).toContain('anthropicMonthlyUsd');
     expect(status.exceeded).not.toContain('chatDailyCount');
+  });
+
+  it('flags anthropicMonthlyCalls as exceeded when current >= limit', async () => {
+    const deps = makeDeps({ limits: { anthropicMonthlyCalls: 2 } });
+    await incrementCounter(deps, KIND_ANTHROPIC_CALL, 2);
+    const status = await checkBudget(deps);
+    expect(status.current.anthropicMonthlyCalls).toBe(2);
+    expect(status.exceeded).toContain('anthropicMonthlyCalls');
   });
 
   it('flags chatDailyCount as exceeded at the boundary (>= limit)', async () => {
@@ -201,6 +287,74 @@ describe('checkBudget', () => {
       'anthropicMonthlyUsd',
       'chatDailyCount',
     ]);
+  });
+
+  it('flags externalApiDailyCount as exceeded when current >= limit', async () => {
+    const deps = makeDeps({ limits: { externalApiDailyCount: 1 } });
+    await incrementCounter(deps, KIND_EXTERNAL_API_CALL, 1);
+    const status = await checkBudget(deps);
+    expect(status.current.externalApiDailyCount).toBe(1);
+    expect(status.exceeded).toContain('externalApiDailyCount');
+  });
+
+  it('applies D1 config hard-cap overlay and disabled state', async () => {
+    const db = makeCostGuardDb();
+    db._config.set('global', {
+      enabled: 0,
+      paused_until_ms: null,
+      limits_json: JSON.stringify({ chatDailyCount: 1 }),
+      updated_by: 'admin@example.com',
+      updated_at_ms: 123,
+      change_seq: 4,
+    });
+    const deps = makeDeps({ db });
+    await incrementCounter(deps, KIND_CHAT_POST, 2);
+    const status = await checkBudget(deps);
+    expect(status.limit.chatDailyCount).toBe(1);
+    expect(status.config.enabled).toBe(false);
+    expect(status.config.changeSeq).toBe(4);
+    expect(status.exceeded).toEqual([]);
+  });
+
+  it('falls back to KV/defaults when D1 tables are unavailable', async () => {
+    resetCostGuardConfigCacheForTest();
+    const kv = makeKv();
+    await kv.put(`${PREFIX}:chat_post:2026-05-15`, JSON.stringify({ v: 7 }));
+    const db = {
+      prepare() {
+        throw new Error('no such table');
+      },
+    } as unknown as D1Database;
+    const status = await checkBudget(makeDeps({ db, kv }));
+    expect(status.current.chatDailyCount).toBe(7);
+    expect(status.limit.chatDailyCount).toBe(DEFAULT_LIMITS.chatDailyCount);
+    expect(status.config.source).toBe('default');
+  });
+
+  it('does not honor stale disabled/pause/raised limits after D1 read failure', async () => {
+    resetCostGuardConfigCacheForTest();
+    const kv = makeKv();
+    await kv.put(`${PREFIX}:chat_post:2026-05-15`, JSON.stringify({ v: 1 }));
+    const db = makeCostGuardDb();
+    db._config.set('global', {
+      enabled: 0,
+      paused_until_ms: Date.parse('2026-05-15T13:00:00Z'),
+      limits_json: JSON.stringify({ chatDailyCount: 999 }),
+      updated_by: 'admin@example.com',
+      updated_at_ms: 123,
+      change_seq: 4,
+    });
+    await checkBudget(makeDeps({ db, kv, limits: { chatDailyCount: 1 } }));
+
+    (db as unknown as { prepare: D1Database['prepare'] }).prepare = () => {
+      throw new Error('temporary d1 outage');
+    };
+    const status = await checkBudget(makeDeps({ db, kv, limits: { chatDailyCount: 1 } }));
+    expect(status.config.source).toBe('stale');
+    expect(status.config.enabled).toBe(true);
+    expect(status.config.paused).toBe(false);
+    expect(status.limit.chatDailyCount).toBe(1);
+    expect(status.exceeded).toEqual(['chatDailyCount']);
   });
 });
 
@@ -382,5 +536,239 @@ describe('wrapChatSender', () => {
     // operator への警告は届いている
     expect(sender.calls.filter((c) => c.space === 'spaces/OPS')).toHaveLength(1);
     expect(putCallCount).toBeGreaterThan(0);
+  });
+});
+
+describe('per-session staged approval', () => {
+  const sessionConfig = {
+    thresholdsUsd: [8, 12, 16],
+    stepUsd: 4,
+    usdToJpy: 155,
+    fallbackModel: 'claude-opus-4-7',
+  };
+
+  it('calculates usage USD including cache tokens', () => {
+    const usd = usdFromUsage(
+      {
+        input_tokens: 1_000_000,
+        output_tokens: 100_000,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 10_000,
+          ephemeral_1h_input_tokens: 20_000,
+        },
+        cache_read_input_tokens: 30_000,
+      },
+      'claude-sonnet-4-6',
+      sessionConfig,
+    );
+    expect(usd).toBeCloseTo(4.6665, 6);
+  });
+
+  it('asks at $8 then allows yes until the $12 stage', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    const snapshot = {
+      model: 'claude-opus-4-7',
+      usage: { input_tokens: 1_600_000, output_tokens: 0 },
+    };
+
+    const first = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot,
+    });
+    expect(first?.thresholdUsd).toBe(8);
+    expect(first?.promptText).toContain('この session の対話を続けますか？');
+    expect(first?.promptText).toContain('$12 到達時');
+
+    const yes = await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'はい',
+    });
+    expect(yes.kind).toBe('reply');
+    if (yes.kind === 'reply') {
+      expect(yes.closeSession).toBe(false);
+      expect(yes.text).toContain('$12');
+    }
+
+    const stillUnderNextStage = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_000_000, output_tokens: 0 },
+      },
+    });
+    expect(stillUnderNextStage).toBeNull();
+
+    const next = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_400_000, output_tokens: 0 },
+      },
+    });
+    expect(next?.thresholdUsd).toBe(12);
+    expect(next?.promptText).toContain('$16 到達時');
+  });
+
+  it('records one Anthropic monthly call for each processed usage snapshot', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_usage_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+    });
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_usage_1',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 150, output_tokens: 30 },
+      },
+    });
+
+    await expect(readCounter(deps, KIND_ANTHROPIC_CALL)).resolves.toBe(2);
+  });
+
+  it('projects PDF cost against the current session threshold before sending it to the LLM', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_pdf');
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_pdf',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_580_000, output_tokens: 0 },
+      },
+    });
+
+    const projection = await projectSessionCostForPdfPreflight(deps, {
+      threadSessionKey,
+      totalPages: 12,
+      estimatedTokensLow: 74_300,
+      estimatedTokensHigh: 98_600,
+      estimatedCostLowUsd: 0.3715,
+      estimatedCostHighUsd: 0.493,
+    });
+
+    expect(projection?.currentSessionUsd).toBeCloseTo(7.9, 6);
+    expect(projection?.crossedThresholdUsd).toBe(8);
+    expect(projection?.projectedHighUsd).toBeCloseTo(8.393, 6);
+    expect(projection?.promptText).toContain('PDF事前確認');
+    expect(projection?.promptText).toContain('次の確認ライン: $8');
+  });
+
+  it('does not project a PDF prompt when the read stays below the next threshold', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_pdf_low');
+    const deps = {
+      kv,
+      now: fixedNow('2026-05-15T12:00:00Z'),
+      config: sessionConfig,
+    };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_pdf_low',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_000_000, output_tokens: 0 },
+      },
+    });
+
+    const projection = await projectSessionCostForPdfPreflight(deps, {
+      threadSessionKey,
+      totalPages: 2,
+      estimatedTokensLow: 54_050,
+      estimatedTokensHigh: 58_100,
+      estimatedCostLowUsd: 0.27025,
+      estimatedCostHighUsd: 0.2905,
+    });
+
+    expect(projection?.currentSessionUsd).toBeCloseTo(5, 6);
+    expect(projection?.crossedThresholdUsd).toBeNull();
+    expect(projection?.nextThresholdUsd).toBe(8);
+    expect(projection?.promptText).toBeNull();
+  });
+
+  it('does not make one yes unlimited; jumps approve the highest crossed stage only', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    const deps = { kv, config: sessionConfig };
+
+    const prompt = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_jump',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 2_600_000, output_tokens: 0 },
+      },
+    });
+    expect(prompt?.thresholdUsd).toBe(12);
+    expect(prompt?.nextThresholdUsd).toBe(16);
+
+    await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'はい、続けて',
+    });
+
+    const next = await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_jump',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 3_200_000, output_tokens: 0 },
+      },
+    });
+    expect(next?.thresholdUsd).toBe(16);
+    expect(next?.nextThresholdUsd).toBe(20);
+  });
+
+  it('いいえ clears the thread session binding so another turn starts fresh', async () => {
+    const kv = makeKv();
+    const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';
+    await kv.put(threadSessionKey, 'ses_old');
+    const deps = { kv, config: sessionConfig };
+    await evaluateSessionCostAfterTurn(deps, {
+      threadSessionKey,
+      sessionId: 'ses_old',
+      snapshot: {
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1_600_000, output_tokens: 0 },
+      },
+    });
+
+    const no = await handlePendingSessionApproval(deps, {
+      threadSessionKey,
+      text: 'いいえ',
+    });
+    expect(no.kind).toBe('reply');
+    if (no.kind === 'reply') {
+      expect(no.closeSession).toBe(true);
+    }
+    expect(await kv.get(threadSessionKey)).toBeNull();
   });
 });
