@@ -1420,6 +1420,32 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).not.toContain('bot');
   });
 
+  it('Case 9c: benign runtime path mention is softened, not neutralized', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9c',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: 'まず `/mnt/memory/` を確認し、調査プロセスを説明しました。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('社内記憶');
+    expect(chatApiMock.patches[0]!.text).toContain('調査プロセス');
+    expect(chatApiMock.patches[0]!.text).not.toContain('/mnt/memory');
+    expect(chatApiMock.patches[0]!.text).not.toContain('今回のタスクは完了できませんでした');
+  });
+
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
