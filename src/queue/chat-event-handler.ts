@@ -536,7 +536,9 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName = await safePostPlaceholder(env, spaceName, threadName, eventKey, claim);
+  const placeholderName =
+    body.placeholderMessageName ||
+    (await safePostPlaceholder(env, spaceName, threadName, eventKey, claim));
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の

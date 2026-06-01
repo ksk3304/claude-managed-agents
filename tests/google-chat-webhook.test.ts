@@ -16,7 +16,7 @@
  *     を使って拒否されることを確認する。
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   SignJWT,
   generateKeyPair,
@@ -32,6 +32,31 @@ import {
   type ChatEventPayload,
 } from '../src/webhooks/google-chat';
 import { makeFakeQueue, makeMakotoDb } from './makoto-helpers';
+
+const chatApiMock = {
+  posts: [] as Array<{ spaceName: string; text: string; opts: unknown }>,
+  deletes: [] as string[],
+  postThrow: null as Error | null,
+};
+vi.mock('../src/lib/chat-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/lib/chat-api')>();
+  return {
+    ...actual,
+    postChatMessage: async (
+      _deps: unknown,
+      spaceName: string,
+      text: string,
+      opts: unknown = {},
+    ) => {
+      if (chatApiMock.postThrow) throw chatApiMock.postThrow;
+      chatApiMock.posts.push({ spaceName, text, opts });
+      return { name: `${spaceName}/messages/placeholder_${chatApiMock.posts.length}` };
+    },
+    deleteChatMessage: async (_deps: unknown, messageName: string) => {
+      chatApiMock.deletes.push(messageName);
+    },
+  };
+});
 
 const PROJECT_NUMBER = '192588613210';
 const ISSUER = 'accounts.google.com';
@@ -167,6 +192,9 @@ describe('google-chat webhook handler', () => {
   beforeEach(() => {
     origFetch = globalThis.fetch;
     _resetPublicKeyCacheForTesting();
+    chatApiMock.posts.length = 0;
+    chatApiMock.deletes.length = 0;
+    chatApiMock.postThrow = null;
   });
   afterEach(() => {
     globalThis.fetch = origFetch;
@@ -195,6 +223,33 @@ describe('google-chat webhook handler', () => {
     // dedupe row exists with no committed_at_ms (= Phase B が confirmOwner で読む)
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, unknown> } })._tables.dedupe;
     expect(dedupe.has('chat:msgname:spaces/A/messages/M1')).toBe(true);
+  });
+
+  it('posts a synchronous placeholder and passes it to the Queue consumer', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const env = envWith({
+      CHAT_SA_KEY_JSON: '{"client_email":"x","private_key":"y"}',
+    });
+    const jwt = await signJwt(fixture);
+    const body = JSON.stringify(makeMessageEvent('spaces/A/messages/M1'));
+    const req = buildRequest(body, `Bearer ${jwt}`);
+
+    const resp = await handleGoogleChatWebhook(req, env);
+    expect(resp.status).toBe(200);
+    await expect(resp.json()).resolves.toEqual({});
+
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.spaceName).toBe('spaces/SPACE_X');
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.posts[0]!.opts).toEqual({
+      threadName: 'spaces/SPACE_X/threads/THREAD_X',
+      threadFallback: 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD',
+    });
+
+    const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.placeholderMessageName).toBe('spaces/SPACE_X/messages/placeholder_1');
   });
 
   it('200 + skipped on non-MESSAGE event (ADDED_TO_SPACE)', async () => {

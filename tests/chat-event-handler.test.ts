@@ -1004,6 +1004,33 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
+  it('webhook placeholder が渡されたら新規 placeholder を POST せず既存 message を PATCH', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '質問です' });
+    msg.placeholderMessageName = 'spaces/AAA/messages/from_webhook';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_placeholder_from_webhook',
+      events: [
+        { type: 'agent.message.text', text: '応答テキスト' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toEqual([
+      {
+        messageName: 'spaces/AAA/messages/from_webhook',
+        text: '応答テキスト',
+      },
+    ]);
+  });
+
   it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
