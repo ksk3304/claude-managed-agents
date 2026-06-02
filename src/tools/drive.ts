@@ -380,6 +380,20 @@ export async function driveReadExport(
 
 const DRIVE_CREATE_FILE_KNOWN_KEYS = new Set(['name', 'content', 'mime_type', 'parents']);
 const DRIVE_CREATE_FILE_MAX_BYTES = 1024 * 1024;
+const DRIVE_CREATE_FILE_BINARY_EXTENSIONS = [
+  '.xlsx',
+  '.xlsm',
+  '.docx',
+  '.pptx',
+  '.pdf',
+] as const;
+const DRIVE_CREATE_FILE_BINARY_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/pdf',
+]);
 
 export interface DriveCreateFileResult {
   id?: string;
@@ -426,6 +440,7 @@ export async function driveCreateFile(
     typeof input.mime_type === 'string' && input.mime_type.trim().length > 0
       ? input.mime_type.trim()
       : 'text/plain';
+  rejectDriveCreateBinaryArtifact(name, mimeType);
 
   let parents: string[] | undefined;
   if (input.parents !== undefined) {
@@ -494,6 +509,19 @@ export async function driveCreateFile(
     );
   }
   return (await resp.json()) as DriveCreateFileResult;
+}
+
+function rejectDriveCreateBinaryArtifact(name: string, mimeType: string): void {
+  const lowerName = name.toLowerCase();
+  const lowerMime = mimeType.toLowerCase();
+  const ext = DRIVE_CREATE_FILE_BINARY_EXTENSIONS.find((e) => lowerName.endsWith(e));
+  if (!ext && !DRIVE_CREATE_FILE_BINARY_MIME_TYPES.has(lowerMime)) return;
+  const reason = ext ?? lowerMime;
+  throw new ToolSchemaError(
+    `drive_create_file: ${reason} is a binary artifact, but drive_create_file only accepts UTF-8 text content. ` +
+      `Create the Office/PDF file with the attached skill, save it under /mnt/session/outputs/${name}, ` +
+      `then answer normally; the Google Chat bridge uploads session output files to Drive and appends the Drive URL.`,
+  );
 }
 
 /**

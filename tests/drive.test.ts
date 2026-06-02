@@ -125,6 +125,22 @@ describe('driveCreateFile', () => {
       driveCreateFile({ name: 'x', content: big }, baseDeps(fetcher)),
     ).rejects.toThrow();
   });
+
+  it('rejects binary Office/PDF artifacts because content is text-only', async () => {
+    const fetcher = makeFetchMock(async () => {
+      throw new Error('drive_create_file should reject before fetch');
+    });
+    await expect(
+      driveCreateFile(
+        {
+          name: 'issue247-drive-e2e.xlsx',
+          content: 'not a real xlsx package',
+          mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+        baseDeps(fetcher),
+      ),
+    ).rejects.toThrow(/binary artifact/);
+  });
 });
 
 describe('driveUploadBinaryFile', () => {
