@@ -59,6 +59,7 @@ export interface DeliverSessionOutputsInput {
   env: Env;
   sessionId: string;
   sourceText: string;
+  artifactHintText?: string;
   minCreatedAtMs: number;
   eventKey: string;
   resolveDriveDeps: () => Promise<DriveToolDeps>;
@@ -76,7 +77,8 @@ export async function deliverSessionOutputsToDrive(
     skipped: [],
     sanitizedPathCount: sanitized.count,
   };
-  if (sanitized.count === 0 && !ARTIFACT_FILENAME_HINT_RE.test(input.sourceText)) {
+  const hintText = `${input.sourceText}\n${input.artifactHintText ?? ''}`;
+  if (sanitized.count === 0 && !ARTIFACT_FILENAME_HINT_RE.test(hintText)) {
     return base;
   }
 
