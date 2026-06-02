@@ -85,4 +85,16 @@ describe('makoto-prime spec bundle (generated src/data/*.ts)', () => {
       200_000,
     );
   });
+
+  it('self-introspection instructions are bundled with current skill/tool boundaries', async () => {
+    const r = await buildMakotoSystemPrompt(PERSONA_SPEC, TOOLS_SPEC);
+    expect(r.systemPrompt).toContain('`makoto_introspect` custom tool');
+    expect(r.systemPrompt).toContain('{"detail": "all", "include_sources": true}');
+    expect(r.systemPrompt).not.toContain('{"topic": "workspace", "include_sources": true}');
+    expect(r.systemPrompt).toContain('Cloudflare Workers + Anthropic Managed Agents (CMA)');
+    expect(r.systemPrompt).toContain('slash-command skill');
+    expect(r.systemPrompt).toContain('attached Managed Agent skill');
+    expect(r.systemPrompt).toContain('custom tool / action marker');
+    expect(r.systemPrompt).toContain('`slash_skills` と `attached_skills`');
+  });
 });
