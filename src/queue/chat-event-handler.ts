@@ -2026,7 +2026,7 @@ function scrubActionMarkerLeakForChat(
   }
   const normalized = text.toLowerCase();
   const rawMarkerSyntax =
-    /\b(email_send|chat_post|schedule_action)\s*:/i.test(text);
+    /`?\b(email_send|chat_post|schedule_action)\b`?\s*:\s*\{/i.test(text);
   const processingStateTalk =
     text.includes('処理中') ||
     text.includes('処理しています') ||

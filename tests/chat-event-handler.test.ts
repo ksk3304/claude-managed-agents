@@ -1588,6 +1588,37 @@ describe('handleChatEvent', () => {
     );
   });
 
+  it('Case 9e: tool inventory may describe marker names with colons', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9e',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '*アクションマーカー（bot 側で実行）*\n\n' +
+            '- EMAIL_SEND: 送信（live 確認済み）\n' +
+            '- CHAT_POST: 別スペース投稿（live 確認済み）\n' +
+            '- SCHEDULE_ACTION: ジョブ管理',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('EMAIL_SEND: 送信');
+    expect(chatApiMock.patches[0]!.text).toContain('CHAT_POST: 別スペース投稿');
+    expect(chatApiMock.patches[0]!.text).not.toContain(
+      '送信処理の状態を確認できませんでした',
+    );
+  });
+
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
