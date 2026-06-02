@@ -3,12 +3,13 @@
  * の入力 prompt 組立 (= Python `cma_gchat_bot.py:_handle_event` の prompt
  * 構築) の byte 等価性を担保する。
  *
- * 5 ケース:
- *   1. 最小 envelope (旧 `<context>...</context>\n<user_message>...` と同形)
- *   2. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
- *   3. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
- *   4. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
- *   5. cap-recovery (body 完全差し替え = Python recovery semantics)
+ * 主なケース:
+ *   1. 最小 envelope + routing instructions
+ *   2. routing instructions (#217)
+ *   3. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
+ *   4. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
+ *   5. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
+ *   6. cap-recovery (body 完全差し替え = Python recovery semantics)
  */
 
 import { describe, it, expect } from 'vitest';
