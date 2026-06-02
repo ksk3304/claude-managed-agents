@@ -1542,6 +1542,7 @@ export async function handleChatEvent(
     env,
     sessionId,
     sourceText: markerLeakScrubbed.text,
+    artifactHintText: bodyText,
     minCreatedAtMs: sessionOutputMinCreatedAtMs,
     eventKey,
     resolveDriveDeps: async () => {
