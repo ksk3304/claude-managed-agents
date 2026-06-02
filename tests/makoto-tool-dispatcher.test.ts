@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import type Anthropic from '@anthropic-ai/sdk';
 import {
   dispatchMakotoTool,
   isMakotoToolName,
@@ -40,7 +41,8 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(12);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(13);
+    expect(MAKOTO_TOOL_NAMES).toContain('drive_stage_file');
     expect(MAKOTO_TOOL_NAMES).toContain('agentmail_read');
     expect(MAKOTO_TOOL_NAMES).toContain('makoto_introspect');
   });
@@ -200,6 +202,82 @@ describe('dispatchMakotoTool happy paths', () => {
     });
     expect(r.ok).toBe(true);
     expect((r.payload as { files: unknown[] }).files).toHaveLength(1);
+  });
+
+  it('drive_stage_file resolves OAuth then mounts the Drive binary into the session', async () => {
+    const kv = makeKv();
+    await putRefreshToken(kv, TEST_VAULT_KEY_B64, 'alice', 'rt');
+    let driveCalls = 0;
+    const fetchImpl = makeFetchMock(async (url) => {
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, { access_token: 'AT', expires_in: 3600 });
+      }
+      if (url.includes('googleapis.com/drive/v3/files/file123')) {
+        driveCalls++;
+        if (driveCalls === 1) {
+          return jsonResponse(200, {
+            id: 'file123',
+            name: 'template.xlsx',
+            mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            size: '2',
+          });
+        }
+        return new Response(new Uint8Array([0x50, 0x4b]), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const anthropic = {
+      beta: {
+        files: {
+          upload: async () => ({
+            id: 'file_ant',
+            type: 'file',
+            filename: 'template.xlsx',
+            mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            size_bytes: 2,
+            created_at: '2026-06-02T00:00:00Z',
+          }),
+        },
+        sessions: {
+          resources: {
+            add: async () => ({
+              id: 'sesrsc_ant',
+              type: 'file',
+              file_id: 'file_ant',
+              mount_path: '/mnt/session/uploads/template.xlsx',
+              created_at: '2026-06-02T00:00:00Z',
+              updated_at: '2026-06-02T00:00:00Z',
+            }),
+          },
+        },
+      },
+    } as unknown as Anthropic;
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: kv,
+      MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+      OAUTH_CLIENT_ID: 'cid',
+      OAUTH_CLIENT_SECRET: 'csec',
+    } as unknown as Env;
+
+    const r = await dispatchMakotoTool(
+      'drive_stage_file',
+      { file_id: 'file123' },
+      {
+        env,
+        userSlug: 'alice',
+        boundMessageId: 'm-1',
+        callerSessionId: 'sesn_123',
+        anthropic,
+        fetchImpl,
+      },
+    );
+
+    expect(r.ok).toBe(true);
+    expect((r.payload as Record<string, unknown>).mount_path).toBe(
+      '/mnt/session/uploads/template.xlsx',
+    );
   });
 
   it('calendar_list_events also resolves OAuth then proxies', async () => {
