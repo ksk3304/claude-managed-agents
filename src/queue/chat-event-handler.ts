@@ -1258,11 +1258,27 @@ export async function handleChatEvent(
         forceFreshSession,
         timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
           ? MORNING_BRIEF_STREAM_TIMEOUT_MS
-          : undefined,
+          : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
+      if (orchestrated.stopReason === 'custom_tool_timeout') {
+        assistantText =
+          'ファイル作成中にツール実行がタイムアウトしました。作成完了を確認できていないため、担当者がログを確認します。';
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'custom_tool_timeout_visible_notice',
+          level: 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            tool_use_count: orchestrated.toolUseCount,
+            tool_use_names: orchestrated.toolUseNames,
+          },
+        });
+      }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
       // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
@@ -2519,6 +2535,16 @@ function mapToPythonCapStopReason(
     default:
       return null;
   }
+}
+
+function parseReactiveStreamTimeoutMs(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n < 10 || n > 600_000) {
+    console.warn(`[chat-event] invalid CMA_REACTIVE_STREAM_TIMEOUT_MS=${raw}; using default`);
+    return undefined;
+  }
+  return n;
 }
 
 /**

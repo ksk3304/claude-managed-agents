@@ -117,7 +117,13 @@ vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async () => ({ ok: false, payload: { error: 'mocked' } }),
+    dispatchMakotoTool: async (name: string, input: unknown) => {
+      const override = (globalThis as unknown as {
+        __makotoToolDispatch?: (name: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>;
+      }).__makotoToolDispatch;
+      if (override) return override(name, input);
+      return { ok: false, payload: { error: 'mocked' } };
+    },
   };
 });
 
@@ -488,6 +494,7 @@ beforeEach(() => {
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
   schedulerMock.jobs = [];
+  delete (globalThis as unknown as { __makotoToolDispatch?: unknown }).__makotoToolDispatch;
   installFakeAnthropic(null);
 });
 
@@ -2468,6 +2475,48 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('Chat に表示できる本文が空でした');
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('custom tool timeout: PATCHes visible notice instead of leaving placeholder text', async () => {
+    const env = buildEnv({
+      envOverrides: { CMA_REACTIVE_STREAM_TIMEOUT_MS: '10' },
+    });
+    const msg = buildQueueMsg({
+      text: '原稿を書いてDrive保存して',
+      placeholderName: 'spaces/AAA/messages/ingress_timeout',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    (globalThis as unknown as {
+      __makotoToolDispatch?: () => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async () => new Promise(() => undefined);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_custom_tool_timeout',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'まず原稿を書いてDriveに上げます。' }],
+        },
+        { type: 'agent.custom_tool_use', id: 'tu_drive', name: 'drive_create_file', input: {} },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_drive'] },
+        },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_timeout');
+    expect(chatApiMock.patches[0]!.text).toContain(
+      'ファイル作成中にツール実行がタイムアウトしました',
+    );
+    expect(chatApiMock.patches[0]!.text).not.toContain('Driveに上げます');
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 

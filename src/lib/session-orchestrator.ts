@@ -228,6 +228,10 @@ export interface OrchestrateChatTurnResult {
    * `'stream_terminated'` / `'events_send_failed'` 等。
    */
   stopReason?: string;
+  /** stream 中に観測した tool-use event 件数。 */
+  toolUseCount: number;
+  /** stream 中に観測した tool 名。重複なし、観測順。 */
+  toolUseNames: string[];
   /** 起動ログ用に取得した system prompt sha 等。caller が必要なら参照. */
   systemPromptInfo: SystemPromptResult;
 }
@@ -640,6 +644,8 @@ export async function orchestrateChatTurn(
     sessionId,
     isNewSession,
     assistantText: streamResult.assistantText,
+    toolUseCount: streamResult.toolUseCount,
+    toolUseNames: streamResult.toolUseNames,
     systemPromptInfo,
   };
   if (streamResult.terminalEventType !== undefined) {
