@@ -287,6 +287,7 @@ async function runDailyReportCron(env: Env): Promise<void> {
 }
 
 interface Issue206DebugBody {
+  mode?: "chat_observe" | "morning_brief";
   runId?: string;
   text?: string;
   senderEmail?: string;
@@ -312,6 +313,10 @@ async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Re
     body = (await request.json()) as Issue206DebugBody;
   } catch {
     return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
+  }
+  if (body.mode === "morning_brief") {
+    const result = await enqueueMorningBriefSeto(env);
+    return Response.json({ ok: result.kind !== "failed", mode: body.mode, ...result });
   }
   const runId = safeDebugId(body.runId || `issue206-${Date.now()}`);
   const spaceName = body.spaceName || "spaces/issue206-smoke";
