@@ -29,9 +29,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 
 import { handleChatEvent } from '../src/queue/chat-event-handler';
-import { buildAllManagedAgentSkills } from '../src/lib/attached-skills';
-import { skillsHash } from '../src/lib/agent-cache';
-import { chatThreadSessionKey } from '../src/lib/session-orchestrator';
+import {
+  buildChatCapabilitySessionKey,
+  chatThreadSessionKey,
+} from '../src/lib/session-orchestrator';
 import type { ChatQueueMessage } from '../src/webhooks/google-chat';
 import { _resetChatOAuthCacheForTests } from '../src/lib/chat-oauth';
 import { buildSideEffectKey } from '../src/lib/three-stage-precheck';
@@ -1578,7 +1579,7 @@ describe('handleChatEvent', () => {
       'alice@example.com',
       'spaces/ROOM10',
       'spaces/ROOM10/threads/T10',
-      await skillsHash(buildAllManagedAgentSkills(env)),
+      await buildChatCapabilitySessionKey(env),
     );
     expect(sessionKey).not.toBeNull();
     await env.MAKOTO_KV.put(sessionKey!, 'sesn_existing');
@@ -1643,7 +1644,7 @@ describe('handleChatEvent', () => {
       'alice@example.com',
       'spaces/ROOM10',
       'spaces/ROOM10/threads/T11',
-      await skillsHash(buildAllManagedAgentSkills(env)),
+      await buildChatCapabilitySessionKey(env),
     );
     expect(threadKey).not.toBeNull();
     expect(await env.MAKOTO_KV.get(threadKey!)).toBe('sesn_new_thread');
@@ -1660,7 +1661,7 @@ describe('handleChatEvent', () => {
       'alice@example.com',
       'spaces/AAA',
       'spaces/AAA/threads/TATT',
-      await skillsHash(buildAllManagedAgentSkills(env)),
+      await buildChatCapabilitySessionKey(env),
     );
     expect(threadKey).not.toBeNull();
     await env.MAKOTO_KV.put(scopeKey, 'sesn_existing');

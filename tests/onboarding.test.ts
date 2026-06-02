@@ -21,6 +21,7 @@ import {
   USER_SCOPED_STORES,
   actualStoreName,
 } from '../src/cli/store-config';
+import { MAKOTO_TOOL_NAMES } from '../src/lib/makoto-capability-registry';
 import { main } from '../src/cli/onboarding';
 
 // ---- in-memory fakes ----
@@ -60,11 +61,11 @@ function makeAnthropicFake(opts: {
   };
 } = {}): AnthropicClientLike & {
   _created: Array<{ name: string; description?: string }>;
-  _agentsCreated: Array<{ name: string; system: string }>;
+  _agentsCreated: Array<{ name: string; system: string; tools?: unknown }>;
 } {
   const existing = [...(opts.existing ?? [])];
   const created: Array<{ name: string; description?: string }> = [];
-  const agentsCreated: Array<{ name: string; system: string }> = [];
+  const agentsCreated: Array<{ name: string; system: string; tools?: unknown }> = [];
   return {
     _created: created,
     _agentsCreated: agentsCreated,
@@ -93,7 +94,7 @@ function makeAnthropicFake(opts: {
           return opts.template;
         },
         async create(params) {
-          agentsCreated.push({ name: params.name, system: params.system });
+          agentsCreated.push({ name: params.name, system: params.system, tools: params.tools });
           return { id: `agent_${agentsCreated.length}_new`, name: params.name };
         },
       },
@@ -225,6 +226,13 @@ describe('copyAgent', () => {
     const created = ant._agentsCreated[0]!;
     expect(created.name).toBe('MAKOTOくん (山田 太郎用)');
     expect(created.system).toBe('You are MAKOTOくん.\n\nあなたは山田さん専属です');
+    const tools = (created.tools ?? []) as Array<Record<string, unknown>>;
+    expect(tools).toContainEqual({ type: 'bash' });
+    const customToolNames = tools
+      .filter((tool) => tool.type === 'custom')
+      .map((tool) => tool.name);
+    expect(customToolNames.sort()).toEqual([...MAKOTO_TOOL_NAMES].sort());
+    expect(customToolNames).toContain('makoto_introspect');
   });
 
   it('throws when SDK returns null system / undefined model (fail-fast)', async () => {

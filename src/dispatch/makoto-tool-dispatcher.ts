@@ -1,7 +1,7 @@
 /**
  * MAKOTO 専用 tool dispatcher — bridges the bridge layer's
  * `sendAndStreamWithToolDispatch` event loop to MAKOTO custom tools
- * (Drive / Sheets / Calendar / AgentMail).
+ * (Drive / Sheets / Calendar / AgentMail / self-introspection).
  *
  * Why this layer exists (vs. wiring tools into `custom-tools-runtime`):
  *   The Cloudflare fork's `defineTool` / `CustomToolContext` exposes
@@ -53,6 +53,11 @@ import {
   agentmailRead,
 } from '../tools/agentmail-read';
 import {
+  buildMakotoIntrospection,
+  MAKOTO_TOOL_NAMES,
+  type MakotoToolName,
+} from '../lib/makoto-capability-registry';
+import {
   GoogleApiToolError,
   ToolSchemaError,
   createKvConfirmTokenStore,
@@ -60,33 +65,7 @@ import {
 import { getAccessToken } from '../lib/workspace-oauth';
 import { getOAuthLease } from '../durable-objects/oauth-lease';
 
-/** Names of the tools the MAKOTO bridge exposes to its agent. */
-export type MakotoToolName =
-  | 'drive_search'
-  | 'drive_get_file_metadata'
-  | 'drive_read_export'
-  | 'drive_create_file'
-  | 'drive_delete'
-  | 'sheets_create'
-  | 'sheets_read'
-  | 'sheets_update'
-  | 'sheets_append'
-  | 'calendar_list_events'
-  | 'agentmail_read';
-
-export const MAKOTO_TOOL_NAMES: readonly MakotoToolName[] = [
-  'drive_search',
-  'drive_get_file_metadata',
-  'drive_read_export',
-  'drive_create_file',
-  'drive_delete',
-  'sheets_create',
-  'sheets_read',
-  'sheets_update',
-  'sheets_append',
-  'calendar_list_events',
-  'agentmail_read',
-];
+export { MAKOTO_TOOL_NAMES } from '../lib/makoto-capability-registry';
 
 const MAKOTO_TOOL_NAME_SET: ReadonlySet<string> = new Set(MAKOTO_TOOL_NAMES);
 
@@ -157,6 +136,12 @@ export async function dispatchMakotoTool(
     };
   }
   const args = input as Record<string, unknown>;
+
+  // Local metadata only. Keep it before OAuth so MAKOTOくん can answer
+  // capability questions even when Workspace is not connected.
+  if (name === 'makoto_introspect') {
+    return ok(await buildMakotoIntrospection(args, ctx.env));
+  }
 
   if (name === 'agentmail_read') {
     try {

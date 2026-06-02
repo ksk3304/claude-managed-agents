@@ -23,12 +23,14 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { skillsHash } from './agent-cache';
+import { skillsHash, toolsHash } from './agent-cache';
 import {
   buildAllManagedAgentSkills,
   ensureManagedAgentSkills,
   hasAttachedSkills,
 } from './attached-skills';
+import { MAKOTO_AGENT_TOOLS } from './makoto-capability-registry';
+import { ensureManagedAgentTools } from './managed-agent-tools';
 import type { UserMappingValue } from './memory-attach';
 import {
   buildAnthropicClient,
@@ -69,23 +71,37 @@ const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
- * `_session_key_for_thread` (Python l.494-512) と byte 等価な KV key を
- * 組み立てる純関数。sender_email + space + thread の三つ組で per-user per-thread
- * に振り分ける (issue #1119 = per-user 化)。いずれかが空なら null を返し、
+ * Google Chat reactive turn の KV key を組み立てる純関数。
+ * sender_email + space + thread の三つ組で per-user per-thread に振り分ける
+ * (issue #1119 = per-user 化)。capabilityKey は tool / skill 構成変更時に
+ * 旧 session を再利用しないための suffix。いずれかが空なら null を返し、
  * 毎回新規 session として扱わせる (fail-closed)。
  */
 export function chatThreadSessionKey(
   senderEmail: string,
   spaceName: string,
   threadName: string | null | undefined,
-  skillsKey?: string | null,
+  capabilityKey?: string | null,
 ): string | null {
   const email = (senderEmail || '').trim().toLowerCase();
   const space = (spaceName || '').trim();
   const thread = (threadName || '').trim();
   if (!email || !space || !thread) return null;
-  const suffix = skillsKey && skillsKey !== 'none' ? `:skills-${skillsKey}` : '';
+  const suffix = capabilityKey && capabilityKey !== 'none' ? `:${capabilityKey}` : '';
   return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}${suffix}`;
+}
+
+export function buildChatCapabilitySessionKeyFromHashes(
+  desiredAgentToolsHash: string,
+  attachedSkillsHash: string,
+): string {
+  return `tools-${desiredAgentToolsHash}:skills-${attachedSkillsHash}`;
+}
+
+export async function buildChatCapabilitySessionKey(env: Env): Promise<string> {
+  const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
+  const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
+  return buildChatCapabilitySessionKeyFromHashes(desiredAgentToolsHash, attachedSkillsHash);
 }
 
 /**
@@ -311,6 +327,35 @@ export async function orchestrateChatTurn(
     };
   }
 
+  // ---- custom tools ensure ----
+  // Existing employee agents predate new Worker-side tools. Patch their tool
+  // catalog in place before session reuse so model-visible tools and the
+  // Worker dispatcher cannot drift.
+  const desiredAgentTools = MAKOTO_AGENT_TOOLS;
+  const desiredAgentToolsHash = await toolsHash([...desiredAgentTools]);
+  try {
+    const ensuredTools = await ensureManagedAgentTools(
+      client,
+      input.userMapping.agent_id,
+      desiredAgentTools,
+      {
+        kv,
+        desiredToolsHash: desiredAgentToolsHash,
+      },
+    );
+    if (ensuredTools.reason !== 'ensured_cache_hit') {
+      console.log(
+        `[chat-event] managed tools ensure agent=${input.userMapping.agent_id} ` +
+          `reason=${ensuredTools.reason} updated=${ensuredTools.updated} tools=${ensuredTools.finalTools.length}`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[chat-event] managed tools ensure failed agent=${input.userMapping.agent_id}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   // ---- attached skills ensure ----
   // Anthropic pre-built document skills (xlsx / pptx / docx / pdf) are only
   // usable after they are attached to the employee agent. Keep the existing
@@ -344,7 +389,11 @@ export async function orchestrateChatTurn(
   // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
   // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
   // 古い CMA session を継続してしまうため、scope key への fallback はしない。
-  // skills hash を suffix に含め、document skills 付与前の session を再利用しない。
+  // capability hash を suffix に含め、tools / document skills 付与前の session を再利用しない。
+  const capabilitySessionKey = buildChatCapabilitySessionKeyFromHashes(
+    desiredAgentToolsHash,
+    attachedSkillsHash,
+  );
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
     ? null
@@ -352,7 +401,7 @@ export async function orchestrateChatTurn(
         input.senderEmail,
         input.spaceName,
         input.threadName,
-        attachedSkillsHash,
+        capabilitySessionKey,
       );
   let sessionId: string | null = null;
   if (sessionKey !== null) {
