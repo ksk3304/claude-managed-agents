@@ -1258,6 +1258,7 @@ export async function handleChatEvent(
                 userSlug: userMapping.user_slug,
                 boundMessageId: '',
                 callerSessionId: sessionIdRef.current,
+                anthropic: client,
               })
             : gateExternalToolCall(env, {
                 eventKey,

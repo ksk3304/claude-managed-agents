@@ -9,6 +9,7 @@ export type MakotoToolName =
   | 'drive_get_file_metadata'
   | 'drive_read_export'
   | 'drive_create_file'
+  | 'drive_stage_file'
   | 'drive_delete'
   | 'sheets_create'
   | 'sheets_read'
@@ -68,6 +69,13 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
   {
     name: 'drive_create_file',
     description: 'Create a Google Drive file within size limits.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: true,
+  },
+  {
+    name: 'drive_stage_file',
+    description:
+      'Download an existing Drive Office/PDF binary and mount it into the active session for document skills; save edited output under /mnt/session/outputs.',
     status: 'cloudflare_code_live_unverified',
     requires_workspace_oauth: true,
   },
@@ -413,6 +421,14 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
           parents: arrayProp('Optional parent Drive folder ids.'),
         },
         ['name', 'content'],
+      );
+    case 'drive_stage_file':
+      return objectSchema(
+        {
+          file_id: stringProp('Google Drive file id for an existing .xlsx/.xlsm/.docx/.pptx/.pdf binary.'),
+          name: stringProp('Optional session mount filename with extension.'),
+        },
+        ['file_id'],
       );
     case 'drive_delete':
       return objectSchema(
