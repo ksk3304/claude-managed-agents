@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   INTERNAL_STATE_PATTERNS,
+  maskInternalStateForChat,
   scrubInternalStateForChat,
 } from '../src/redact/internal-state';
 import parityCases from './data/internal_state_patterns_parity_cases.json';
@@ -54,6 +55,15 @@ describe('scrubInternalStateForChat', () => {
     const r = scrubInternalStateForChat('memory store にアクセス', 'job-X');
     expect(r.text).toBe('[job-X] 今回のタスクは完了できませんでした。担当者が確認します。');
     expect(r.hits).toEqual(['memory store']);
+  });
+});
+
+describe('maskInternalStateForChat', () => {
+  it('uses the same registry while preserving the answer body', () => {
+    const r = maskInternalStateForChat('memory store が未 attach のため対応できません');
+    expect(r.hits).toEqual(['未 attach', 'memory store']);
+    expect(r.text).toBe('内部運用情報 が内部運用情報 のため対応できません');
+    expect(r.text).not.toContain('今回のタスクは完了できませんでした');
   });
 });
 

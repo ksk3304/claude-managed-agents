@@ -97,14 +97,11 @@ function extractEmailSendSpans(text: string): EmailSendSpan[] {
   while (searchFrom < text.length) {
     const prefixAt = text.indexOf(EMAIL_SEND_PREFIX, searchFrom);
     if (prefixAt === -1) break;
-    const jsonStart = text.indexOf('{', prefixAt + EMAIL_SEND_PREFIX.length);
-    if (jsonStart === -1) {
-      spans.push({
-        start: prefixAt,
-        end: lineEnd(text, prefixAt),
-        raw: text.slice(prefixAt, lineEnd(text, prefixAt)),
-        json: '',
-      });
+    let jsonStart = prefixAt + EMAIL_SEND_PREFIX.length;
+    while (text[jsonStart] === ' ' || text[jsonStart] === '\t') {
+      jsonStart += 1;
+    }
+    if (text[jsonStart] !== '{') {
       searchFrom = prefixAt + EMAIL_SEND_PREFIX.length;
       continue;
     }

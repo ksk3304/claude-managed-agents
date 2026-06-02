@@ -60,6 +60,13 @@ describe('parseEmailSendMarkers', () => {
     expect(result.failures[0]!.reason).toMatch(/JSON parse/);
   });
 
+  it('leaves capability descriptions with EMAIL_SEND colon untouched', () => {
+    const result = parseAssistantText('- EMAIL_SEND: 送信（live 確認済み）');
+    expect(result.markers).toHaveLength(0);
+    expect(result.failures).toHaveLength(0);
+    expect(result.cleanedText).toBe('- EMAIL_SEND: 送信（live 確認済み）');
+  });
+
   it('strips marker lines from cleanedText', () => {
     const text = 'before\nEMAIL_SEND:{"to":"a@x","subject":"s","body":"b"}\nafter';
     const result = parseAssistantText(text);
