@@ -22,7 +22,7 @@
  *
  *   4. Drive the SDK event stream with `sendAndStreamWithToolDispatch`.
  *      The TS event loop self-services `agent.custom_tool_use` events
- *      (= MAKOTO's 10 tools) via `dispatchMakotoTool` and posts the
+ *      (= MAKOTO custom tools) via `dispatchMakotoTool` and posts the
  *      result back as `user.custom_tool_result` (mirrors Python
  *      cma_lib.py:2563-2729).
  *

@@ -297,10 +297,15 @@ interface Issue206DebugBody {
 }
 
 async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Response> {
-  const expected = (env.MAKOTO_DEBUG_TOKEN ?? "").trim();
-  if (!expected) return new Response("not found", { status: 404 });
+  const expected = [
+    env.MAKOTO_DEBUG_TOKEN,
+    env.MAKOTO_ISSUE250_SMOKE_TOKEN,
+  ]
+    .map((value) => (value ?? "").trim())
+    .filter(Boolean);
+  if (expected.length === 0) return new Response("not found", { status: 404 });
   const got = (request.headers.get("x-makoto-debug-token") ?? "").trim();
-  if (got !== expected) return new Response("not found", { status: 404 });
+  if (!got || !expected.includes(got)) return new Response("not found", { status: 404 });
 
   let body: Issue206DebugBody;
   try {

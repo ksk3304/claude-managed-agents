@@ -63,6 +63,8 @@ declare namespace Cloudflare {
     WEBHOOK_SECRET_AGENTMAIL_SECONDARY?: string;
     /** API key for outbound AgentMail REST (send / reply). */
     AGENTMAIL_API_KEY?: string;
+    /** Default AgentMail inbox id used for outbound send and read-only lookup. */
+    AGENTMAIL_DEFAULT_INBOX_ID?: string;
     /** Override for AgentMail REST base URL (production default lives in code). */
     AGENTMAIL_API_BASE_URL?: string;
     /**
@@ -92,6 +94,8 @@ declare namespace Cloudflare {
     MAIL_SEND_SKILL_VERSION?: string;
     /** Secret-gated debug endpoint token. Unset means debug endpoints return 404. */
     MAKOTO_DEBUG_TOKEN?: string;
+    /** Temporary smoke token for issue-specific live verification. */
+    MAKOTO_ISSUE250_SMOKE_TOKEN?: string;
 
     /**
      * Optional default user_slug for the Chat reactive path. When set,

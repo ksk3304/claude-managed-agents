@@ -151,11 +151,28 @@ export class AgentMailClient {
    */
   async listMessages(
     inboxId: string,
-    options: { limit?: number; cursor?: string } = {},
-  ): Promise<{ messages: AgentMailMessage[]; next_cursor?: string }> {
+    options: {
+      limit?: number;
+      pageToken?: string;
+      labels?: string[];
+      before?: string;
+      after?: string;
+      includeSpam?: boolean;
+      includeBlocked?: boolean;
+      includeUnauthenticated?: boolean;
+    } = {},
+  ): Promise<{ messages: AgentMailMessage[]; next_page_token?: string }> {
     const params = new URLSearchParams();
     if (options.limit) params.set('limit', String(options.limit));
-    if (options.cursor) params.set('cursor', options.cursor);
+    if (options.pageToken) params.set('page_token', options.pageToken);
+    for (const label of options.labels ?? []) {
+      if (label) params.append('labels', label);
+    }
+    if (options.before) params.set('before', options.before);
+    if (options.after) params.set('after', options.after);
+    if (options.includeSpam) params.set('include_spam', 'true');
+    if (options.includeBlocked) params.set('include_blocked', 'true');
+    if (options.includeUnauthenticated) params.set('include_unauthenticated', 'true');
     const path = `/inboxes/${encodeURIComponent(inboxId)}/messages${
       params.toString() ? `?${params.toString()}` : ''
     }`;
