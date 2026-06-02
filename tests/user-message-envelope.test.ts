@@ -16,14 +16,17 @@ import {
   buildUserMessageEnvelope,
   MAIL_INTENT_INSTRUCTIONS,
   MENTION_SECTION_HEADER,
+  ROUTING_INSTRUCTIONS,
 } from '../src/lib/user-message-envelope';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () => {
-  it('opts 全省略で `<context>space_type=UNKNOWN sender=</context>\\n<user_message>...</user_message>` を返す', () => {
+  it('opts 全省略で routing instructions + `<context>` + `<user_message>` を返す', () => {
     const out = buildUserMessageEnvelope('こんにちは');
     expect(out).toBe(
-      '<context>space_type=UNKNOWN sender=</context>\n<user_message>こんにちは</user_message>',
+      `${ROUTING_INSTRUCTIONS}\n` +
+        '<context>space_type=UNKNOWN sender=</context>\n' +
+        '<user_message>こんにちは</user_message>',
     );
   });
 
@@ -32,8 +35,27 @@ describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () =>
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
     expect(out).toBe(
-      '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n<user_message>hi</user_message>',
+      `${ROUTING_INSTRUCTIONS}\n` +
+        '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n' +
+        '<user_message>hi</user_message>',
     );
+  });
+});
+
+describe('buildUserMessageEnvelope — routing instructions (#217)', () => {
+  it('lightweight 発話で tool / bash / API 深掘りを避ける指示を context 前に置く', () => {
+    const out = buildUserMessageEnvelope('質問です', {
+      speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
+    });
+    const idxRouting = out.indexOf('<routing_instructions>');
+    const idxContext = out.indexOf('<context>');
+    const idxBody = out.indexOf('<user_message>');
+
+    expect(idxRouting).toBe(0);
+    expect(idxRouting).toBeLessThan(idxContext);
+    expect(idxContext).toBeLessThan(idxBody);
+    expect(out).toContain('tool / bash / Drive / Calendar / Chat API / memory 深掘りを使わず');
+    expect(out).toContain('入力中 placeholder は現在のユーザー依頼として扱わない');
   });
 });
 
@@ -84,11 +106,14 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
     // intent は context より前、body より前
     const idxIntent = out.indexOf('<intent>');
     const idxMailInstructions = out.indexOf('<mail_intent_instructions>');
+    const idxRouting = out.indexOf('<routing_instructions>');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
     expect(idxIntent).toBeLessThan(idxContext);
     expect(idxIntent).toBeLessThan(idxMailInstructions);
     expect(idxMailInstructions).toBeLessThan(idxContext);
+    expect(idxMailInstructions).toBeLessThan(idxRouting);
+    expect(idxRouting).toBeLessThan(idxContext);
     expect(idxContext).toBeLessThan(idxBody);
   });
 
