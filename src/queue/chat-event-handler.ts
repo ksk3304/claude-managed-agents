@@ -1424,8 +1424,7 @@ export async function handleChatEvent(
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          const notice =
-            '処理開始中に一時的なエラーが発生しました。削除表示を避けるため、このメッセージを残しています。少し時間を置いて再実行してください。';
+          const notice = '一時的なエラーです。少し時間を置いて再送してください。';
           await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
           await recordRuntimeEvent(env, {
             eventKey,
@@ -1434,7 +1433,7 @@ export async function handleChatEvent(
             eventType: 'orchestrator_transient_visible_notice',
             level: 'warn',
             source: 'chat-event-handler',
-            detail: { reason: err.reason },
+            detail: { reason: err.reason, error: redactPiiInText(err.message).slice(0, 1000) },
           });
           await safeCommit(env, eventKey, claim, {
             messageId: message.name,

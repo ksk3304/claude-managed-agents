@@ -1851,11 +1851,15 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.deletes).toHaveLength(0);
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('一時的なエラー');
+    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
     const runtimeEvents = (env.DB as unknown as {
       _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
     })._tables.cma_worker_runtime_events;
     expect(runtimeEvents.map((row) => row.event_type)).toContain('orchestrator_transient_visible_notice');
+    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    expect(noticeEvent?.detail_json).toContain('stream_failed');
+    expect(noticeEvent?.detail_json).toContain('stream connection reset');
   });
 
   it('Case 13: session-log attachment 不在 → skip + event committed', async () => {
@@ -2547,7 +2551,14 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
-    expect(chatApiMock.patches[0]!.text).toContain('一時的なエラー');
+    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
+    })._tables.cma_worker_runtime_events;
+    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    expect(noticeEvent?.detail_json).toContain('sessions_create_failed');
+    expect(noticeEvent?.detail_json).toContain('sessions.create upstream 503');
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
