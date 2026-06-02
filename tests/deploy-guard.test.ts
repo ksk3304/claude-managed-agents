@@ -7,15 +7,28 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   checkRequiredMarkers,
   collectGitContext,
+  collectServingLineage,
   evaluateBranchPolicy,
   evaluateDeployGuard,
   evaluateRunContextPolicy,
+  extractCfRepoCommit,
+  findEffectiveServingCommit,
   readDeployTarget,
   renderReport,
   REQUIRED_MARKERS,
 } from "../scripts/deploy-guard.mjs";
 
 const roots: string[] = [];
+
+function deploymentFor(commit: string) {
+  return [
+    {
+      id: "fixture",
+      created_on: "2026-06-02T00:00:00Z",
+      annotations: { "workers/message": `cf-repo=${commit}` },
+    },
+  ];
+}
 
 function makeRoot() {
   const root = mkdtempSync(path.join(os.tmpdir(), "deploy-guard-"));
@@ -169,6 +182,7 @@ describe("deploy guard", () => {
 
   it("allows GitHub Actions deploy from main when fresh and markers exist", () => {
     const root = makeGitRoot();
+    const head = git(root, ["rev-parse", "HEAD"]);
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
@@ -176,6 +190,7 @@ describe("deploy guard", () => {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",
       },
+      deployments: deploymentFor(head),
     });
 
     expect(result.ok).toBe(true);
@@ -204,6 +219,7 @@ describe("deploy guard", () => {
     git(root, ["commit", "-m", "main update"]);
     git(root, ["branch", "-f", "origin/main", "main"]);
     git(root, ["checkout", "codex/stale-worktree"]);
+    const staleHead = git(root, ["rev-parse", "HEAD"]);
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
@@ -213,11 +229,178 @@ describe("deploy guard", () => {
         DEPLOY_GUARD_ALLOW_NON_MAIN: "1",
         DEPLOY_GUARD_OVERRIDE_REASON: "test stale branch override still needs freshness",
       },
+      deployments: deploymentFor(staleHead),
     });
 
     expect(result.ok).toBe(false);
     expect(result.failures).toContainEqual(
       expect.stringContaining("HEAD does not contain origin/main"),
+    );
+  });
+
+  it("extracts cf-repo from deployment messages", () => {
+    expect(extractCfRepoCommit("makoto-prime cf-repo=656a5eb1c836 issue=226")).toBe(
+      "656a5eb1c836",
+    );
+    expect(extractCfRepoCommit("secret deployment without code marker")).toBe("");
+  });
+
+  it("uses the previous marked code deployment when latest deployment has no cf-repo", () => {
+    const deployments = [
+      {
+        id: "code",
+        created_on: "2026-06-01T20:35:16Z",
+        annotations: { "workers/message": "issue=250 cf-repo=c19059547b5c34219e631ee63bf5d94306195e00" },
+      },
+      {
+        id: "secret",
+        created_on: "2026-06-01T21:40:26Z",
+        annotations: { "workers/message": "secret-triggered deployment" },
+      },
+    ];
+
+    expect(findEffectiveServingCommit(deployments)).toMatchObject({
+      ok: true,
+      latestHadCfRepo: false,
+      source: "previous_code_deployment",
+      commit: "c19059547b5c34219e631ee63bf5d94306195e00",
+      latestDeploymentId: "secret",
+      codeDeploymentId: "code",
+    });
+  });
+
+  it("blocks deploy when HEAD would drop the current serving hotfix", () => {
+    const root = makeGitRoot();
+    git(root, ["checkout", "-b", "codex/serving-hotfix"]);
+    writeFileSync(path.join(root, "hotfix.txt"), "656a5eb style production fix\n");
+    git(root, ["add", "hotfix.txt"]);
+    git(root, ["commit", "-m", "serving hotfix"]);
+    const servingHotfix = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "main"]);
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(servingHotfix),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("HEAD does not contain current serving cf-repo"),
+    );
+  });
+
+  it("blocks deploy when a must-preserve commit would be dropped", () => {
+    const root = makeGitRoot();
+    git(root, ["checkout", "-b", "codex/must-preserve-hotfix"]);
+    writeFileSync(path.join(root, "must-preserve.txt"), "deployed but not merged\n");
+    git(root, ["add", "must-preserve.txt"]);
+    git(root, ["commit", "-m", "must preserve hotfix"]);
+    const mustPreserve = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "main"]);
+    const mainHead = git(root, ["rev-parse", "HEAD"]);
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+        DEPLOY_GUARD_MUST_PRESERVE_COMMITS: mustPreserve,
+      },
+      deployments: deploymentFor(mainHead),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("HEAD does not contain must-preserve commit"),
+    );
+  });
+
+  it("loads active must-preserve commits from the ledger file", () => {
+    const root = makeGitRoot();
+    git(root, ["checkout", "-b", "codex/ledger-hotfix"]);
+    writeFileSync(path.join(root, "ledger-hotfix.txt"), "deployed hotfix\n");
+    git(root, ["add", "ledger-hotfix.txt"]);
+    git(root, ["commit", "-m", "ledger hotfix"]);
+    const ledgerHotfix = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "main"]);
+    const mainHead = git(root, ["rev-parse", "HEAD"]);
+    writeFileSync(
+      path.join(root, "deploy-must-preserve.json"),
+      JSON.stringify({
+        schema: 1,
+        commits: [
+          {
+            commit: ledgerHotfix,
+            issue: "#226",
+            reason: "production hotfix already served",
+            status: "active",
+          },
+          {
+            commit: "deadbeef",
+            issue: "#old",
+            reason: "retired example",
+            status: "retired",
+          },
+        ],
+      }),
+    );
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(mainHead),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.servingLineage.mustPreserveChecks).toHaveLength(1);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("HEAD does not contain must-preserve commit"),
+    );
+  });
+
+  it("passes serving lineage when HEAD contains the current serving commit", () => {
+    const root = makeGitRoot();
+    const mainHead = git(root, ["rev-parse", "HEAD"]);
+
+    const lineage = collectServingLineage(root, readDeployTarget(root), {
+      deployments: deploymentFor(mainHead),
+    });
+
+    expect(lineage.ok).toBe(true);
+    expect(lineage.servingContained).toBe(true);
+  });
+
+  it("ignores inherited DEPLOY_GUARD_SERVING_COMMIT and uses Cloudflare metadata fixtures", () => {
+    const root = makeGitRoot();
+    const mainHead = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "-b", "codex/serving-hotfix"]);
+    writeFileSync(path.join(root, "serving.txt"), "currently serving\n");
+    git(root, ["add", "serving.txt"]);
+    git(root, ["commit", "-m", "serving hotfix"]);
+    const servingHotfix = git(root, ["rev-parse", "HEAD"]);
+    git(root, ["checkout", "main"]);
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+        DEPLOY_GUARD_SERVING_COMMIT: mainHead,
+      },
+      deployments: deploymentFor(servingHotfix),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.servingLineage.effective.commit).toBe(servingHotfix);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("HEAD does not contain current serving cf-repo"),
     );
   });
 });

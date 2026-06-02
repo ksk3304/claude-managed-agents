@@ -18,6 +18,7 @@ export const REQUIRED_MARKERS = [
 ];
 
 export const PRODUCTION_BRANCHES = ['main', 'master'];
+export const MUST_PRESERVE_FILE = 'deploy-must-preserve.json';
 
 function readText(file) {
   return readFileSync(file, 'utf8');
@@ -38,6 +39,87 @@ function tryGit(root, args, fallback = '') {
   } catch {
     return fallback;
   }
+}
+
+function isHexCommit(value) {
+  return /^[0-9a-f]{7,40}$/i.test(value);
+}
+
+function shortCommit(value) {
+  return value.slice(0, 12);
+}
+
+function splitCommitList(value = '') {
+  return value
+    .split(/[\s,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function extractCfRepoCommit(message = '') {
+  return message.match(/(?:^|\s)cf-repo=([0-9a-f]{7,40})(?:\s|$)/i)?.[1] ?? '';
+}
+
+function deploymentMessage(deployment) {
+  return (
+    deployment?.annotations?.['workers/message'] ??
+    deployment?.annotations?.workers_message ??
+    deployment?.message ??
+    ''
+  );
+}
+
+function deploymentCreatedAt(deployment) {
+  const value = deployment?.created_on ?? deployment?.createdAt ?? deployment?.created_at ?? '';
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+export function findEffectiveServingCommit(deployments) {
+  if (!Array.isArray(deployments) || deployments.length === 0) {
+    return {
+      ok: false,
+      latestHadCfRepo: false,
+      source: 'missing',
+      commit: '',
+      latestDeploymentId: '',
+      codeDeploymentId: '',
+    };
+  }
+  const ordered = [...deployments].sort((a, b) => deploymentCreatedAt(b) - deploymentCreatedAt(a));
+  const latest = ordered[0];
+  const latestCommit = extractCfRepoCommit(deploymentMessage(latest));
+  if (latestCommit) {
+    return {
+      ok: true,
+      latestHadCfRepo: true,
+      source: 'latest_deployment',
+      commit: latestCommit,
+      latestDeploymentId: latest?.id ?? '',
+      codeDeploymentId: latest?.id ?? '',
+    };
+  }
+  for (const deployment of ordered.slice(1)) {
+    const commit = extractCfRepoCommit(deploymentMessage(deployment));
+    if (commit) {
+      return {
+        ok: true,
+        latestHadCfRepo: false,
+        source: 'previous_code_deployment',
+        commit,
+        latestDeploymentId: latest?.id ?? '',
+        codeDeploymentId: deployment?.id ?? '',
+      };
+    }
+  }
+  return {
+    ok: false,
+    latestHadCfRepo: false,
+    source: 'unmarked',
+    commit: '',
+    latestDeploymentId: latest?.id ?? '',
+    codeDeploymentId: '',
+  };
 }
 
 export function readDeployTarget(root) {
@@ -124,6 +206,138 @@ export function collectGitContext(root, options = {}) {
   };
 }
 
+export function readMustPreserveCommits(root, env = process.env) {
+  const commits = [];
+  for (const commit of splitCommitList(env.DEPLOY_GUARD_MUST_PRESERVE_COMMITS || '')) {
+    commits.push({ commit, source: 'env', issue: '', reason: 'DEPLOY_GUARD_MUST_PRESERVE_COMMITS' });
+  }
+
+  const ledgerPath = path.join(root, MUST_PRESERVE_FILE);
+  if (!existsSync(ledgerPath)) return commits;
+
+  const parsed = JSON.parse(readText(ledgerPath));
+  const entries = Array.isArray(parsed) ? parsed : parsed.commits;
+  if (!Array.isArray(entries)) return commits;
+
+  for (const entry of entries) {
+    const commit = typeof entry === 'string' ? entry : entry?.commit;
+    if (!commit) continue;
+    const status = typeof entry === 'string' ? 'active' : (entry.status ?? 'active');
+    if (status === 'retired' || entry.active === false) continue;
+    commits.push({
+      commit,
+      source: MUST_PRESERVE_FILE,
+      issue: typeof entry === 'string' ? '' : (entry.issue ?? ''),
+      reason: typeof entry === 'string' ? '' : (entry.reason ?? ''),
+    });
+  }
+  return commits;
+}
+
+function commitIsAncestor(root, commit, descendant = 'HEAD') {
+  if (!isHexCommit(commit)) {
+    return { ok: false, error: `invalid commit marker: ${commit}` };
+  }
+  try {
+    runGit(root, ['merge-base', '--is-ancestor', commit, descendant]);
+    return { ok: true, error: '' };
+  } catch (err) {
+    const exists = tryGit(root, ['rev-parse', '--verify', `${commit}^{commit}`]);
+    if (!exists) {
+      return { ok: false, error: `commit not found locally: ${commit}` };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export function collectServingLineage(root, target, options = {}) {
+  const env = options.env ?? process.env;
+  let deployments = null;
+  let readbackError = '';
+  let readbackSource = 'cloudflare';
+  const failures = [];
+
+  if (options.deployments) {
+    readbackSource = 'fixture';
+    deployments = options.deployments;
+  } else if (options.deploymentsJson) {
+    readbackSource = 'fixture';
+    try {
+      deployments = JSON.parse(options.deploymentsJson);
+    } catch (err) {
+      readbackError = err instanceof Error ? err.message : String(err);
+    }
+  } else {
+    try {
+      const raw = execFileSync(
+        'npx',
+        ['wrangler', 'deployments', 'list', '--name', target.workerName, '--json'],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: options.cloudflareTimeoutMs ?? 30_000,
+        },
+      );
+      deployments = JSON.parse(raw);
+    } catch (err) {
+      readbackError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  const effective = findEffectiveServingCommit(deployments);
+  let mustPreserve = [];
+  try {
+    mustPreserve = readMustPreserveCommits(root, env);
+  } catch (err) {
+    failures.push(`could not read must-preserve ledger: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (readbackError) {
+    failures.push(`could not read Cloudflare deployments for serving lineage: ${readbackError}`);
+  }
+  if (!effective.ok) {
+    failures.push('could not determine serving cf-repo from Cloudflare deployment metadata');
+  }
+
+  let servingContained = false;
+  let servingError = '';
+  if (effective.commit) {
+    const check = commitIsAncestor(root, effective.commit);
+    servingContained = check.ok;
+    servingError = check.error;
+    if (!check.ok) {
+      failures.push(`HEAD does not contain current serving cf-repo (${shortCommit(effective.commit)})`);
+    }
+  }
+
+  const mustPreserveChecks = mustPreserve.map((entry) => {
+    const check = commitIsAncestor(root, entry.commit);
+    if (!check.ok) {
+      const detail = [entry.issue, entry.reason].filter(Boolean).join(' ');
+      failures.push(
+        `HEAD does not contain must-preserve commit ${shortCommit(entry.commit)}` +
+          (detail ? ` (${detail})` : ''),
+      );
+    }
+    return { ...entry, ok: check.ok, error: check.error };
+  });
+
+  return {
+    ok: failures.length === 0,
+    readbackSource,
+    readbackError,
+    effective,
+    servingContained,
+    servingError,
+    mustPreserveChecks,
+    failures,
+  };
+}
+
 export function evaluateBranchPolicy(git, env = process.env) {
   const githubRefName = env.GITHUB_REF_NAME || '';
   const effectiveBranch = git.branch === '(detached HEAD)' && githubRefName ? githubRefName : git.branch;
@@ -164,6 +378,7 @@ export function evaluateDeployGuard(root, options = {}) {
   const branchPolicy = evaluateBranchPolicy(git, env);
   const runContextPolicy = evaluateRunContextPolicy(env);
   const markerChecks = checkRequiredMarkers(root, options.requirements ?? REQUIRED_MARKERS);
+  const servingLineage = collectServingLineage(root, target, options);
   const failures = [];
 
   if (!runContextPolicy.ok) {
@@ -189,6 +404,7 @@ export function evaluateDeployGuard(root, options = {}) {
       failures.push(`missing required marker "${check.marker}" (${check.label})`);
     }
   }
+  failures.push(...servingLineage.failures);
 
   return {
     ok: failures.length === 0,
@@ -197,6 +413,7 @@ export function evaluateDeployGuard(root, options = {}) {
     branchPolicy,
     runContextPolicy,
     markerChecks,
+    servingLineage,
     failures,
   };
 }
@@ -248,6 +465,33 @@ export function renderReport(result) {
       lines.push(`[deploy-guard] OK ${check.label}: ${check.matches.join(', ')}`);
     } else {
       lines.push(`[deploy-guard] BLOCK ${check.label}: marker "${check.marker}" not found`);
+    }
+  }
+  if (result.servingLineage) {
+    const lineage = result.servingLineage;
+    lines.push(
+      `[deploy-guard] serving_lineage_source=${lineage.readbackSource}` +
+        (lineage.effective?.latestDeploymentId ? ` latest=${lineage.effective.latestDeploymentId}` : '') +
+        (lineage.effective?.codeDeploymentId ? ` code=${lineage.effective.codeDeploymentId}` : ''),
+    );
+    if (lineage.effective?.commit) {
+      lines.push(
+        `[deploy-guard] serving_cf_repo=${shortCommit(lineage.effective.commit)}` +
+          ` source=${lineage.effective.source}`,
+      );
+    }
+    if (lineage.effective?.source === 'previous_code_deployment') {
+      lines.push('[deploy-guard] note: latest deployment has no cf-repo; using previous marked code deployment as effective lineage');
+    }
+    if (lineage.servingContained) {
+      lines.push('[deploy-guard] OK HEAD contains current serving cf-repo');
+    }
+    for (const check of lineage.mustPreserveChecks ?? []) {
+      const detail = [check.issue, check.reason].filter(Boolean).join(' ');
+      lines.push(
+        `[deploy-guard] ${check.ok ? 'OK' : 'BLOCK'} must-preserve ${shortCommit(check.commit)}` +
+          (detail ? ` ${detail}` : ''),
+      );
     }
   }
   if (result.ok) {

@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "commits": [
+    {
+      "commit": "656a5eb1c836826458b3b3c6ebf75485a46ff972",
+      "issue": "#226/#233/#264",
+      "reason": "2026-06-02 production hotfix was deployed once and later dropped by a deploy-clobber incident; keep active until merged or explicitly retired with evidence",
+      "status": "active"
+    }
+  ]
+}
