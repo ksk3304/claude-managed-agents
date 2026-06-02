@@ -8,8 +8,8 @@
  *       Python 側 (Issue #184) は Firestore document `cma_agent_cache/
  *       lifelog-cma` に書いているが、CF Worker 環境では Firestore が使えない
  *       ため D1 (Cloudflare の SQLite) を一次層、KV を fallback 層として
- *       採用する (= agent rotate / 新規 user bootstrap でも auto-create +
- *       永続化が成立する)。
+ *       採用する。Issue #254 以降、cache miss / recreate は明示許可なしでは
+ *       createFn を呼ばず、意図しない agent/environment 増殖を fail-fast する。
  *
  * 層の順序:
  *   1. D1 (`agent_cache` table — migrations/0005_agent_cache.sql)
@@ -360,6 +360,10 @@ export interface GetOrCreateResourcesOptions {
   skills?: Array<Record<string, unknown>> | null;
   /** True で cache を bypass し新規作成 (Python `recreate=True` 相当)。 */
   recreate?: boolean;
+  /** cache miss / recreate 時の agent/environment 新規作成を明示許可する。 */
+  allowCreate?: boolean;
+  /** allowCreate 時の監査ログ用理由。 */
+  createReason?: string;
   /** per-user bootstrap 時に row へ user_slug を埋める。default は `'default'`。 */
   userSlug?: string;
   logger?: AgentCacheLogger;
@@ -389,6 +393,7 @@ export async function getOrCreateResources(
   const userSlug = opts.userSlug ?? 'default';
   const logger = opts.logger ?? defaultAgentCacheLogger;
   const recreate = opts.recreate ?? false;
+  const allowCreate = opts.allowCreate ?? false;
 
   const th = await toolsHash(tools);
   const sh = await skillsHash(skills);
@@ -418,7 +423,18 @@ export async function getOrCreateResources(
     }
   }
 
-  // === miss / recreate → 新規作成 ===
+  // === miss / recreate → 明示許可時だけ新規作成 ===
+  if (!allowCreate) {
+    logger.warn('agent_cache_create_blocked', {
+      cache_key: cacheKey,
+      kind: recreate ? 'recreate' : 'cache_miss',
+      user_slug: userSlug,
+      reason: 'missing_explicit_allow',
+    });
+    throw new Error(
+      `agent/environment creation blocked: kind=${recreate ? 'recreate' : 'cache_miss'} cache_key=${cacheKey}`,
+    );
+  }
   const created = await createFn({
     agentName,
     environmentName,
@@ -449,6 +465,7 @@ export async function getOrCreateResources(
     skills_hash: sh,
     user_slug: userSlug,
     written_backends: written,
+    create_reason: opts.createReason ?? '',
   });
 
   return {

@@ -5,7 +5,7 @@
  *
  * テスト 5 ケース (タスク完了条件):
  *   1. cache hit (D1 既存 entry)
- *   2. cache miss → 新規作成 → 両層書込み
+ *   2. allowCreate 付き cache miss → 新規作成 → 両層書込み
  *   3. D1 unavailable → KV fallback で読書きが成立
  *   4. 並行 read (同じ key を 2 回 load してどちらも同 entry を返す)
  *   5. overwrite (既存 entry を recreate=true で上書き)
@@ -285,11 +285,29 @@ describe('case 1: cache hit (D1)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. cache miss → createFn 呼出 → 両層書込み
+// 2. cache miss guard / allowCreate 時だけ createFn 呼出
 // ---------------------------------------------------------------------------
 
 describe('case 2: cache miss → create', () => {
-  it('getOrCreateResources calls createFn once and persists to both D1 and KV', async () => {
+  it('getOrCreateResources blocks cache miss without allowCreate', async () => {
+    const db = makeAgentCacheDb();
+    const kv = makeFakeKv();
+    const env: AgentCacheBindings = { DB: db, MAKOTO_KV: kv };
+
+    let createCalls = 0;
+    const createFn: CreateResourcesFn = async () => {
+      createCalls += 1;
+      return { agent_id: 'agent_should_not_create', environment_id: 'env_should_not_create' };
+    };
+
+    const logger = makeLogger();
+    await expect(getOrCreateResources(env, createFn, { logger }))
+      .rejects.toThrow('creation blocked');
+    expect(createCalls).toBe(0);
+    expect(logger.warns.some(([ev]) => ev === 'agent_cache_create_blocked')).toBe(true);
+  });
+
+  it('getOrCreateResources calls createFn once and persists to both D1 and KV when allowed', async () => {
     const db = makeAgentCacheDb();
     const kv = makeFakeKv();
     const env: AgentCacheBindings = { DB: db, MAKOTO_KV: kv };
@@ -303,7 +321,11 @@ describe('case 2: cache miss → create', () => {
     };
 
     const logger = makeLogger();
-    const res = await getOrCreateResources(env, createFn, { logger });
+    const res = await getOrCreateResources(env, createFn, {
+      logger,
+      allowCreate: true,
+      createReason: 'unit_test',
+    });
     expect(createCalls).toBe(1);
     expect(res.agent_id).toBe('agent_new_xyz');
     expect(res.source).toBe('created');
@@ -376,7 +398,7 @@ describe('case 3: D1 unavailable → KV fallback', () => {
     expect(logger.warns.some(([ev]) => ev === 'agent_cache_load_d1_failed')).toBe(true);
   });
 
-  it('getOrCreateResources still creates + persists to KV alone when D1 is dead', async () => {
+  it('getOrCreateResources still creates + persists to KV alone when D1 is dead and allowed', async () => {
     const db = makeAgentCacheDb({ failOnAll: true });
     const kv = makeFakeKv();
     const env: AgentCacheBindings = { DB: db, MAKOTO_KV: kv };
@@ -388,7 +410,11 @@ describe('case 3: D1 unavailable → KV fallback', () => {
     };
 
     const logger = makeLogger();
-    const res = await getOrCreateResources(env, createFn, { logger });
+    const res = await getOrCreateResources(env, createFn, {
+      logger,
+      allowCreate: true,
+      createReason: 'unit_test',
+    });
     expect(createCalls).toBe(1);
     expect(res.agent_id).toBe('agent_in_kv');
     expect(res.source).toBe('created');
@@ -501,7 +527,40 @@ describe('case 5: overwrite', () => {
     expect(db._rows.size).toBe(1);
   });
 
-  it('getOrCreateResources with recreate=true bypasses cache and overwrites', async () => {
+  it('getOrCreateResources with recreate=true blocks without allowCreate', async () => {
+    const db = makeAgentCacheDb();
+    const kv = makeFakeKv();
+    const env: AgentCacheBindings = { DB: db, MAKOTO_KV: kv };
+
+    const th = await toolsHash([{ type: 'agent_toolset_20260401' }]);
+    const sh = await skillsHash(null);
+    const cacheKey = buildCacheKey({
+      agentName: 'lifelog-cma-default',
+      environmentName: 'lifelog-cma-default',
+      toolsHash: th,
+      skillsHash: sh,
+    });
+    await saveAgentCacheEntry(env, cacheKey, {
+      agent_id: 'agent_old',
+      environment_id: 'env_old',
+      tools_hash: th,
+      skills_hash: sh,
+    });
+
+    let createCalls = 0;
+    const createFn: CreateResourcesFn = async () => {
+      createCalls += 1;
+      return { agent_id: 'agent_should_not_create', environment_id: 'env_should_not_create' };
+    };
+
+    const logger = makeLogger();
+    await expect(getOrCreateResources(env, createFn, { recreate: true, logger }))
+      .rejects.toThrow('creation blocked');
+    expect(createCalls).toBe(0);
+    expect(logger.warns.some(([ev]) => ev === 'agent_cache_create_blocked')).toBe(true);
+  });
+
+  it('getOrCreateResources with recreate=true bypasses cache and overwrites when allowed', async () => {
     const db = makeAgentCacheDb();
     const kv = makeFakeKv();
     const env: AgentCacheBindings = { DB: db, MAKOTO_KV: kv };
@@ -530,6 +589,8 @@ describe('case 5: overwrite', () => {
     const res = await getOrCreateResources(env, createFn, {
       recreate: true,
       logger: makeLogger(),
+      allowCreate: true,
+      createReason: 'unit_test',
     });
     expect(createCalls).toBe(1);
     expect(res.agent_id).toBe('agent_recreated');
