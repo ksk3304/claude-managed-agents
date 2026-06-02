@@ -475,8 +475,12 @@ export async function handleChatEvent(
     );
   }
 
+  const isAutonomousEvent = eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX);
+
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
-  const cgCommand = parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
+  const cgCommand = isAutonomousEvent
+    ? null
+    : parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
   if (cgCommand) {
     const cgText = await handleCostGuardCommand(
       env,
@@ -505,7 +509,7 @@ export async function handleChatEvent(
     );
     return { kind: 'committed' };
   }
-  if (bodyText.startsWith('/')) {
+  if (!isAutonomousEvent && bodyText.startsWith('/')) {
     const slashSkillsData: SkillsData = loadSlashSkillsData(env);
     const slashHandlers: SlashSkillHandlers = {};
     const slashOutcome = await dispatchSlashCommand(bodyText, slashSkillsData, {
@@ -538,15 +542,17 @@ export async function handleChatEvent(
     }
   }
 
-  const naturalScheduleResult = await dispatchNaturalScheduleCommand(
-    env,
-    bodyText,
-    {
-      eventKey,
-      messageId: message.name,
-      threadName,
-    },
-  );
+  const naturalScheduleResult = isAutonomousEvent
+    ? null
+    : await dispatchNaturalScheduleCommand(
+      env,
+      bodyText,
+      {
+        eventKey,
+        messageId: message.name,
+        threadName,
+      },
+    );
   if (naturalScheduleResult !== null) {
     await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
@@ -845,8 +851,10 @@ export async function handleChatEvent(
   //     ここで /mail や /schedule の skill 自体を invoke することはしない
   //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
   //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
-  let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
-  if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
+  let intent = isAutonomousEvent
+    ? null
+    : detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  if (!isAutonomousEvent && intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
     console.log(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
@@ -1264,11 +1272,27 @@ export async function handleChatEvent(
         forceFreshSession,
         timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
           ? MORNING_BRIEF_STREAM_TIMEOUT_MS
-          : undefined,
+          : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
+      if (orchestrated.stopReason === 'custom_tool_timeout') {
+        assistantText =
+          'ファイル作成中にツール実行がタイムアウトしました。作成完了を確認できていないため、担当者がログを確認します。';
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'custom_tool_timeout_visible_notice',
+          level: 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            tool_use_count: orchestrated.toolUseCount,
+            tool_use_names: orchestrated.toolUseNames,
+          },
+        });
+      }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
       // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
@@ -1403,20 +1427,35 @@ export async function handleChatEvent(
         }
       }
     } catch (err) {
-      // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
-      // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
-      // 全体は落とさない (= 上流 retry/skip 経路を優先)。
-      if (placeholderName) {
-        await safeDeletePlaceholder(env, placeholderName, eventKey);
-      }
       if (err instanceof OrchestratorFailure) {
         if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
-          // transient → release & retry
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          await safeRelease(env, eventKey, claim);
-          return { kind: 'release_and_retry', reason: err.reason };
+          const notice = '一時的なエラーです。少し時間を置いて再送してください。';
+          await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            eventType: 'orchestrator_transient_visible_notice',
+            level: 'warn',
+            source: 'chat-event-handler',
+            detail: { reason: err.reason, error: redactPiiInText(err.message).slice(0, 1000) },
+          });
+          await safeCommit(env, eventKey, claim, {
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            reason: err.reason,
+            stage: 'orchestrator',
+            outcome: 'committed',
+            level: 'warn',
+            detail: { visible_notice: true },
+          });
+          return { kind: 'committed' };
+        }
+        if (placeholderName) {
+          await safeDeletePlaceholder(env, placeholderName, eventKey);
         }
         // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
         console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
@@ -1430,6 +1469,9 @@ export async function handleChatEvent(
           detail: { error: err.message },
         });
         return { kind: 'skipped', reason: err.reason };
+      }
+      if (placeholderName) {
+        await safeDeletePlaceholder(env, placeholderName, eventKey);
       }
       // Unknown throw — defensive: release & retry
       console.error(
@@ -2559,6 +2601,16 @@ function mapToPythonCapStopReason(
     default:
       return null;
   }
+}
+
+function parseReactiveStreamTimeoutMs(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n < 10 || n > 600_000) {
+    console.warn(`[chat-event] invalid CMA_REACTIVE_STREAM_TIMEOUT_MS=${raw}; using default`);
+    return undefined;
+  }
+  return n;
 }
 
 /**

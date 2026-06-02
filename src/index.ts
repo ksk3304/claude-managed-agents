@@ -35,6 +35,8 @@ import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report
 import {
   enqueueMorningBriefSeto,
   MORNING_BRIEF_SETO_CRON,
+  MORNING_BRIEF_SETO_EMAIL,
+  MORNING_BRIEF_SETO_SPACE,
 } from "./scheduled/morning-brief";
 import { buildAnthropicClient } from "./lib/session";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
@@ -287,6 +289,7 @@ async function runDailyReportCron(env: Env): Promise<void> {
 }
 
 interface Issue206DebugBody {
+  mode?: "chat_observe" | "morning_brief" | "scheduled_text";
   runId?: string;
   text?: string;
   senderEmail?: string;
@@ -313,7 +316,64 @@ async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Re
   } catch {
     return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 });
   }
+  if (body.mode === "morning_brief") {
+    const result = await enqueueMorningBriefSeto(env);
+    return Response.json({ ok: result.kind !== "failed", mode: body.mode, ...result });
+  }
   const runId = safeDebugId(body.runId || `issue206-${Date.now()}`);
+  if (body.mode === "scheduled_text") {
+    const spaceName = body.spaceName || MORNING_BRIEF_SETO_SPACE;
+    const messageName =
+      body.messageName || `${spaceName}/messages/scheduled_issue217_${runId}`;
+    const senderEmail = body.senderEmail || MORNING_BRIEF_SETO_EMAIL;
+    const eventKey = `scheduled:morning_brief_seto:issue217-smoke:${runId}`;
+    const event: ChatEventPayload = {
+      type: "MESSAGE",
+      eventTime: new Date().toISOString(),
+      space: { name: spaceName, type: "DM", displayName: "Issue 217 smoke" },
+      user: { name: body.senderName || "users/issue217-smoke", email: senderEmail },
+      message: {
+        name: messageName,
+        sender: {
+          name: body.senderName || "users/issue217-smoke",
+          displayName: "Issue 217 Smoke",
+          email: senderEmail,
+        },
+        text: body.text || "Issue 217 scheduled smoke",
+        annotations: [],
+        attachment: [],
+      },
+    };
+    const owner = newClaimOwner("issue217-debug");
+    const claim = await tryClaim(env.DB, eventKey, owner);
+    if (claim.state === "DONE_DUPLICATE" || claim.state === "LEASE_ALIVE") {
+      return Response.json({ ok: true, duplicate: true, mode: body.mode, eventKey, claimState: claim.state });
+    }
+    if (claim.owner === undefined || claim.version === undefined) {
+      return Response.json({ ok: false, mode: body.mode, error: "unexpected claim state" }, { status: 500 });
+    }
+    await recordChatWebhookPayload(env, eventKey, event);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: messageName,
+      eventType: "debug_scheduled_text_enqueued",
+      source: "issue-206-debug-endpoint",
+      detail: { run_id: runId, text_chars: event.message?.text?.length ?? 0 },
+    });
+    const queueMsg: ChatQueueMessage = {
+      eventKey,
+      receivedAtMs: Date.now(),
+      claim: { owner: claim.owner, version: claim.version },
+      payload: event,
+    };
+    try {
+      await env.MAKOTO_CHAT_QUEUE.send(queueMsg);
+    } catch (err) {
+      await releaseClaim(env.DB, eventKey, claim.owner, claim.version);
+      return Response.json({ ok: false, mode: body.mode, eventKey, error: "queue send failed" }, { status: 500 });
+    }
+    return Response.json({ ok: true, mode: body.mode, eventKey, sessionLookup: { spaceName, senderEmail } });
+  }
   const spaceName = body.spaceName || "spaces/issue206-smoke";
   const threadName = body.threadName || `${spaceName}/threads/${runId}`;
   const messageName = body.messageName || `${spaceName}/messages/${runId}`;
