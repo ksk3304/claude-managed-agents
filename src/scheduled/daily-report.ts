@@ -75,13 +75,13 @@ const NEEDLES: Readonly<Record<string, readonly [string, string]>> = {
 /** KV key prefix (= `src/lib/memory-attach.ts` と同じ). */
 const KV_USER_MAPPING_PREFIX = 'user_mapping:';
 
-/** Known stand-mode agent IDs. Compatibility fallback for older KV mapping values. */
-const KNOWN_AGENT_IDS: Readonly<Record<string, string>> = {
+/** Existing employee agent IDs. Compatibility only; never creates agents. */
+const KNOWN_ACTIVE_EMPLOYEE_AGENT_IDS: Readonly<Record<string, string>> = {
   'k.seto@makotoprime.com': 'agent_015g2g4SKACdzaPyQ8QiSi2o',
   'takei@makotoprime.com': 'agent_01Vtoq66KenhBQzR4vnHG33t',
 };
 
-const KNOWN_AGENT_IDS_BY_SLUG: Readonly<Record<string, string>> = {
+const KNOWN_ACTIVE_EMPLOYEE_AGENT_IDS_BY_SLUG: Readonly<Record<string, string>> = {
   'k-seto': 'agent_015g2g4SKACdzaPyQ8QiSi2o',
   takei: 'agent_01Vtoq66KenhBQzR4vnHG33t',
 };
@@ -338,11 +338,16 @@ function agentIdForEntry(email: string, entry: UserMappingValue): string {
   const raw = (entry as { agent_id?: unknown }).agent_id;
   if (typeof raw === 'string' && raw.trim().length > 0) return raw.trim();
   const normalized = email.trim().toLowerCase();
-  return KNOWN_AGENT_IDS[normalized] ?? KNOWN_AGENT_IDS_BY_SLUG[entry.user_slug] ?? '';
+  return (
+    KNOWN_ACTIVE_EMPLOYEE_AGENT_IDS[normalized]
+    ?? KNOWN_ACTIVE_EMPLOYEE_AGENT_IDS_BY_SLUG[entry.user_slug]
+    ?? ''
+  );
 }
 
 /**
  * Python `_summarize_logs` (l.153-175) の TS port.
+ * user mapping の agent_id または既知社員 fallback が無い場合は logs 0 件でも fail-fast する。
  * logs 0 件時は `# {date_label} {route.title}\n\n新着セッションなし。\n` を
  * LLM 呼出なしで返す (byte 等価).
  *
@@ -358,15 +363,15 @@ export async function summarizeLogs(
   agentId: string,
   environmentId: string,
 ): Promise<SummarizeLogsResult> {
+  if (!agentId) {
+    throw new Error('daily-report agent_id missing');
+  }
   if (logs.length === 0) {
     return {
       report: `# ${dateLabel} ${route.title}\n\n新着セッションなし。\n`,
       toolUseCount: 0,
       toolUseNames: [],
     };
-  }
-  if (!agentId) {
-    throw new Error('daily-report agent_id missing');
   }
   const userPrompt = dailyReportPrompt(route, dateLabel, logs);
   let sessionId: string | undefined;
@@ -380,6 +385,11 @@ export async function summarizeLogs(
       sessionId,
       userMessage: userPrompt,
     });
+    if (streamed.toolUseCount > 0) {
+      throw new Error(
+        `daily-report tool use forbidden: count=${streamed.toolUseCount} names=${streamed.toolUseNames.join(',')}`,
+      );
+    }
     // Python: `"".join(chunks).strip() + "\n"` (l.175).
     return {
       report: streamed.assistantText.trim() + '\n',
