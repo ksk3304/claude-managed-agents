@@ -52,6 +52,7 @@ import {
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
   ChatApiError,
+  type ChatMessageResult,
   deleteChatMessage,
   postChatMessage,
   updateChatMessage,
@@ -152,13 +153,16 @@ import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
 import { recordRuntimeEvent, stableHash } from '../lib/observability';
-import { postChatPlaceholder } from '../lib/chat-placeholder';
+import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
+const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
+const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -1193,16 +1197,18 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName =
-    ingressPlaceholderName ||
-    await postChatPlaceholder(env, {
-      spaceName,
-      threadName,
-      eventKey,
-      messageId: message.name,
-      claim,
-      source: 'chat-event-handler',
-    });
+  const postedPlaceholder = ingressPlaceholderName
+    ? null
+    : await postChatPlaceholderResult(env, {
+        spaceName,
+        threadName,
+        eventKey,
+        messageId: message.name,
+        claim,
+        source: 'chat-event-handler',
+      });
+  const placeholderName = ingressPlaceholderName || postedPlaceholder?.name || '';
+  const placeholderThreadName = postedPlaceholder?.threadName ?? null;
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -1609,86 +1615,120 @@ export async function handleChatEvent(
       `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting visible notice`,
     );
   }
-    // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
-    // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
-    // WARN log + safePost に fallback (= bot 全体は落とさない、Python
-    // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
-    // は従来通り新規 POST。
-    //
-    // 3-stage precheck wrap (Python `cma_lib.py:send_chat_reply` 等価)。
-    // 同一 (eventKey, kind='chat_reply', target=`${spaceName}:${threadName}`)
-    // 既送信なら ALREADY → 二重 reply を構造的に防ぐ (life #1266 系再発防止)。
-    const chatReplyOutcome = await executeWithCommit({
-      env,
-      parentEventKey: eventKey,
-      parentOwner: claim.owner,
-      kind: 'chat_reply',
-      target: `${spaceName}:${threadName ?? ''}`,
-      sendFn: async () => {
+  const autonomousLongReply = buildAutonomousLongReplyDelivery(eventKey, chatReplyText);
+  // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
+  // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
+  // WARN log + safePost に fallback (= bot 全体は落とさない、Python
+  // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
+  // は従来通り新規 POST。
+  //
+  // 3-stage precheck wrap (Python `cma_lib.py:send_chat_reply` 等価)。
+  // 同一 (eventKey, kind='chat_reply', target=`${spaceName}:${threadName}`)
+  // 既送信なら ALREADY → 二重 reply を構造的に防ぐ (life #1266 系再発防止)。
+  const chatReplyOutcome = await executeWithCommit({
+    env,
+    parentEventKey: eventKey,
+    parentOwner: claim.owner,
+    kind: 'chat_reply',
+    target: `${spaceName}:${threadName ?? ''}`,
+    sendFn: async () => {
+      if (autonomousLongReply) {
+        let replyThreadName = threadName || placeholderThreadName;
         if (placeholderName) {
-          await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
+          await safeUpdateOrPost(
+            env,
+            placeholderName,
+            spaceName,
+            autonomousLongReply.title,
+            replyThreadName,
+            eventKey,
+          );
         } else {
-          await safePost(env, spaceName, chatReplyText, threadName, eventKey);
+          const titlePost = await safePost(
+            env,
+            spaceName,
+            autonomousLongReply.title,
+            threadName,
+            eventKey,
+          );
+          replyThreadName = replyThreadName || titlePost?.threadName || null;
         }
-        // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
-        return undefined as unknown as void;
-      },
-      options: parentHeartbeat ? { heartbeat: parentHeartbeat } : {},
+        await safePost(
+          env,
+          spaceName,
+          autonomousLongReply.body,
+          replyThreadName,
+          eventKey,
+        );
+      } else if (placeholderName) {
+        await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
+      } else {
+        await safePost(env, spaceName, chatReplyText, threadName, eventKey);
+      }
+      // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
+      return undefined as unknown as void;
+    },
+    options: parentHeartbeat ? { heartbeat: parentHeartbeat } : {},
+  });
+  if (chatReplyOutcome.outcome === 'already') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      source: 'chat-event-handler',
+      detail: { outcome: 'already' },
     });
-    if (chatReplyOutcome.outcome === 'already') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        source: 'chat-event-handler',
-        detail: { outcome: 'already' },
-      });
-      console.log(
-        `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
-      );
-    } else if (chatReplyOutcome.outcome === 'lease_alive') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { outcome: 'lease_alive' },
-      });
-      console.warn(
-        `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
-      );
-      await safeRelease(env, eventKey, claim);
-      return { kind: 'release_and_retry', reason: 'chat_reply_lease_alive' };
-    } else if (chatReplyOutcome.outcome === 'lease_lost') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { outcome: 'lease_lost' },
-      });
-      console.warn(
-        `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
-      );
-    } else if (chatReplyOutcome.outcome === 'sent') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        source: 'chat-event-handler',
-        detail: {
-          outcome: 'sent',
-          mode: placeholderName ? 'patch_or_post_fallback' : 'post',
-          final_text_chars: chatReplyText.length,
-        },
-      });
-    }
+    console.log(
+      `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
+    );
+  } else if (chatReplyOutcome.outcome === 'lease_alive') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { outcome: 'lease_alive' },
+    });
+    console.warn(
+      `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
+    );
+    await safeRelease(env, eventKey, claim);
+    return { kind: 'release_and_retry', reason: 'chat_reply_lease_alive' };
+  } else if (chatReplyOutcome.outcome === 'lease_lost') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { outcome: 'lease_lost' },
+    });
+    console.warn(
+      `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
+    );
+  } else if (chatReplyOutcome.outcome === 'sent') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      source: 'chat-event-handler',
+      detail: {
+        outcome: 'sent',
+        mode: autonomousLongReply
+          ? 'autonomous_long_reply_split'
+          : placeholderName
+            ? 'patch_or_post_fallback'
+            : 'post',
+        final_text_chars: chatReplyText.length,
+        autonomous_split: Boolean(autonomousLongReply),
+      },
+    });
+  }
 
   // ---- 8. session-log memory append ----
   await safeAppendSessionLog(env, {
@@ -2537,6 +2577,61 @@ export function buildIntentPrefix(intent: ActionSkillIntent | null): string {
   return '';
 }
 
+interface AutonomousLongReplyDelivery {
+  title: string;
+  body: string;
+}
+
+function buildAutonomousLongReplyDelivery(
+  eventKey: string,
+  text: string,
+): AutonomousLongReplyDelivery | null {
+  const body = (text || '').trim();
+  if (!eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX)) return null;
+  if (Array.from(body).length < AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS) return null;
+  const title = buildAutonomousReplyTitle(body, eventKey);
+  return { title, body };
+}
+
+function buildAutonomousReplyTitle(text: string, eventKey: string): string {
+  const firstLine =
+    text
+      .split(/\r?\n/)
+      .map((line) => normalizeAutonomousTitleLine(line))
+      .find((line) => line.length > 0) || defaultAutonomousReplyTitle(eventKey);
+  const maxBodyChars = Math.max(
+    8,
+    AUTONOMOUS_REPLY_TITLE_MAX_CHARS - defaultAutonomousReplyPrefix(eventKey).length,
+  );
+  return `${defaultAutonomousReplyPrefix(eventKey)}${truncateDisplayChars(firstLine, maxBodyChars)}`;
+}
+
+function normalizeAutonomousTitleLine(line: string): string {
+  return line
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^[-*]\s*/, '')
+    .replace(/^===.*===$/, '')
+    .trim();
+}
+
+function defaultAutonomousReplyPrefix(eventKey: string): string {
+  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+    ? '朝ブリーフ: '
+    : '定期実行: ';
+}
+
+function defaultAutonomousReplyTitle(eventKey: string): string {
+  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+    ? '朝ブリーフをまとめました'
+    : '結果をまとめました';
+}
+
+function truncateDisplayChars(text: string, maxChars: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`;
+}
+
 // ---------------------------------------------------------------------------
 // helper: safe wrappers (never throw)
 // ---------------------------------------------------------------------------
@@ -2547,19 +2642,19 @@ async function safePost(
   text: string,
   threadName: string | null,
   eventKey: string,
-): Promise<void> {
+): Promise<ChatMessageResult | null> {
   const saKey = env.CHAT_SA_KEY_JSON;
   if (!saKey) {
     console.warn(
       `[chat-event] safePost skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
     );
-    return;
+    return null;
   }
   if (!spaceName || !text) {
     console.warn(
       `[chat-event] safePost skipped eventKey=${eventKey} empty space or text`,
     );
-    return;
+    return null;
   }
   try {
     // Python `_reply_to_chat:l.1247-1249` と等価: thread 指定時は
@@ -2567,7 +2662,7 @@ async function safePost(
     // 付ける。これがないと Chat REST API のデフォルト動作で「新規 thread
     // として post」される (= 2026-05-26 reactive bot 実機検証で表示崩れ
     // 確認、Python と等価合わせ)。
-    await postChatMessage(
+    const result = await postChatMessage(
       { saKeyJson: saKey },
       spaceName,
       text,
@@ -2584,6 +2679,7 @@ async function safePost(
       operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
       enabledEnv: env.COST_GUARD_ENABLED,
     });
+    return result;
   } catch (err) {
     const reason =
       err instanceof ChatApiError
@@ -2594,6 +2690,7 @@ async function safePost(
     console.warn(
       `[chat-event] safePost fail eventKey=${eventKey} space=${spaceName}: ${reason}`,
     );
+    return null;
   }
 }
 

@@ -93,7 +93,14 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
     ) => {
       if (chatApiMock.postThrow) throw chatApiMock.postThrow;
       chatApiMock.posts.push({ spaceName, text, opts });
-      return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}` };
+      const threadName =
+        typeof opts === 'object' &&
+        opts !== null &&
+        'threadName' in opts &&
+        typeof (opts as { threadName?: unknown }).threadName === 'string'
+          ? (opts as { threadName: string }).threadName
+          : `${spaceName}/threads/t_${chatApiMock.posts.length}`;
+      return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}`, threadName };
     },
     updateChatMessage: async (
       _deps: unknown,
@@ -2726,6 +2733,45 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('通常完了テキスト');
     expect(chatApiMock.patches[0]!.text).not.toContain('RECOVERY_ERRONEOUSLY_RAN');
+  });
+
+  it('autonomous scheduled long reply: first message is short title and full body is thread reply', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-06-02:test';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '直近3日分の朝ブリーフです\n' +
+      Array.from({ length: 24 }, (_, i) => `- 重要項目${i + 1}: 対応内容を整理しました。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_split',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: `===BRIEF_FINAL===\n${longBody}` }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(chatApiMock.posts).toHaveLength(2);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toBe('朝ブリーフ: 直近3日分の朝ブリーフです');
+    expect(chatApiMock.patches[0]!.text.length).toBeLessThan(40);
+
+    expect(chatApiMock.posts[1]!.text).toBe(longBody);
+    expect((chatApiMock.posts[1]!.opts as { threadName?: string }).threadName).toBe(
+      'spaces/AAA/threads/t_1',
+    );
   });
 
   it('morning brief: final reply lease_alive は parent を commit せず retry に戻す', async () => {
