@@ -1829,7 +1829,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
-  it('Case 12: LLM stream throw → release_and_retry', async () => {
+  it('Case 12: LLM stream throw → visible notice + commit', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1842,21 +1842,20 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('release_and_retry');
-    if (result.kind === 'release_and_retry') {
-      expect(result.reason).toBe('stream_failed');
-    }
-    // claim was released (= lease_expires_at_ms = 0)
+    expect(result.kind).toBe('committed');
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
-    expect(Number(row?.lease_expires_at_ms)).toBe(0);
-    // placeholder POST は走った (= ack 表示) が、stream throw 後に DELETE で
-    // 残骸 cleanup される (Python `_delete_chat_message` 等価)。
+    expect(row?.committed_at_ms).toBeTruthy();
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
-    expect(chatApiMock.deletes).toHaveLength(1);
-    expect(chatApiMock.patches).toHaveLength(0); // 最終 reply は無い
+    expect(chatApiMock.deletes).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('一時的なエラー');
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
+    })._tables.cma_worker_runtime_events;
+    expect(runtimeEvents.map((row) => row.event_type)).toContain('orchestrator_transient_visible_notice');
   });
 
   it('Case 13: session-log attachment 不在 → skip + event committed', async () => {
@@ -2527,7 +2526,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
-  it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
+  it('sessions.create throw → visible notice without deleting placeholder', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -2542,17 +2541,17 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('release_and_retry');
-    if (result.kind === 'release_and_retry') {
-      expect(result.reason).toBe('sessions_create_failed');
-    }
-    // placeholder POST 1 件 + DELETE 1 件 (= 残骸 cleanup)
+    expect(result.kind).toBe('committed');
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
-    expect(chatApiMock.deletes).toHaveLength(1);
-    expect(chatApiMock.deletes[0]).toBe('spaces/AAA/messages/m_1');
-    // PATCH は呼ばれない (= 最終応答は無い)
-    expect(chatApiMock.patches).toHaveLength(0);
+    expect(chatApiMock.deletes).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toContain('一時的なエラー');
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const row = dedupe.get(msg.eventKey);
+    expect(row?.committed_at_ms).toBeTruthy();
   });
 
   it('placeholder PATCH 失敗: WARN log + safePost (新規 POST) に fallback、bot 全体は落とさない', async () => {

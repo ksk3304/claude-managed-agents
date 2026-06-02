@@ -1419,20 +1419,36 @@ export async function handleChatEvent(
         }
       }
     } catch (err) {
-      // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
-      // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
-      // 全体は落とさない (= 上流 retry/skip 経路を優先)。
-      if (placeholderName) {
-        await safeDeletePlaceholder(env, placeholderName, eventKey);
-      }
       if (err instanceof OrchestratorFailure) {
         if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
-          // transient → release & retry
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          await safeRelease(env, eventKey, claim);
-          return { kind: 'release_and_retry', reason: err.reason };
+          const notice =
+            '処理開始中に一時的なエラーが発生しました。削除表示を避けるため、このメッセージを残しています。少し時間を置いて再実行してください。';
+          await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            eventType: 'orchestrator_transient_visible_notice',
+            level: 'warn',
+            source: 'chat-event-handler',
+            detail: { reason: err.reason },
+          });
+          await safeCommit(env, eventKey, claim, {
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            reason: err.reason,
+            stage: 'orchestrator',
+            outcome: 'committed',
+            level: 'warn',
+            detail: { visible_notice: true },
+          });
+          return { kind: 'committed' };
+        }
+        if (placeholderName) {
+          await safeDeletePlaceholder(env, placeholderName, eventKey);
         }
         // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
         console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
@@ -1446,6 +1462,9 @@ export async function handleChatEvent(
           detail: { error: err.message },
         });
         return { kind: 'skipped', reason: err.reason };
+      }
+      if (placeholderName) {
+        await safeDeletePlaceholder(env, placeholderName, eventKey);
       }
       // Unknown throw — defensive: release & retry
       console.error(
