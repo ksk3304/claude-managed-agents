@@ -2833,6 +2833,37 @@ describe('handleChatEvent', () => {
     );
   });
 
+  it('reactive long reply: human-triggered long body stays in the first message', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '通常返信の長文です\n' +
+      Array.from({ length: 24 }, (_, i) => `- 項目${i + 1}: 人間が依頼した通常返信です。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_reactive_long_reply',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: longBody }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toBe(longBody);
+  });
+
   it('morning brief: final reply lease_alive は parent を commit せず retry に戻す', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
