@@ -232,6 +232,19 @@ describe('routeStorePairs', () => {
     ]);
   });
 
+  it('uses known active employee agent fallback for legacy mappings', () => {
+    const legacySeto: UserMappingValue = {
+      ...aliceMapping,
+      user_slug: 'k-seto',
+      agent_id: '',
+    };
+    const mapping = new Map<string, UserMappingValue>([
+      ['k.seto@makotoprime.com', legacySeto],
+    ]);
+    const pairs = routeStorePairs(mapping, REPORT_ROUTES[0]);
+    expect(pairs[0]?.agentId).toBe('agent_015g2g4SKACdzaPyQ8QiSi2o');
+  });
+
   it('throws when no user-scoped DM pair is found', () => {
     const mapping = new Map<string, UserMappingValue>([
       [
@@ -526,7 +539,7 @@ describe('generateDailyReports', () => {
     expect(written?.content).toBe('# 2026-05-25 日報\n\n## 主な話題\n- 進捗共有\n');
   });
 
-  it('reports managed session id and observed tool use in route result', async () => {
+  it('forbids managed session tool use and does not write that route', async () => {
     const kv = makeKv();
     await seedMapping(kv);
     const mock = makeMockClient(
@@ -547,8 +560,34 @@ describe('generateDailyReports', () => {
     });
 
     expect(result['dm:alice'].session_id).toMatch(/^ses_/);
-    expect(result['dm:alice'].tool_use_count).toBe(1);
-    expect(result['dm:alice'].tool_use_names).toEqual(['bash']);
+    expect(result['dm:alice'].error).toMatch(/tool use forbidden/);
+    expect(result['dm:alice'].tool_use_count).toBe(0);
+    expect(mock.stores.get(DM_REPORT_ALICE)?.get('/2026-05-25.md')).toBeUndefined();
+  });
+
+  it('requires explicit or known mapping agent_id even when logs are empty', async () => {
+    const kv = makeKv();
+    const noAgent: UserMappingValue = {
+      ...aliceMapping,
+      agent_id: '',
+    };
+    await kv.put('user_mapping:alice@example.com', JSON.stringify(noAgent));
+    const mock = makeMockClient({});
+
+    const result = await generateDailyReports({
+      kv,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: mock.client as any,
+      dateLabel: '2026-05-25',
+      model: 'claude-haiku-4-5',
+      environmentId: 'env_test',
+      dryRun: false,
+    });
+
+    expect(result['dm:alice'].error).toMatch(/daily-report agent_id missing/);
+    expect(result['shared'].error).toMatch(/daily-report agent_id missing/);
+    expect(mock.calls.sessions).toBe(0);
+    expect(mock.calls.create).toBe(0);
   });
 
   it('updates an existing /<date>.md memory in-place', async () => {
