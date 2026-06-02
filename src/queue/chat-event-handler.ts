@@ -475,8 +475,12 @@ export async function handleChatEvent(
     );
   }
 
+  const isAutonomousEvent = eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX);
+
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
-  const cgCommand = parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
+  const cgCommand = isAutonomousEvent
+    ? null
+    : parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
   if (cgCommand) {
     const cgText = await handleCostGuardCommand(
       env,
@@ -505,7 +509,7 @@ export async function handleChatEvent(
     );
     return { kind: 'committed' };
   }
-  if (bodyText.startsWith('/')) {
+  if (!isAutonomousEvent && bodyText.startsWith('/')) {
     const slashSkillsData: SkillsData = loadSlashSkillsData(env);
     const slashHandlers: SlashSkillHandlers = {};
     const slashOutcome = await dispatchSlashCommand(bodyText, slashSkillsData, {
@@ -538,15 +542,17 @@ export async function handleChatEvent(
     }
   }
 
-  const naturalScheduleResult = await dispatchNaturalScheduleCommand(
-    env,
-    bodyText,
-    {
-      eventKey,
-      messageId: message.name,
-      threadName,
-    },
-  );
+  const naturalScheduleResult = isAutonomousEvent
+    ? null
+    : await dispatchNaturalScheduleCommand(
+      env,
+      bodyText,
+      {
+        eventKey,
+        messageId: message.name,
+        threadName,
+      },
+    );
   if (naturalScheduleResult !== null) {
     await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
@@ -845,8 +851,10 @@ export async function handleChatEvent(
   //     ここで /mail や /schedule の skill 自体を invoke することはしない
   //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
   //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
-  let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
-  if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
+  let intent = isAutonomousEvent
+    ? null
+    : detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  if (!isAutonomousEvent && intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
     console.log(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,

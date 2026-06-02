@@ -2833,6 +2833,40 @@ describe('handleChatEvent', () => {
     );
   });
 
+  it('autonomous scheduled prompt bypasses reactive schedule-command short circuit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'スケジュール一覧も確認して、瀬戸さん向けの朝ブリーフを長文でまとめてください。',
+    });
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-06-02:schedule-word';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '朝ブリーフです\n' +
+      Array.from({ length: 24 }, (_, i) => `- 確認項目${i + 1}: スケジュール語を含む自律起動です。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_schedule_word',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: `===BRIEF_FINAL===\n${longBody}` }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(schedulerMock.capturedCalls).toHaveLength(0);
+    expect(runtimeEvents(env).some((row) => row.event_type === 'natural_schedule_command_result')).toBe(false);
+    expect(chatApiMock.patches[0]!.text).toBe('朝ブリーフ: 朝ブリーフです');
+    expect(chatApiMock.posts[1]!.text).toBe(longBody);
+  });
+
   it('reactive long reply: human-triggered long body stays in the first message', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
