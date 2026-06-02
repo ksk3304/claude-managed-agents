@@ -1556,6 +1556,38 @@ describe('handleChatEvent', () => {
     );
   });
 
+  it('Case 9d: tool inventory may say action markers are executed bot-side', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_9d',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '*▼ 使えるツール*\n\n' +
+            '*アクションマーカー（bot 側が実行）*\n' +
+            '- `EMAIL_SEND`: AgentMail 送信\n' +
+            '- `CHAT_POST`: 別スペース投稿\n' +
+            '- `SCHEDULE_ACTION`: Cloud Scheduler ジョブ管理',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('アクションマーカー');
+    expect(chatApiMock.patches[0]!.text).toContain('EMAIL_SEND');
+    expect(chatApiMock.patches[0]!.text).not.toContain(
+      '送信処理の状態を確認できませんでした',
+    );
+  });
+
   it('Case 10: 既存 session 解決 (KV hit) → sessions.create skip', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({

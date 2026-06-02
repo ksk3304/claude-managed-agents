@@ -2027,8 +2027,16 @@ function scrubActionMarkerLeakForChat(
   const normalized = text.toLowerCase();
   const rawMarkerSyntax =
     /\b(email_send|chat_post|schedule_action)\s*:/i.test(text);
+  const processingStateTalk =
+    text.includes('処理中') ||
+    text.includes('処理しています') ||
+    text.includes('すでに') ||
+    text.includes('既に') ||
+    text.includes('前のメッセージ') ||
+    text.includes('already');
   const botProcessingMarkerTalk =
     (text.includes('bot 側') || text.includes('bot側')) &&
+    processingStateTalk &&
     (normalized.includes('email_send') ||
       normalized.includes('chat_post') ||
       normalized.includes('schedule_action') ||
