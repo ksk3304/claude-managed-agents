@@ -190,8 +190,6 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
-  /** Called after resolving/creating the session id, before stream/tool dispatch. */
-  onSessionIdResolved?: (sessionId: string) => void;
   /** Session watchdog override (test / incident-debug 用)。 */
   sessionWatchdogSec?: number;
   /**
@@ -551,8 +549,6 @@ export async function orchestrateChatTurn(
         `memory_stores=${resources.length}/${routedMemory.max_stores}`,
     );
   }
-
-  input.onSessionIdResolved?.(sessionId);
 
   if (input.eventKey) {
     await recordSessionBind(input.env, {
