@@ -153,8 +153,8 @@ import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
-const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
-const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const CHAT_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
+const CHAT_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
@@ -584,6 +584,19 @@ export async function handleChatEvent(
   let parentHeartbeat: LeaseHeartbeat | null = null;
 
   try {
+    parentHeartbeat = await startParentLeaseHeartbeat(env, ctx, {
+      eventKey,
+      messageId: message.name,
+      owner: claim.owner,
+      version: claim.version,
+      eventType: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+        ? 'morning_brief_parent_lease_heartbeat_started'
+        : 'chat_parent_lease_heartbeat_started',
+    });
+    if (!parentHeartbeat) {
+      return { kind: 'skipped', reason: 'lost_claim' };
+    }
+
     const pdfApprovalDecision = parsePdfPreflightApprovalDecision(bodyText);
     const pendingPdfPreflight = threadSessionKey
       ? await readPendingPdfPreflightApproval(env.MAKOTO_KV, threadSessionKey)
@@ -1071,39 +1084,12 @@ export async function handleChatEvent(
   const extraContentBlocks = attachmentBlocks.extraBlocks;
 
   if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) {
-    parentHeartbeat = new LeaseHeartbeat({
-      env,
-      eventKey,
-      owner: claim.owner,
-      version: claim.version,
-      leaseTtlMs: MORNING_BRIEF_EVENT_LEASE_TTL_MS,
-      intervalMs: MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS,
-    });
-    const renewed = await parentHeartbeat.tick();
-    if (!renewed) {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        messageId: message.name,
-        eventType: 'morning_brief_parent_lease_renew_failed',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { reason: parentHeartbeat.lostBecause() ?? 'renew_failed' },
-      });
-      return { kind: 'skipped', reason: 'lost_claim' };
-    }
-    parentHeartbeat.start();
-    if (typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(parentHeartbeat.completionPromise);
-    }
     await recordRuntimeEvent(env, {
       eventKey,
       messageId: message.name,
-      eventType: 'morning_brief_parent_lease_heartbeat_started',
+      eventType: 'morning_brief_long_turn_mode',
       source: 'chat-event-handler',
-      detail: {
-        lease_ttl_ms: MORNING_BRIEF_EVENT_LEASE_TTL_MS,
-        interval_ms: MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS,
-      },
+      detail: { stream_timeout_ms: MORNING_BRIEF_STREAM_TIMEOUT_MS },
     });
   }
 
@@ -2578,6 +2564,55 @@ function parseReactiveStreamTimeoutMs(raw: string | undefined): number | undefin
     return undefined;
   }
   return n;
+}
+
+async function startParentLeaseHeartbeat(
+  env: Env,
+  ctx: ExecutionContext,
+  input: {
+    eventKey: string;
+    messageId: string;
+    owner: string;
+    version: number;
+    eventType: string;
+  },
+): Promise<LeaseHeartbeat | null> {
+  const heartbeat = new LeaseHeartbeat({
+    env,
+    eventKey: input.eventKey,
+    owner: input.owner,
+    version: input.version,
+    leaseTtlMs: CHAT_EVENT_LEASE_TTL_MS,
+    intervalMs: CHAT_EVENT_HEARTBEAT_INTERVAL_MS,
+  });
+  const renewed = await heartbeat.tick();
+  if (!renewed) {
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      eventType: 'chat_parent_lease_renew_failed',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { reason: heartbeat.lostBecause() ?? 'renew_failed' },
+    });
+    await heartbeat.stop();
+    return null;
+  }
+  heartbeat.start();
+  if (typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(heartbeat.completionPromise);
+  }
+  await recordRuntimeEvent(env, {
+    eventKey: input.eventKey,
+    messageId: input.messageId,
+    eventType: input.eventType,
+    source: 'chat-event-handler',
+    detail: {
+      lease_ttl_ms: CHAT_EVENT_LEASE_TTL_MS,
+      interval_ms: CHAT_EVENT_HEARTBEAT_INTERVAL_MS,
+    },
+  });
+  return heartbeat;
 }
 
 /**
