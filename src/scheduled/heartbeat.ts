@@ -378,7 +378,13 @@ async function inspectMailReplyWait(
     includeBlocked: true,
     includeUnauthenticated: true,
   });
-  const matches = matchExpectedReplies(expected, listed.messages, ref.subject_contains);
+  const matches = await matchExpectedReplies(
+    client,
+    inboxId,
+    expected,
+    listed.messages,
+    ref.subject_contains,
+  );
   const matchedSet = new Set(matches.map((match) => match.expected));
   const missing = expected.filter((email) => !matchedSet.has(email));
   return {
@@ -403,11 +409,13 @@ function parseMailReplyWaitRef(raw: string | null | undefined): MailReplyWaitRef
   }
 }
 
-function matchExpectedReplies(
+async function matchExpectedReplies(
+  client: AgentMailClient,
+  inboxId: string,
   expected: string[],
   messages: AgentMailMessage[],
   subjectContains: string | undefined,
-): MailReplyMatch[] {
+): Promise<MailReplyMatch[]> {
   const matches = new Map<string, MailReplyMatch>();
   const subjectNeedle = (subjectContains ?? '').trim().toLowerCase();
   for (const message of messages) {
@@ -417,15 +425,37 @@ function matchExpectedReplies(
     if (!expectedEmail || matches.has(expectedEmail)) continue;
     const subject = String(message.subject ?? '');
     if (subjectNeedle && !subject.toLowerCase().includes(subjectNeedle)) continue;
+    const body =
+      agentMailMessageBody(message) ||
+      (await hydrateAgentMailMessageBody(client, inboxId, message));
     matches.set(expectedEmail, {
       expected: expectedEmail,
       from,
       subject,
-      body: String(message.extracted_text ?? message.text ?? '').trim().slice(0, 2000),
+      body,
       received_at: String(message.received_at ?? ''),
     });
   }
   return [...matches.values()];
+}
+
+function agentMailMessageBody(message: AgentMailMessage): string {
+  return String(message.extracted_text ?? message.text ?? '').trim().slice(0, 2000);
+}
+
+async function hydrateAgentMailMessageBody(
+  client: AgentMailClient,
+  inboxId: string,
+  message: AgentMailMessage,
+): Promise<string> {
+  const messageId = String(message.id ?? message.message_id ?? '').trim();
+  if (!messageId) return '';
+  try {
+    const detail = await client.getMessage(inboxId, messageId);
+    return agentMailMessageBody(detail);
+  } catch {
+    return '';
+  }
 }
 
 function buildAsyncWaitResumePrompt(task: HeartbeatTaskRow, state: MailReplyWaitState): string {
