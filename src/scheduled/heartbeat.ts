@@ -50,6 +50,7 @@ export interface HeartbeatEnqueueResult {
     | 'failed'
     | 'unsupported_target'
     | 'missing_target_space'
+    | 'missing_target_thread'
     | 'not_ready';
   eventKey: string;
 }
@@ -95,7 +96,8 @@ export async function processAsyncWaitTask(
   nowMs: number = Date.now(),
 ): Promise<HeartbeatEnqueueResult> {
   const eventKey = heartbeatEventKey(task.task_id, nowMs);
-  if (task.target_scope !== 'dm') return { kind: 'unsupported_target', eventKey };
+  const targetCheck = validateHeartbeatTarget(task);
+  if (targetCheck) return { kind: targetCheck, eventKey };
   if (!task.target_space_name) return { kind: 'missing_target_space', eventKey };
   if ((task.waiting_for ?? '').trim() !== 'mail_reply') {
     await markAsyncWaitNotReady(env.DB, task, nowMs, 'unsupported waiting_for');
@@ -136,12 +138,8 @@ export async function enqueueHeartbeatTask(
   nowMs: number = Date.now(),
 ): Promise<HeartbeatEnqueueResult> {
   const eventKey = heartbeatEventKey(task.task_id, nowMs);
-  if (task.target_scope !== 'dm') {
-    return { kind: 'unsupported_target', eventKey };
-  }
-  if (!task.target_space_name) {
-    return { kind: 'missing_target_space', eventKey };
-  }
+  const targetCheck = validateHeartbeatTarget(task);
+  if (targetCheck) return { kind: targetCheck, eventKey };
 
   const owner = newClaimOwner(`cron-heartbeat-${task.task_id}`);
   const claim = await tryClaim(env.DB, eventKey, owner, { now: nowMs });
@@ -194,19 +192,23 @@ export async function enqueueHeartbeatTask(
 }
 
 export function buildHeartbeatChatEvent(
-  task: Pick<HeartbeatTaskRow, 'task_id' | 'owner_user_id' | 'target_space_name' | 'prompt'>,
+  task: Pick<HeartbeatTaskRow, 'task_id' | 'owner_user_id' | 'target_space_name' | 'prompt'> &
+    Partial<Pick<HeartbeatTaskRow, 'target_scope' | 'thread_ref'>>,
   nowMs: number,
   eventKey: string,
 ): ChatEventPayload {
   const targetSpace = task.target_space_name ?? '';
   const messageName = `${targetSpace}/messages/${safeMessageId(eventKey)}`;
+  const targetScope = task.target_scope ?? 'dm';
+  const ref = parseMailReplyWaitRef(task.thread_ref);
+  const threadName = targetScope === 'shared' ? ref.target_thread_name : undefined;
   return {
     type: 'MESSAGE',
     eventTime: new Date(nowMs).toISOString(),
     space: {
       name: targetSpace,
-      type: 'DM',
-      displayName: `${task.owner_user_id} DM`,
+      type: targetScope === 'shared' ? 'ROOM' : 'DM',
+      displayName: targetScope === 'shared' ? `${task.owner_user_id} shared thread` : `${task.owner_user_id} DM`,
     },
     user: {
       name: `users/scheduled-heartbeat-${safeMessageId(task.task_id)}`,
@@ -221,10 +223,25 @@ export function buildHeartbeatChatEvent(
         email: task.owner_user_id,
       },
       text: `${todayPrefix(nowMs)}${heartbeatPrompt(task.prompt)}`,
+      ...(threadName ? { thread: { name: threadName } } : {}),
       annotations: [],
       attachment: [],
     },
   };
+}
+
+function validateHeartbeatTarget(task: HeartbeatTaskRow): HeartbeatEnqueueResult['kind'] | null {
+  if (task.target_scope !== 'dm' && task.target_scope !== 'shared') {
+    return 'unsupported_target';
+  }
+  if (!task.target_space_name) {
+    return 'missing_target_space';
+  }
+  if (task.target_scope === 'shared') {
+    const ref = parseMailReplyWaitRef(task.thread_ref);
+    if (!ref.target_thread_name) return 'missing_target_thread';
+  }
+  return null;
 }
 
 export function isHeartbeatEnabled(env: Pick<Env, 'HEARTBEAT_ENABLED'>): boolean {
@@ -327,6 +344,7 @@ interface MailReplyWaitRef {
   expected_from?: string[];
   since_ms?: number;
   subject_contains?: string;
+  target_thread_name?: string;
 }
 
 interface MailReplyMatch {

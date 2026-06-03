@@ -303,7 +303,8 @@ export async function handleChatEvent(
   // substring false hit 解消)。
   const botUserName = (env.GCHAT_BOT_USER_NAME ?? '').trim();
   const isDm = isDmSpace(spaceType);
-  const isForBot = isDm || isMentioningBot(annotations, botUserName);
+  const isAutonomousEvent = eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX);
+  const isForBot = isDm || isAutonomousEvent || isMentioningBot(annotations, botUserName);
   if (!isForBot) {
     console.log(
       `[chat-event] skip non-mention eventKey=${eventKey} space=${spaceName} type=${spaceType}`,
@@ -479,8 +480,6 @@ export async function handleChatEvent(
         `space_type=${spaceType} count=${userMapping.filtered_personal_store_count}`,
     );
   }
-
-  const isAutonomousEvent = eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX);
 
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
   const cgCommand = isAutonomousEvent
@@ -1538,17 +1537,18 @@ export async function handleChatEvent(
     { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
   const asyncWaitRegistration = heartbeatEvent
-    ? { text: '' }
-    : await maybeRegisterMailReplyAsyncWait(env, {
-        eventKey,
-        messageId: message.name,
-        userSlug: userMapping.user_slug,
-        senderEmail,
-        spaceName,
-        spaceType,
-        bodyText,
-        emailDispatchSummaries,
-      });
+      ? { text: '' }
+      : await maybeRegisterMailReplyAsyncWait(env, {
+          eventKey,
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          senderEmail,
+          spaceName,
+          spaceType,
+          threadName,
+          bodyText,
+          emailDispatchSummaries,
+        });
 
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
   //     しつつ posting する。`parseChatPostMarker` は first-match のみ返す
@@ -2169,6 +2169,7 @@ interface MailReplyAsyncWaitInput {
   senderEmail: string;
   spaceName: string;
   spaceType: string;
+  threadName: string | null;
   bodyText: string;
   emailDispatchSummaries: EmailDispatchSummary[];
 }
@@ -2181,7 +2182,13 @@ async function maybeRegisterMailReplyAsyncWait(
   if (sent.length === 0) return { text: '' };
   if (!isMailReplyWaitRequest(input.bodyText)) return { text: '' };
 
-  const target = await resolveAsyncWaitTargetSpace(env.MAKOTO_KV, input.senderEmail, input.spaceName, input.spaceType);
+  const target = await resolveAsyncWaitTargetSpace(
+    env.MAKOTO_KV,
+    input.senderEmail,
+    input.spaceName,
+    input.spaceType,
+    input.threadName,
+  );
   if (!target.spaceName) {
     await recordRuntimeEvent(env, {
       eventKey: input.eventKey,
@@ -2210,8 +2217,9 @@ async function maybeRegisterMailReplyAsyncWait(
     expected_from: expectedFrom,
     since_ms: nowMs - 60_000,
     ...(subjectContains ? { subject_contains: subjectContains } : {}),
+    ...(target.threadName ? { target_thread_name: target.threadName } : {}),
   };
-  const prompt = buildMailReplyAsyncWaitPrompt(input.bodyText, sent);
+  const prompt = buildMailReplyAsyncWaitPrompt(input.bodyText, sent, target.route);
   try {
     await env.DB.prepare(
       `INSERT OR REPLACE INTO heartbeat_tasks
@@ -2221,7 +2229,7 @@ async function maybeRegisterMailReplyAsyncWait(
          thread_ref, user_visible_status, created_at, updated_at)
        VALUES
         (?1, ?2, ?3, 'async_wait', ?4, ?5,
-         NULL, 'dm', 1, NULL, 'waiting', 'mail_reply_wait',
+         NULL, ?10, 1, NULL, 'waiting', 'mail_reply_wait',
          'mail_reply', ?6, ?7, 0, NULL,
          ?8, ?9, ?7, ?7)`,
     )
@@ -2235,6 +2243,7 @@ async function maybeRegisterMailReplyAsyncWait(
         nowMs,
         JSON.stringify(threadRef),
         `waiting for mail replies (0/${expectedFrom.length})`,
+        target.scope,
       )
       .run();
     await recordRuntimeEvent(env, {
@@ -2248,15 +2257,20 @@ async function maybeRegisterMailReplyAsyncWait(
         expected_count: expectedFrom.length,
         subject_contains: subjectContains ?? null,
         target_route: target.route,
+        target_scope: target.scope,
       },
     });
+    const resumeTargetText =
+      target.route === 'current_dm'
+        ? 'このDMに集計して再開します。'
+        : target.route === 'current_shared_thread'
+          ? 'このスレッドに集計して再開します。'
+          : '本人DMに集計して再開します。';
     return {
       text:
         `⏳ 返信待ちを登録しました\n` +
         `対象: ${expectedFrom.length}件\n` +
-        (target.route === 'current_dm'
-          ? `返信が揃ったら、このDMに集計して再開します。`
-          : `返信が揃ったら、本人DMに集計して再開します。`),
+        `返信が揃ったら、${resumeTargetText}`,
     };
   } catch (error) {
     await recordRuntimeEvent(env, {
@@ -2296,13 +2310,27 @@ async function resolveAsyncWaitTargetSpace(
   senderEmail: string,
   currentSpaceName: string,
   spaceType: string,
-): Promise<{ spaceName: string | null; route: 'current_dm' | 'sender_dm_kv' | 'missing_sender_dm_space' }> {
-  if (spaceType === 'DM') return { spaceName: currentSpaceName, route: 'current_dm' };
+  currentThreadName: string | null,
+): Promise<{
+  spaceName: string | null;
+  scope: 'dm' | 'shared';
+  route: 'current_dm' | 'current_shared_thread' | 'sender_dm_kv' | 'missing_sender_dm_space';
+  threadName?: string;
+}> {
+  if (spaceType === 'DM') return { spaceName: currentSpaceName, scope: 'dm', route: 'current_dm' };
+  if (currentSpaceName && currentThreadName) {
+    return {
+      spaceName: currentSpaceName,
+      scope: 'shared',
+      route: 'current_shared_thread',
+      threadName: currentThreadName,
+    };
+  }
   const email = normalizeSenderEmail(senderEmail);
-  if (!email) return { spaceName: null, route: 'missing_sender_dm_space' };
+  if (!email) return { spaceName: null, scope: 'dm', route: 'missing_sender_dm_space' };
   const dmSpaceName = await kv.get(`${CHAT_DM_SPACE_KV_PREFIX}${email}`);
-  if (!dmSpaceName) return { spaceName: null, route: 'missing_sender_dm_space' };
-  return { spaceName: dmSpaceName, route: 'sender_dm_kv' };
+  if (!dmSpaceName) return { spaceName: null, scope: 'dm', route: 'missing_sender_dm_space' };
+  return { spaceName: dmSpaceName, scope: 'dm', route: 'sender_dm_kv' };
 }
 
 function isMailReplyWaitRequest(text: string): boolean {
@@ -2317,11 +2345,13 @@ function isMailReplyWaitRequest(text: string): boolean {
 function buildMailReplyAsyncWaitPrompt(
   originalRequest: string,
   sent: EmailDispatchSummary[],
+  route: 'current_dm' | 'current_shared_thread' | 'sender_dm_kv' | 'missing_sender_dm_space',
 ): string {
   const sentLines = sent.map((summary) => `- ${summary.to} / ${summary.subject}`).join('\n');
+  const targetText = route === 'current_shared_thread' ? '元の共有スレッド' : '本人DM';
   return [
     'メール返信待ちの非同期継続です。',
-    '以下の送信先からの返信が揃ったら、返信内容を短く集計し、次アクション案を本人DMに出してください。',
+    `以下の送信先からの返信が揃ったら、返信内容を短く集計し、次アクション案を${targetText}に出してください。`,
     '',
     '元の依頼:',
     originalRequest.trim().slice(0, 2000),

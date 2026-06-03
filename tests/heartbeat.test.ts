@@ -132,12 +132,14 @@ describe('heartbeat scheduled enqueue', () => {
     expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(1);
   });
 
-  it('requires dm target space for v1', async () => {
+  it('requires a target space and shared thread when needed', async () => {
     const env = envWithQueue({ HEARTBEAT_ENABLED: '1' });
     const noSpace = addTask(env, { target_space_name: null });
     const shared = addTask(env, { task_id: 'shared-task', target_scope: 'shared' });
+    const unknown = addTask(env, { task_id: 'unknown-target', target_scope: 'external' });
     expect((await enqueueHeartbeatTask(env, noSpace)).kind).toBe('missing_target_space');
-    expect((await enqueueHeartbeatTask(env, shared)).kind).toBe('unsupported_target');
+    expect((await enqueueHeartbeatTask(env, shared)).kind).toBe('missing_target_thread');
+    expect((await enqueueHeartbeatTask(env, unknown)).kind).toBe('unsupported_target');
     expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(0);
   });
 
@@ -299,6 +301,7 @@ describe('heartbeat helpers', () => {
         task_id: 'news_check_seto',
         owner_user_id: 'k.seto@makotoprime.com',
         target_space_name: 'spaces/DM_SET0',
+        target_scope: 'dm',
         prompt: 'ニュースを確認する',
       },
       Date.parse('2026-06-02T23:30:00.000Z'),
@@ -307,5 +310,24 @@ describe('heartbeat helpers', () => {
     expect(event.space?.type).toBe('DM');
     expect(event.message?.text).toContain('今日は 2026-06-03 JST です。');
     expect(event.message?.text).toContain('ニュースを確認する');
+  });
+
+  it('builds a synthetic Google Chat shared-thread event', () => {
+    const event = buildHeartbeatChatEvent(
+      {
+        task_id: 'mail_collect',
+        owner_user_id: 'k.seto@makotoprime.com',
+        target_space_name: 'spaces/ROOM',
+        target_scope: 'shared',
+        thread_ref: JSON.stringify({ target_thread_name: 'spaces/ROOM/threads/T1' }),
+        prompt: '返信を集計する',
+      },
+      Date.parse('2026-06-02T23:30:00.000Z'),
+      'scheduled:heartbeat_tick:mail_collect:123',
+    );
+    expect(event.space?.type).toBe('ROOM');
+    expect(event.space?.name).toBe('spaces/ROOM');
+    expect(event.message?.thread?.name).toBe('spaces/ROOM/threads/T1');
+    expect(event.message?.text).toContain('返信を集計する');
   });
 });

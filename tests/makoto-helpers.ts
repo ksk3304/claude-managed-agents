@@ -258,7 +258,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       return { results: [], meta: { changes: 1 } };
     }
     if (
-      /^INSERT OR REPLACE INTO heartbeat_tasks \(task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at, status, stage, waiting_for, next_check_at, last_progress_at, attempt_count, stop_reason, thread_ref, user_visible_status, created_at, updated_at\) VALUES \(\?1, \?2, \?3, 'async_wait', \?4, \?5, NULL, 'dm', 1, NULL, 'waiting', 'mail_reply_wait', 'mail_reply', \?6, \?7, 0, NULL, \?8, \?9, \?7, \?7\)$/i.test(
+      /^INSERT OR REPLACE INTO heartbeat_tasks \(task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at, status, stage, waiting_for, next_check_at, last_progress_at, attempt_count, stop_reason, thread_ref, user_visible_status, created_at, updated_at\) VALUES \(\?1, \?2, \?3, 'async_wait', \?4, \?5, NULL, \?10, 1, NULL, 'waiting', 'mail_reply_wait', 'mail_reply', \?6, \?7, 0, NULL, \?8, \?9, \?7, \?7\)$/i.test(
         trimmed,
       )
     ) {
@@ -272,7 +272,8 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         nowMs,
         threadRef,
         visibleStatus,
-      ] = params as [string, string, string, string, number, number, number, string, string];
+        targetScope,
+      ] = params as [string, string, string, string, number, number, number, string, string, string];
       tables.heartbeat_tasks.set(taskId, {
         task_id: taskId,
         owner_user_id: ownerUserId,
@@ -281,7 +282,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         prompt,
         interval_min: intervalMin,
         active_hours: null,
-        target_scope: 'dm',
+        target_scope: targetScope,
         enabled: 1,
         last_run_at: null,
         status: 'waiting',

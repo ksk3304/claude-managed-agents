@@ -1081,9 +1081,8 @@ describe('handleChatEvent', () => {
     }
   });
 
-  it('Case 1-async-wait-shared: shared mail survey registers async_wait to sender DM', async () => {
+  it('Case 1-async-wait-shared: shared mail survey registers async_wait to original thread', async () => {
     const env = buildEnv();
-    await env.MAKOTO_KV.put('chat_dm_space:alice@example.com', 'spaces/DM_ALICE');
     const msg = buildQueueMsg({
       spaceType: 'ROOM',
       spaceName: 'spaces/ROOM',
@@ -1132,19 +1131,21 @@ describe('handleChatEvent', () => {
       expect(tasks.size).toBe(1);
       const task = Array.from(tasks.values())[0]!;
       expect(task.kind).toBe('async_wait');
-      expect(task.target_scope).toBe('dm');
-      expect(task.target_space_name).toBe('spaces/DM_ALICE');
+      expect(task.target_scope).toBe('shared');
+      expect(task.target_space_name).toBe('spaces/ROOM');
       expect(JSON.parse(String(task.thread_ref))).toMatchObject({
         expected_from: ['alice@example.com', 'bob@example.com'],
         subject_contains: '#245 shared async wait',
+        target_thread_name: 'spaces/ROOM/threads/T1',
       });
       expect(chatApiMock.patches.at(-1)?.text).toContain('⏳ 返信待ちを登録しました');
-      expect(chatApiMock.patches.at(-1)?.text).toContain('本人DMに集計して再開します');
+      expect(chatApiMock.patches.at(-1)?.text).toContain('このスレッドに集計して再開します');
       const registered = runtimeEvents(env).find(
         (row) => row.event_type === 'heartbeat_async_wait_registered',
       );
       expect(JSON.parse(String(registered?.detail_json))).toMatchObject({
-        target_route: 'sender_dm_kv',
+        target_route: 'current_shared_thread',
+        target_scope: 'shared',
       });
     } finally {
       globalThis.fetch = origFetch;
@@ -3521,6 +3522,42 @@ describe('handleChatEvent', () => {
     expect((chatApiMock.posts[1]!.opts as { threadName?: string }).threadName).toBe(
       'spaces/AAA/threads/t_1',
     );
+  });
+
+  it('autonomous scheduled shared event bypasses mention filter and replies in the provided thread', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      eventKey: 'scheduled:heartbeat_tick:shared_mail_collect:123',
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM',
+      threadName: 'spaces/ROOM/threads/T1',
+      text: 'メール返信が揃ったので集計してください。',
+      annotations: [],
+    });
+    msg.claim.owner = 'cron-heartbeat-shared-mail-collect';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_shared_heartbeat',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '共有スレッドで集計しました。' }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.spaceName).toBe('spaces/ROOM');
+    expect((chatApiMock.posts[0]!.opts as { threadName?: string }).threadName).toBe(
+      'spaces/ROOM/threads/T1',
+    );
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe('共有スレッドで集計しました。');
   });
 
   it('autonomous scheduled prompt bypasses reactive schedule-command short circuit', async () => {
