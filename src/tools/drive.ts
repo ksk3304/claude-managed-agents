@@ -21,6 +21,9 @@
  * Source: `scripts/cma_lib.py:799-1396` (drive helpers + 5 _exec_drive_*).
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
+import { toFile } from '@anthropic-ai/sdk';
+
 import {
   GoogleApiToolError,
   ToolSchemaError,
@@ -47,6 +50,10 @@ export interface DriveToolDeps {
   accessToken: string;
   refreshAccessToken?: () => Promise<string>;
   fetcher?: Fetcher;
+  /** Required only for `driveStageFile`. */
+  anthropic?: Anthropic;
+  /** Required only for `driveStageFile`. */
+  sessionId?: string;
   /** Required only for `driveDelete`. */
   confirmTokenStore?: ConfirmTokenStore;
   /** Inbound RFC 822 Message-ID — only meaningful for `driveDelete` (Issue #126). */
@@ -380,6 +387,31 @@ export async function driveReadExport(
 
 const DRIVE_CREATE_FILE_KNOWN_KEYS = new Set(['name', 'content', 'mime_type', 'parents']);
 const DRIVE_CREATE_FILE_MAX_BYTES = 1024 * 1024;
+const DRIVE_CREATE_FILE_BINARY_EXTENSIONS = [
+  '.xlsx',
+  '.xlsm',
+  '.docx',
+  '.pptx',
+  '.pdf',
+] as const;
+const DRIVE_CREATE_FILE_BINARY_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/pdf',
+]);
+
+const DRIVE_STAGE_FILE_KNOWN_KEYS = new Set(['file_id', 'name']);
+const DRIVE_STAGE_FILE_MAX_BYTES = 50 * 1024 * 1024;
+const DRIVE_STAGE_FILE_ALLOWED_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/pdf',
+]);
+const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
 
 export interface DriveCreateFileResult {
   id?: string;
@@ -388,6 +420,16 @@ export interface DriveCreateFileResult {
   webViewLink?: string;
   parents?: string[];
   [extra: string]: unknown;
+}
+
+export interface DriveStageFileResult {
+  drive_file_id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  anthropic_file_id: string;
+  session_resource_id: string;
+  mount_path: string;
 }
 
 export interface DriveUploadBinaryFileInput {
@@ -426,6 +468,7 @@ export async function driveCreateFile(
     typeof input.mime_type === 'string' && input.mime_type.trim().length > 0
       ? input.mime_type.trim()
       : 'text/plain';
+  rejectDriveCreateBinaryArtifact(name, mimeType);
 
   let parents: string[] | undefined;
   if (input.parents !== undefined) {
@@ -494,6 +537,160 @@ export async function driveCreateFile(
     );
   }
   return (await resp.json()) as DriveCreateFileResult;
+}
+
+function rejectDriveCreateBinaryArtifact(name: string, mimeType: string): void {
+  const lowerName = name.toLowerCase();
+  const lowerMime = mimeType.toLowerCase();
+  const ext = DRIVE_CREATE_FILE_BINARY_EXTENSIONS.find((e) => lowerName.endsWith(e));
+  if (!ext && !DRIVE_CREATE_FILE_BINARY_MIME_TYPES.has(lowerMime)) return;
+  const reason = ext ?? lowerMime;
+  throw new ToolSchemaError(
+    `drive_create_file: ${reason} is a binary artifact, but drive_create_file only accepts UTF-8 text content. ` +
+      `Create the Office/PDF file with the attached skill, save it under /mnt/session/outputs/${name}, ` +
+      `then answer normally; the Google Chat bridge uploads session output files to Drive and appends the Drive URL.`,
+  );
+}
+
+/**
+ * Download an existing Drive Office/PDF binary and mount it into the
+ * active Anthropic session. The agent can then edit the mounted file
+ * with the attached document/spreadsheet/presentation/PDF skills and
+ * save the updated artifact under `/mnt/session/outputs`.
+ */
+export async function driveStageFile(
+  input: Record<string, unknown>,
+  deps: DriveToolDeps,
+): Promise<DriveStageFileResult> {
+  rejectUnknownKeys(input, DRIVE_STAGE_FILE_KNOWN_KEYS, 'drive_stage_file');
+  const fileId = validateDriveFileId(input.file_id, 'drive_stage_file');
+  if (!deps.anthropic) {
+    throw new ToolSchemaError('drive_stage_file: anthropic client unavailable');
+  }
+  if (!deps.sessionId) {
+    throw new ToolSchemaError('drive_stage_file: session_id unavailable');
+  }
+
+  const metaParams = new URLSearchParams({
+    fields: 'id,name,mimeType,size',
+    supportsAllDrives: 'true',
+  });
+  const metaUrl = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${metaParams.toString()}`;
+  const metaResp = await googleApiFetch(metaUrl, { method: 'GET' }, fetchOpts(deps));
+  if (metaResp.status === 404) {
+    throw new GoogleApiToolError(`drive_stage_file not_found: file_id=${fileId}`, {
+      status: 404,
+    });
+  }
+  if (!metaResp.ok) {
+    const snippet = await safeErrorSnippet(metaResp);
+    throw new GoogleApiToolError(
+      `drive_stage_file metadata HTTP ${metaResp.status}: ${snippet}`,
+      { status: metaResp.status, bodySnippet: snippet },
+    );
+  }
+
+  const meta = (await metaResp.json()) as {
+    id?: string;
+    name?: string;
+    mimeType?: string;
+    size?: string;
+  };
+  const mimeType = (meta.mimeType ?? '').trim();
+  if (mimeType.startsWith('application/vnd.google-apps.')) {
+    throw new ToolSchemaError(
+      `drive_stage_file: Google-native files are not binary Office/PDF artifacts (mimeType=${mimeType}). Use sheets_* / docs_* style tools for native Workspace files.`,
+    );
+  }
+  if (!DRIVE_STAGE_FILE_ALLOWED_MIME_TYPES.has(mimeType)) {
+    throw new ToolSchemaError(
+      `drive_stage_file: unsupported mimeType=${mimeType || '(empty)'}. Supported: .xlsx, .xlsm, .docx, .pptx, .pdf`,
+    );
+  }
+  const declaredSize = Number(meta.size ?? 0);
+  if (Number.isFinite(declaredSize) && declaredSize > DRIVE_STAGE_FILE_MAX_BYTES) {
+    throw new ToolSchemaError(
+      `drive_stage_file: file too large (${declaredSize} bytes > ${DRIVE_STAGE_FILE_MAX_BYTES})`,
+    );
+  }
+
+  const mediaUrl = `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+  const contentResp = await googleApiFetch(mediaUrl, { method: 'GET' }, fetchOpts(deps));
+  if (!contentResp.ok) {
+    const snippet = await safeErrorSnippet(contentResp);
+    throw new GoogleApiToolError(
+      `drive_stage_file download HTTP ${contentResp.status}: ${snippet}`,
+      { status: contentResp.status, bodySnippet: snippet },
+    );
+  }
+  const bytes = await contentResp.arrayBuffer();
+  if (bytes.byteLength === 0) {
+    throw new GoogleApiToolError(`drive_stage_file empty_file: file_id=${fileId}`);
+  }
+  if (bytes.byteLength > DRIVE_STAGE_FILE_MAX_BYTES) {
+    throw new ToolSchemaError(
+      `drive_stage_file: file too large (${bytes.byteLength} bytes > ${DRIVE_STAGE_FILE_MAX_BYTES})`,
+    );
+  }
+
+  const requestedName =
+    typeof input.name === 'string' && input.name.trim().length > 0
+      ? input.name.trim()
+      : undefined;
+  const filename = sanitizeSessionUploadFilename(
+    requestedName ?? meta.name ?? `drive-file${extensionForMimeType(mimeType)}`,
+    extensionForMimeType(mimeType),
+  );
+  const file = await toFile(new Uint8Array(bytes), filename, { type: mimeType });
+  const uploaded = await deps.anthropic.beta.files.upload({
+    file,
+    betas: [ANTHROPIC_FILES_BETA],
+  });
+  const mountPath = `/mnt/session/uploads/${filename}`;
+  const resource = await deps.anthropic.beta.sessions.resources.add(deps.sessionId, {
+    type: 'file',
+    file_id: uploaded.id,
+    mount_path: mountPath,
+  });
+
+  return {
+    drive_file_id: fileId,
+    name: filename,
+    mimeType,
+    size: bytes.byteLength,
+    anthropic_file_id: uploaded.id,
+    session_resource_id: resource.id,
+    mount_path: resource.mount_path ?? mountPath,
+  };
+}
+
+function sanitizeSessionUploadFilename(raw: string, fallbackExt: string): string {
+  const leaf = raw.split(/[\\/]/).pop() ?? '';
+  const cleaned = leaf
+    .replace(/[^A-Za-z0-9._() -]+/g, '_')
+    .replace(/^\.+$/, '')
+    .trim()
+    .slice(0, 140);
+  if (!cleaned) return `drive-file${fallbackExt}`;
+  if (cleaned === '.' || cleaned === '..') return `drive-file${fallbackExt}`;
+  return cleaned;
+}
+
+function extensionForMimeType(mimeType: string): string {
+  switch (mimeType) {
+    case 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+      return '.xlsx';
+    case 'application/vnd.ms-excel.sheet.macroenabled.12':
+      return '.xlsm';
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+      return '.docx';
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+      return '.pptx';
+    case 'application/pdf':
+      return '.pdf';
+    default:
+      return '.bin';
+  }
 }
 
 /**

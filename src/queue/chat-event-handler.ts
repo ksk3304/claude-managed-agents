@@ -1258,6 +1258,7 @@ export async function handleChatEvent(
                 userSlug: userMapping.user_slug,
                 boundMessageId: '',
                 callerSessionId: sessionIdRef.current,
+                anthropic: client,
               })
             : gateExternalToolCall(env, {
                 eventKey,
@@ -1594,6 +1595,7 @@ export async function handleChatEvent(
     env,
     sessionId,
     sourceText: markerLeakScrubbed.text,
+    artifactHintText: bodyText,
     minCreatedAtMs: sessionOutputMinCreatedAtMs,
     eventKey,
     resolveDriveDeps: async () => {
