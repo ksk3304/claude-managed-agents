@@ -77,6 +77,7 @@ const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
+const SESSION_TIMEOUT_RECOVERY_POLL_MS = 180_000;
 
 function isWaitingOnResponsesError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
@@ -195,6 +196,8 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
+  /** Stream timeout後にsession historyから最終応答を回収する時間。 */
+  timeoutRecoveryMs?: number;
   /** Session watchdog override (test / incident-debug 用)。 */
   sessionWatchdogSec?: number;
   /**
@@ -676,6 +679,11 @@ export async function orchestrateChatTurn(
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
+      timeoutRecoveryMs:
+        input.timeoutRecoveryMs ??
+        (input.timeoutMs !== undefined && input.timeoutMs < 1_000
+          ? 0
+          : SESSION_TIMEOUT_RECOVERY_POLL_MS),
       sessionWatchdogSec,
       payloadAudit: {
         kv,
@@ -707,6 +715,8 @@ export async function orchestrateChatTurn(
           assistant_chars: streamResult.assistantText.length,
           terminal_event_type: streamResult.terminalEventType ?? null,
           stop_reason: streamResult.stopReason ?? null,
+          recovered_from_stream_timeout:
+            streamResult.recoveredFromStreamTimeout === true,
           session_watchdog_sec:
             sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
         },
