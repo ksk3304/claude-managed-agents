@@ -9,7 +9,7 @@
  * 上限は厳密に踏襲する.
  *
  * 機能の役割:
- *   1. owner agent 単位の番号付き store (`agent_0001_session_log_store`
+ *   1. owner agent 単位の会社名 + 番号付き store (`Makoto Prime_0001_session_log_store`
  *      等) を優先し、旧 mapping は unified owner log の legacy alias
  *      として使う。
  *   2. JST date label (`YYYY-MM-DD`) + owner slug で base path 構築
@@ -258,7 +258,7 @@ export function buildSessionLogEntry(params: SessionLogEntryParams): string {
 
 /**
  * Unified owner-agent memory. DM / shared space で保存先を分けない。
- * New mappings should use numbered stores such as `agent_0001_session_log_store`;
+ * New mappings should use company-numbered stores such as `Makoto Prime_0001_session_log_store`;
  * old mappings can keep `agent_session_log_store` or `session_log_dm_store`
  * as owner log aliases.
  */
@@ -268,7 +268,7 @@ export function selectSessionLogAttachment(
 ): MemoryAttachment | null {
   void spaceType;
   const preferred: Array<(storeName: string) => boolean> = [
-    (storeName) => /^agent_\d{4}_session_log_store$/.test(storeName),
+    (storeName) => isCompanyNumberedStore(storeName, 'session_log_store'),
     (storeName) => storeName === 'agent_session_log_store',
     (storeName) => storeName === 'session_log_store',
     (storeName) => storeName === 'session_log_dm_store',
@@ -292,6 +292,11 @@ export function selectSessionLogAttachment(
     if (name.includes('session') && name.includes('log')) return att;
   }
   return null;
+}
+
+function isCompanyNumberedStore(storeName: string, suffix: string): boolean {
+  const normalized = storeName.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  return new RegExp(`^[a-z0-9]+(?:_[a-z0-9]+)*_\\d{4}_${suffix}$`).test(normalized);
 }
 
 // ============================================================================

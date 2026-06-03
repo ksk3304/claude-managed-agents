@@ -41,13 +41,15 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(13);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(14);
+    expect(MAKOTO_TOOL_NAMES).toContain('chat_list_space_members');
     expect(MAKOTO_TOOL_NAMES).toContain('drive_stage_file');
     expect(MAKOTO_TOOL_NAMES).toContain('agentmail_read');
     expect(MAKOTO_TOOL_NAMES).toContain('makoto_introspect');
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
+    expect(isMakotoToolName('chat_list_space_members')).toBe(true);
     expect(isMakotoToolName('agentmail_read')).toBe(true);
     expect(isMakotoToolName('makoto_introspect')).toBe(true);
     expect(isMakotoToolName('drive_bogus')).toBe(false);
@@ -130,6 +132,9 @@ describe('dispatchMakotoTool happy paths', () => {
     expect(
       ((payload.identity_model as Record<string, unknown>).instance_variables as string[]),
     ).toContain('agent_number');
+    expect(
+      ((payload.identity_model as Record<string, unknown>).instance_variables as string[]),
+    ).toContain('memory_store_company_name');
     expect((payload.custom_tools as Array<Record<string, unknown>>).length).toBe(
       MAKOTO_TOOL_NAMES.length,
     );
@@ -190,6 +195,25 @@ describe('dispatchMakotoTool happy paths', () => {
     );
     expect(r.ok).toBe(false);
     expect((r.payload as Record<string, unknown>).error).toBe('agentmail_unavailable');
+  });
+
+  it('chat_list_space_members bypasses Workspace OAuth and reports Chat API config', async () => {
+    const env = {
+      DB: makeMakotoDb(),
+      MAKOTO_KV: makeKv(),
+    } as unknown as Env;
+    const r = await dispatchMakotoTool(
+      'chat_list_space_members',
+      {},
+      {
+        env,
+        userSlug: 'alice',
+        boundMessageId: 'm-1',
+        currentSpaceName: 'spaces/AAA',
+      },
+    );
+    expect(r.ok).toBe(false);
+    expect((r.payload as Record<string, unknown>).error).toBe('chat_api_unavailable');
   });
 
   it('drive_search resolves OAuth then proxies to driveSearch', async () => {

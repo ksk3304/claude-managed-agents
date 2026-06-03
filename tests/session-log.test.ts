@@ -275,10 +275,10 @@ describe('selectSessionLogAttachment', () => {
     instructions: 'DM (個人 1:1) のセッションログを記録',
   };
   const numberedAtt: MemoryAttachment = {
-    memory_store_id: 'memstore_agent_0001_log',
+    memory_store_id: 'memstore_makoto_prime_0001_log',
     access: 'read_write',
-    store_name: 'agent_0001_session_log_store',
-    instructions: 'agent 0001 セッションログを記録',
+    store_name: 'Makoto Prime_0001_session_log_store',
+    instructions: 'Makoto Prime 0001 セッションログを記録',
   };
   const otherAtt: MemoryAttachment = {
     memory_store_id: 'memstore_other',
@@ -292,7 +292,7 @@ describe('selectSessionLogAttachment', () => {
   });
   it('selects numbered owner-agent store before legacy aliases', () => {
     const att = selectSessionLogAttachment('ROOM', [otherAtt, sharedAtt, dmAtt, numberedAtt]);
-    expect(att?.memory_store_id).toBe('memstore_agent_0001_log');
+    expect(att?.memory_store_id).toBe('memstore_makoto_prime_0001_log');
   });
   it('selects dm store for DM space', () => {
     const att = selectSessionLogAttachment('DM', [otherAtt, sharedAtt, dmAtt]);
@@ -460,10 +460,10 @@ const DM_ATTACHMENT: MemoryAttachment = {
   instructions: 'DM (個人 1:1) のセッションログ',
 };
 const NUMBERED_ATTACHMENT: MemoryAttachment = {
-  memory_store_id: 'memstore_agent_0001_log',
+  memory_store_id: 'memstore_makoto_prime_0001_log',
   access: 'read_write',
-  store_name: 'agent_0001_session_log_store',
-  instructions: 'agent 0001 セッションログ',
+  store_name: 'Makoto Prime_0001_session_log_store',
+  instructions: 'Makoto Prime 0001 セッションログ',
 };
 
 const FIXED_NOW = new Date('2026-05-26T01:30:00.000Z'); // = 2026-05-26 10:30:00 JST.

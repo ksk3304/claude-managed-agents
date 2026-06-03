@@ -48,6 +48,7 @@ import {
   type InitMemoryStoresResult,
   type CopyAgentResult,
 } from './onboarding-core';
+import { DEFAULT_MEMORY_STORE_COMPANY_NAME } from './store-config';
 
 // ---------------------------------------------------------------------------
 // argv parser (= minimal long-flag parser, dependency なし)
@@ -256,6 +257,7 @@ Common flags:
 
 Sub-command flags:
   init-user-memory-stores --user-slug <slug> --agent-number <0001>
+                          [--company-name "Makoto Prime"]
 
   copy-agent --from <template_agent_id> --to-slug <slug>
              --display-name "<name>" --addendum "<text>"
@@ -263,6 +265,7 @@ Sub-command flags:
   register-user-mapping --slug <slug> --email <addr> --agent-id <id>
                         --display-name "<name>" --addendum "<text>"
                         --agent-number <0001>
+                        [--company-name "Makoto Prime"]
                         [--chat-user-id "users/...]
                         [--store-id <actual_name>=<memstore_id> ...]
 
@@ -278,13 +281,13 @@ KV/D1 への real write は wrangler subprocess (\`npx wrangler kv key put\` /
 で切替可能。
 
 例:
-  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --dry-run
+  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --company-name "Makoto Prime" --dry-run
   npx tsx src/cli/onboarding.ts copy-agent --from agent_xxx --to-slug yamada \\
       --display-name "山田 太郎" --addendum "あなたは山田 太郎さん専属の MAKOTOくんです" --dry-run
   npx tsx src/cli/onboarding.ts register-user-mapping --slug yamada \\
       --email yamada@example.com --agent-id agent_yyy \\
       --display-name "山田 太郎" --addendum "..." --agent-number 0001 \\
-      --store-id "agent_0001_session_log_store=memstore_xxx" \\
+      --store-id "Makoto Prime_0001_session_log_store=memstore_xxx" \\
       --store-id "company_core_memory=memstore_common_xxx" --dry-run
 `;
 
@@ -309,9 +312,18 @@ function parseStoreIdFlags(values: string[]): Record<string, string> {
   return out;
 }
 
+function resolveCompanyName(p: ParsedArgs): string {
+  return (
+    getString(p, 'company-name') ??
+    process.env.MAKOTO_MEMORY_COMPANY_NAME ??
+    DEFAULT_MEMORY_STORE_COMPANY_NAME
+  );
+}
+
 async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
   const userSlug = requireString(p, 'user-slug', 'init-user-memory-stores');
   const agentNumber = requireString(p, 'agent-number', 'init-user-memory-stores');
+  const companyName = resolveCompanyName(p);
   const dryRun = p.flags.has('dry-run');
 
   if (dryRun) {
@@ -323,6 +335,7 @@ async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
       kv: fakeKv,
       userSlug,
       agentNumber,
+      companyName,
       dryRun: true,
     });
   }
@@ -330,7 +343,14 @@ async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
   const { kvNamespaceId, remote } = resolveCfTargets();
   const anthropic = await makeAnthropic();
   const kv = makeWranglerKv(kvNamespaceId, remote);
-  return await initUserMemoryStores({ anthropic, kv, userSlug, agentNumber, dryRun: false });
+  return await initUserMemoryStores({
+    anthropic,
+    kv,
+    userSlug,
+    agentNumber,
+    companyName,
+    dryRun: false,
+  });
 }
 
 async function cmdCopyAgent(p: ParsedArgs): Promise<CopyAgentResult> {
@@ -366,6 +386,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
   const userEmail = requireString(p, 'email', 'register-user-mapping');
   const agentId = requireString(p, 'agent-id', 'register-user-mapping');
   const agentNumber = requireString(p, 'agent-number', 'register-user-mapping');
+  const companyName = resolveCompanyName(p);
   const displayName = requireString(p, 'display-name', 'register-user-mapping');
   const addendum = requireString(p, 'addendum', 'register-user-mapping');
   const chatUserId = getString(p, 'chat-user-id');
@@ -380,6 +401,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
       userEmail,
       userSlug,
       agentNumber,
+      companyName,
       agentId,
       displayName,
       chatUserId,
@@ -398,6 +420,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
     userEmail,
     userSlug,
     agentNumber,
+    companyName,
     agentId,
     displayName,
     chatUserId,

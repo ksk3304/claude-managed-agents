@@ -17,6 +17,7 @@ export type MakotoToolName =
   | 'sheets_update'
   | 'sheets_append'
   | 'calendar_list_events'
+  | 'chat_list_space_members'
   | 'agentmail_read'
   | 'makoto_introspect';
 
@@ -115,6 +116,12 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
     description: 'List Google Calendar events for a requested time range.',
     status: 'cloudflare_code_live_unverified',
     requires_workspace_oauth: true,
+  },
+  {
+    name: 'chat_list_space_members',
+    description: 'List Google Chat space members when roster context is needed.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
   },
   {
     name: 'agentmail_read',
@@ -223,6 +230,7 @@ export async function buildMakotoIntrospection(
       'Google Chat and AgentMail entrypoints drive Anthropic Managed Agent sessions on Cloudflare Workers.',
       'The agent uses per-user Google Workspace OAuth only through Worker-side tools; credentials are not exposed to the agent.',
       'Memory attachments are resolved by Cloudflare-side routing before creating or reusing a session.',
+      'Google Chat space roster is not injected every turn; the agent can call chat_list_space_members when needed.',
       'External write/send/delete operations are guarded by custom tool or marker contracts.',
       'MCP is not an active Google Workspace path; current Workspace access is Worker-side REST tooling.',
       'Playwright MCP is feature-flagged and only attaches when URL and safety gates pass.',
@@ -233,6 +241,7 @@ export async function buildMakotoIntrospection(
       instance_variables: [
         'agent_number',
         'agent_display_name',
+        'memory_store_company_name',
         'owner_display_name',
         'organization_name',
         'agent_role',
@@ -250,7 +259,7 @@ export async function buildMakotoIntrospection(
         raw_source: 'Google Drive meeting minutes and documents remain primary source links.',
       },
       logs_and_reports: {
-        naming: 'Numbered agent-specific stores, e.g. agent_0001_session_log_store and agent_0001_daily_report_store.',
+        naming: 'Company-numbered owner-agent stores, e.g. Makoto Prime_0001_session_log_store and Makoto Prime_0001_daily_report_store.',
         policy: 'Session logs and daily reports stay in one numbered owner-agent Memory Store regardless of DM or shared space.',
         drive_role: 'Drive is source/archive for primary documents, not the default memory carrier.',
       },
@@ -259,6 +268,7 @@ export async function buildMakotoIntrospection(
       'Do not claim active MCP connectors for Google Workspace; they are not the current implementation path.',
       'Do not claim Cloud Run is the primary runtime for Cloudflare版.',
       'Do not claim the LLM automatically chooses which Memory Stores to mount; the Worker router chooses resources[].',
+      'Do not claim Google Chat roster is always preloaded; use chat_list_space_members if roster context is needed.',
       'Do not claim env-specific Workspace operations are available for a user before OAuth/bootstrap/live verification.',
       'Do not expose secret names, token state, raw payload audit, session ids, or internal stack traces to normal Chat users.',
     ],
@@ -316,10 +326,10 @@ export async function buildMakotoIntrospection(
       priority_order: [
         'corporate_wiki_memory / corporate_brain / company_wiki',
         'company_core_memory',
-        'agent_0001_identity_memory / agent_0001_profile_memory / persona_memory',
-        'agent_0001_support_memory for the owner support context',
-        'agent_0001_daily_report_store / daily_report_store for the owner agent',
-        'agent_0001_session_log_store / session_log_store for the owner agent',
+        'Makoto Prime_0001_identity_memory / Makoto Prime_0001_profile_memory / persona_memory',
+        'Makoto Prime_0001_support_memory for the owner support context',
+        'Makoto Prime_0001_daily_report_store / daily_report_store for the owner agent',
+        'Makoto Prime_0001_session_log_store / session_log_store for the owner agent',
         'legacy DM/shared daily/log aliases as compatibility inputs',
         'remaining stores in declared order',
       ],
@@ -335,17 +345,18 @@ export async function buildMakotoIntrospection(
       system_prompt: [
         'Generic role, tone, output format, safety boundaries, trust boundary, and correct Cloudflare/CMA self-recognition.',
         'Instance-specific identity is injected by mapping/addendum/memory, not hard-coded in the generic prompt.',
+        'Company-numbered memory naming examples are variables, not generic prompt identity literals.',
         'What the agent must never claim, such as active Workspace MCP or Cloud Run as primary runtime.',
       ],
       memory: [
         'Corporate wiki / LLM Wiki on Memory Store as interpreted company brain.',
-        'Numbered agent-specific identity/profile/support memory, company core facts, session logs, and daily reports, with owner-agent unified logs.',
+        'Company-numbered owner-agent identity/profile/support memory, company core facts, session logs, and daily reports, with owner-agent unified logs.',
         'Google Drive links and primary source references recorded inside wiki/log entries when source tracing matters.',
       ],
       logic: [
         'Cloudflare session resolver and Memory Store router selecting sessions.create resources[].',
         'Permission gates for Workspace/AgentMail/Chat writes and per-user OAuth subject resolution.',
-        'Routing prompt / envelope logic that keeps lightweight turns from unnecessary tool, bash, Drive, or memory deep dives.',
+        'Thin Chat boundary: route sender/session/resources, execute requested tools, and avoid speculative prompt/context injection.',
       ],
     };
   }
@@ -487,6 +498,16 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
           calendar_id: stringProp('Optional calendar id. Default primary.'),
         },
         ['time_min', 'time_max'],
+      );
+    case 'chat_list_space_members':
+      return objectSchema(
+        {
+          space_name: stringProp(
+            'Optional Google Chat space resource name. Defaults to the current inbound space.',
+          ),
+          limit: numberProp('Optional member cap. 1-100, default 50.'),
+        },
+        [],
       );
     case 'agentmail_read':
       return objectSchema(

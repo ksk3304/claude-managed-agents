@@ -30,8 +30,8 @@ describe('storeIdFromEntry', () => {
       user_slug: 'alice',
       agent_id: 'agent_x',
       memory_attachments: [
-        { memory_store_id: 'memstore_agent_log', access: 'read_write', store_name: 'agent_0001_session_log_store' },
-        { memory_store_id: 'memstore_agent_report', access: 'read_write', store_name: 'agent_0001_daily_report_store' },
+        { memory_store_id: 'memstore_agent_log', access: 'read_write', store_name: 'Makoto Prime_0001_session_log_store' },
+        { memory_store_id: 'memstore_agent_report', access: 'read_write', store_name: 'Makoto Prime_0001_daily_report_store' },
       ],
     };
     expect(storeIdFromEntry(entry, 'agent_session_log_store')).toBe('memstore_agent_log');
@@ -155,8 +155,8 @@ const aliceMapping: UserMappingValue = {
   user_slug: 'alice',
   agent_id: 'agent_a',
   memory_attachments: [
-    { memory_store_id: 'memstore_alice_agent_log', access: 'read_write', store_name: 'agent_0001_session_log_store' },
-    { memory_store_id: 'memstore_alice_agent_report', access: 'read_write', store_name: 'agent_0001_daily_report_store' },
+    { memory_store_id: 'memstore_alice_agent_log', access: 'read_write', store_name: 'Makoto Prime_0001_session_log_store' },
+    { memory_store_id: 'memstore_alice_agent_report', access: 'read_write', store_name: 'Makoto Prime_0001_daily_report_store' },
     { memory_store_id: 'memstore_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
     { memory_store_id: 'memstore_shared_report', access: 'read_write', store_name: 'daily_report_shared_store' },
   ],
@@ -165,8 +165,8 @@ const bobMapping: UserMappingValue = {
   user_slug: 'bob',
   agent_id: 'agent_b',
   memory_attachments: [
-    { memory_store_id: 'memstore_bob_agent_log', access: 'read_write', store_name: 'agent_0002_session_log_store' },
-    { memory_store_id: 'memstore_bob_agent_report', access: 'read_write', store_name: 'agent_0002_daily_report_store' },
+    { memory_store_id: 'memstore_bob_agent_log', access: 'read_write', store_name: 'Makoto Prime_0002_session_log_store' },
+    { memory_store_id: 'memstore_bob_agent_report', access: 'read_write', store_name: 'Makoto Prime_0002_daily_report_store' },
     { memory_store_id: 'memstore_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
     { memory_store_id: 'memstore_shared_report', access: 'read_write', store_name: 'daily_report_shared_store' },
   ],

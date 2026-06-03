@@ -66,6 +66,10 @@ import {
 } from '../tools/tool-common';
 import { getAccessToken } from '../lib/workspace-oauth';
 import { getOAuthLease } from '../durable-objects/oauth-lease';
+import {
+  fetchSpaceMemberRoster,
+  sanitizeRosterDisplayName,
+} from '../lib/space-roster';
 
 export { MAKOTO_TOOL_NAMES } from '../lib/makoto-capability-registry';
 
@@ -88,6 +92,10 @@ export interface MakotoToolDispatchContext {
   boundMessageId: string;
   /** Optional — passed to oauth_audit row. */
   callerSessionId?: string;
+  /** Current inbound Google Chat space resource name, used by chat_list_space_members. */
+  currentSpaceName?: string;
+  /** Current inbound Google Chat thread resource name, for tool result context only. */
+  currentThreadName?: string;
   /** Optional — required for tools that mount files into the active session. */
   anthropic?: Anthropic;
   /** Optional fetch override for tests. */
@@ -179,6 +187,10 @@ export async function dispatchMakotoTool(
         payload: { error: 'unexpected', tool: name, message },
       };
     }
+  }
+
+  if (name === 'chat_list_space_members') {
+    return listChatSpaceMembers(args, ctx);
   }
 
   // Resolve per-user access token. Fail-close if the vault has no
@@ -290,6 +302,89 @@ function describeType(v: unknown): string {
   if (v === null) return 'null';
   if (Array.isArray(v)) return 'array';
   return typeof v;
+}
+
+async function listChatSpaceMembers(
+  args: Record<string, unknown>,
+  ctx: MakotoToolDispatchContext,
+): Promise<MakotoToolResult> {
+  const explicitSpaceName = optionalString(args.space_name);
+  const spaceName = explicitSpaceName || ctx.currentSpaceName || '';
+  if (!spaceName) {
+    return {
+      ok: false,
+      payload: {
+        error: 'missing_space_name',
+        tool: 'chat_list_space_members',
+        message: 'space_name is required outside a Google Chat event context.',
+      },
+    };
+  }
+  if (!ctx.env.CHAT_SA_KEY_JSON) {
+    return {
+      ok: false,
+      payload: {
+        error: 'chat_api_unavailable',
+        tool: 'chat_list_space_members',
+        message: 'CHAT_SA_KEY_JSON secret not set on this Worker.',
+      },
+    };
+  }
+
+  const limit = clampInteger(args.limit, 50, 1, 100);
+  const result = await fetchSpaceMemberRoster(
+    {
+      saKeyJson: ctx.env.CHAT_SA_KEY_JSON,
+      ...(ctx.fetchImpl ? { fetchImpl: ctx.fetchImpl } : {}),
+    },
+    spaceName,
+  );
+  if (result.kind === 'failure') {
+    return {
+      ok: false,
+      payload: {
+        error: 'chat_roster_fetch_failed',
+        tool: 'chat_list_space_members',
+        space_name: spaceName,
+        reason: result.reason,
+      },
+    };
+  }
+
+  const members = Array.from(result.members.entries())
+    .sort(([aName, aDisplay], [bName, bDisplay]) => {
+      const a = aDisplay || aName;
+      const b = bDisplay || bName;
+      return a.localeCompare(b, 'ja');
+    })
+    .slice(0, limit)
+    .map(([userName, displayName]) => ({
+      user_name: userName,
+      display_name: displayName ? sanitizeRosterDisplayName(displayName) : '',
+    }));
+
+  return ok({
+    space_name: spaceName,
+    ...(ctx.currentThreadName ? { thread_name: ctx.currentThreadName } : {}),
+    member_count: result.members.size,
+    limit,
+    truncated: result.members.size > limit,
+    members,
+  });
+}
+
+function optionalString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function clampInteger(
+  value: unknown,
+  defaultValue: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return defaultValue;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
 }
 
 type AccessTokenResolution =
