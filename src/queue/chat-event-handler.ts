@@ -158,10 +158,6 @@ import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
-const ORCHESTRATOR_SESSION_CREATE_NOTICE =
-  'MAKOTOくんの処理を開始できませんでした。ログ確認対象として記録しました。';
-const ORCHESTRATOR_STREAM_FAILED_NOTICE =
-  'MAKOTOくんの応答完了を確認できませんでした。ログ確認対象として記録しました。';
 const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
@@ -1284,20 +1280,21 @@ export async function handleChatEvent(
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
       if (orchestrated.stopReason === 'custom_tool_timeout') {
-        assistantText =
-          'ファイル作成中にツール実行がタイムアウトしました。作成完了を確認できていないため、担当者がログを確認します。';
         await recordRuntimeEvent(env, {
           eventKey,
           sessionId,
           messageId: message.name,
-          eventType: 'custom_tool_timeout_visible_notice',
+          eventType: 'custom_tool_timeout_retry_no_notice',
           level: 'warn',
           source: 'chat-event-handler',
           detail: {
             tool_use_count: orchestrated.toolUseCount,
             tool_use_names: orchestrated.toolUseNames,
+            placeholder_name_present: Boolean(placeholderName),
           },
         });
+        await safeRelease(env, eventKey, claim);
+        return { kind: 'release_and_retry', reason: 'custom_tool_timeout' };
       }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
@@ -1438,30 +1435,21 @@ export async function handleChatEvent(
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          const notice =
-            err.reason === 'sessions_create_failed'
-              ? ORCHESTRATOR_SESSION_CREATE_NOTICE
-              : ORCHESTRATOR_STREAM_FAILED_NOTICE;
-          await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
           await recordRuntimeEvent(env, {
             eventKey,
             messageId: message.name,
             userSlug: userMapping.user_slug,
-            eventType: 'orchestrator_transient_visible_notice',
+            eventType: 'orchestrator_transient_retry_no_notice',
             level: 'warn',
             source: 'chat-event-handler',
-            detail: { reason: err.reason, error: redactPiiInText(err.message).slice(0, 1000) },
+            detail: {
+              reason: err.reason,
+              error: redactPiiInText(err.message).slice(0, 1000),
+              placeholder_name_present: Boolean(placeholderName),
+            },
           });
-          await safeCommit(env, eventKey, claim, {
-            messageId: message.name,
-            userSlug: userMapping.user_slug,
-            reason: err.reason,
-            stage: 'orchestrator',
-            outcome: 'committed',
-            level: 'warn',
-            detail: { visible_notice: true },
-          });
-          return { kind: 'committed' };
+          await safeRelease(env, eventKey, claim);
+          return { kind: 'release_and_retry', reason: err.reason };
         }
         if (placeholderName) {
           await safeDeletePlaceholder(env, placeholderName, eventKey);
@@ -2183,11 +2171,23 @@ function scrubActionMarkerLeakForChat(
   const leaks =
     rawMarkerSyntax || botProcessingMarkerTalk;
   if (!leaks) return { text, scrubbed: false, reason: '' };
+  const redactedText = redactActionMarkerTermsForChat(text).trim();
   return {
-    text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+    text: redactedText || '内部用の実行記法を伏せました。',
     scrubbed: true,
     reason: 'action_marker_terms',
   };
+}
+
+function redactActionMarkerTermsForChat(text: string): string {
+  return text
+    .replace(
+      /`?\b(email_send|chat_post|schedule_action)\b`?\s*:\s*\{[\s\S]*?\}/gi,
+      '（内部用の実行記法を伏せました）',
+    )
+    .replace(/`?\b(email_send|chat_post|schedule_action)\b`?/gi, '内部用マーカー')
+    .replace(/bot\s*側/gi, '内部側')
+    .replace(/bot側/gi, '内部側');
 }
 
 function normalizeEmailPreviewEscapedNewlines(
