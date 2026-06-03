@@ -2,17 +2,29 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  buildChatCapabilitySessionKey,
+  chatThreadSessionKey,
   orchestrateChatTurn,
   resolveReactiveSessionWatchdogSec,
 } from '../src/lib/session-orchestrator';
 import { makeKv } from './helpers';
 
+interface MakeClientOpts {
+  streamEvents?: Array<Record<string, unknown>>;
+  sessionIds?: string[];
+  sendErrors?: Error[];
+}
+
 function makeClient(
   calls: string[],
-  streamEvents?: Array<Record<string, unknown>>,
+  opts: MakeClientOpts | Array<Record<string, unknown>> = {},
 ): Anthropic {
+  const options: MakeClientOpts = Array.isArray(opts) ? { streamEvents: opts } : opts;
+  let createCallCount = 0;
+  let sendCallCount = 0;
+
   async function* stream(): AsyncIterable<Record<string, unknown>> {
-    const events = streamEvents ?? [
+    const events = options.streamEvents ?? [
       { type: 'agent.message.text_delta', text: 'ok' },
       { type: 'session.status_idle', stop_reason: 'end_turn' },
     ];
@@ -36,11 +48,16 @@ function makeClient(
       sessions: {
         async create(args: unknown) {
           calls.push('sessions.create');
-          return { id: 'sesn_new', args };
+          const id = options.sessionIds?.[createCallCount] ?? 'sesn_new';
+          createCallCount += 1;
+          return { id, args };
         },
         events: {
           async send() {
             calls.push('events.send');
+            const error = options.sendErrors?.[sendCallCount];
+            sendCallCount += 1;
+            if (error) throw error;
           },
           async stream() {
             calls.push('events.stream');
@@ -228,5 +245,61 @@ describe('orchestrateChatTurn', () => {
     expect(result.sessionId).toBe('sesn_new');
     expect(dispatcherSawSessionId).toBe('sesn_new');
     expect(calls).toEqual(['sessions.create', 'events.send', 'events.stream', 'events.send']);
+  });
+
+  it('replaces an existing thread session stuck waiting on custom tool responses', async () => {
+    const calls: string[] = [];
+    const kv = makeKv();
+    const env = {
+      ENVIRONMENT_ID: 'env_employee',
+      MAKOTO_KV: kv,
+    } as Env;
+    const senderEmail = 'alice@example.com';
+    const spaceName = 'spaces/AAA';
+    const threadName = 'spaces/AAA/threads/T4';
+    const sessionKey = chatThreadSessionKey(
+      senderEmail,
+      spaceName,
+      threadName,
+      await buildChatCapabilitySessionKey(env),
+    );
+    expect(sessionKey).not.toBeNull();
+    await kv.put(sessionKey!, 'sesn_poisoned');
+    const client = makeClient(calls, {
+      sessionIds: ['sesn_replacement'],
+      sendErrors: [
+        new Error(
+          '400 Invalid user.message event: waiting on responses to events [sevt_custom_tool]',
+        ),
+      ],
+    });
+    const resolvedSessionIds: string[] = [];
+
+    const result = await orchestrateChatTurn({
+      env,
+      client,
+      senderEmail,
+      spaceName,
+      spaceType: 'DM',
+      threadName,
+      bodyText: 'テンプレを更新して',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [],
+      },
+      personaSpec: 'persona',
+      toolsSpec: '## Drive\nstage',
+      onSessionIdResolved: (sessionId) => {
+        resolvedSessionIds.push(sessionId);
+      },
+      toolDispatcher: async () => ({ ok: true, payload: null }),
+    });
+
+    expect(result.sessionId).toBe('sesn_replacement');
+    expect(result.isNewSession).toBe(true);
+    expect(await kv.get(sessionKey!)).toBe('sesn_replacement');
+    expect(resolvedSessionIds).toEqual(['sesn_poisoned', 'sesn_replacement']);
+    expect(calls).toEqual(['events.send', 'sessions.create', 'events.send', 'events.stream']);
   });
 });
