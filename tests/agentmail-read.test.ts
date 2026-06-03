@@ -31,6 +31,7 @@ describe('agentmailRead search', () => {
       const parsed = new URL(url);
       expect(parsed.searchParams.get('limit')).toBe('10');
       expect(parsed.searchParams.get('after')).toBe('2026-06-01T00:00:00Z');
+      expect(parsed.searchParams.get('include_spam')).toBe('true');
       return jsonResponse(200, {
         messages: [
           {
@@ -57,6 +58,19 @@ describe('agentmailRead search', () => {
     const msg = (res.messages as Array<Record<string, unknown>>)[0];
     expect(msg.id).toBe('msg_1');
     expect(msg.body).toBeUndefined();
+  });
+
+  it('allows callers to opt out of spam-inclusive search', async () => {
+    const fetcher = makeFetchMock(async (url) => {
+      const parsed = new URL(url);
+      expect(parsed.searchParams.get('include_spam')).toBeNull();
+      return jsonResponse(200, { messages: [] });
+    });
+    const res = await agentmailRead(
+      { action: 'search', after: '2026-06-01T00:00:00Z', include_spam: false },
+      { ...DEPS, fetcher },
+    );
+    expect(res.count).toBe(0);
   });
 
   it('applies local from and subject filters', async () => {
