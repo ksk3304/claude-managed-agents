@@ -406,6 +406,17 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       });
       return { results: [], meta: { changes: 1 } };
     }
+    if (
+      /^SELECT session_id\s+FROM cma_session_binds\s+WHERE event_key = \?\s+ORDER BY created_at_ms DESC\s+LIMIT 1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [eventKey] = params as [string];
+      const row = [...tables.cma_session_binds]
+        .filter((r) => r.event_key === eventKey)
+        .sort((a, b) => Number(b.created_at_ms) - Number(a.created_at_ms))[0];
+      return { results: row ? [{ session_id: row.session_id }] : [] };
+    }
     if (/^INSERT INTO cma_session_payload_audit/i.test(trimmed)) {
       const [
         created_at_ms,

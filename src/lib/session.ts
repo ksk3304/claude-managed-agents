@@ -894,7 +894,7 @@ interface TimeoutRecoveryInput {
   pollMs: number;
 }
 
-interface TimeoutRecoveryResult {
+export interface TimeoutRecoveryResult {
   assistantText: string;
   terminalEventType: string;
   stopReason: string;
@@ -935,10 +935,11 @@ async function recoverCompletedTurnAfterStreamTimeout(
   return null;
 }
 
-async function readCompletedTurnFromSessionEvents(
+export async function readCompletedTurnFromSessionEvents(
   client: Anthropic,
   sessionId: string,
-  userMessageText: string,
+  userMessageText?: string,
+  userMessageMatch: 'exact' | 'contains' = 'exact',
 ): Promise<TimeoutRecoveryResult | null> {
   const eventsApi = client.beta.sessions.events as unknown as {
     list?: (
@@ -960,7 +961,14 @@ async function readCompletedTurnFromSessionEvents(
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i]!;
     if (typeof ev.type !== 'string' || ev.type !== 'user.message') continue;
-    if (userMessageContentText((ev as { content?: unknown }).content) === userMessageText) {
+    const contentText = userMessageContentText((ev as { content?: unknown }).content);
+    const matched =
+      userMessageText === undefined
+        ? true
+        : userMessageMatch === 'contains'
+          ? contentText.includes(userMessageText)
+          : contentText === userMessageText;
+    if (matched) {
       turnStart = i;
       break;
     }
