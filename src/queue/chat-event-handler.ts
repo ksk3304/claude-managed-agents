@@ -125,6 +125,7 @@ import {
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
 import {
+  readCompletedTurnFromSessionEvents,
   retrieveSessionUsageSnapshot,
   sendAndStreamWithToolDispatch,
 } from '../lib/session';
@@ -155,6 +156,7 @@ const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const CHAT_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const CHAT_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const CHAT_TURN_PROCESSING_RETRY_DELAY_SECONDS = 60;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
@@ -192,11 +194,14 @@ export const ACTION_SKILL_INTENT_TABLE: SkillsData = {
  * - `skipped` — claim 失効 / 不適合 event。caller は msg.ack() (commitDone 済 or 不要)
  * - `release_and_retry` — transient 失敗。caller は releaseClaim 済の状態で
  *   msg.retry() を呼ぶ
+ * - `retry_later` — 他 worker / CMA session が継続中。claim を触らず
+ *   delay 付き msg.retry() を呼ぶ
  */
 export type ChatEventOutcome =
   | { kind: 'committed' }
   | { kind: 'skipped'; reason: string }
-  | { kind: 'release_and_retry'; reason: string };
+  | { kind: 'release_and_retry'; reason: string }
+  | { kind: 'retry_later'; reason: string; delaySeconds: number };
 
 const PDF_PREFLIGHT_PENDING_TTL_SEC = 6 * 60 * 60;
 
@@ -578,11 +583,31 @@ export async function handleChatEvent(
     return { kind: 'release_and_retry', reason: 'chat_scope_lock_held' };
   }
 
+  const client = buildAnthropicClient(env);
+  if (client === null) {
+    console.error(`[chat-event] no Anthropic API key eventKey=${eventKey}`);
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'no_anthropic_api_key',
+      stage: 'anthropic_client_build',
+      outcome: 'skipped',
+      level: 'error',
+    });
+    return { kind: 'skipped', reason: 'no_anthropic_api_key' };
+  }
+
   let attachmentForProcessing = message.attachment ?? null;
   let pdfApprovedThroughUsdFloor: number | null = null;
   let pdfPreflightApprovalConsumed = false;
   let parentHeartbeat: LeaseHeartbeat | null = null;
   let turnProcessingClaim: { key: string; owner: string; version: number } | null = null;
+  let recoveredCompletedTurn: {
+    sessionId: string;
+    assistantText: string;
+    terminalEventType: string;
+    stopReason: string;
+  } | null = null;
 
   try {
     const turnClaim = await claimChatTurnProcessing(env, {
@@ -590,13 +615,51 @@ export async function handleChatEvent(
       messageId: message.name,
     });
     if (turnClaim.kind === 'duplicate') {
-      return { kind: 'skipped', reason: turnClaim.reason };
+      if (turnClaim.reason === 'chat_turn_processing_done') {
+        return { kind: 'skipped', reason: turnClaim.reason };
+      }
+      const recovered = await recoverCompletedBoundChatTurn(env, {
+        client,
+        eventKey,
+        messageId: message.name,
+        bodyText,
+        userSlug: userMapping.user_slug,
+      });
+      if (recovered.kind === 'completed') {
+        recoveredCompletedTurn = recovered.turn;
+      } else {
+        return {
+          kind: 'retry_later',
+          reason: recovered.reason,
+          delaySeconds: CHAT_TURN_PROCESSING_RETRY_DELAY_SECONDS,
+        };
+      }
     }
     if (turnClaim.kind === 'failed') {
       await safeRelease(env, eventKey, claim);
       return { kind: 'release_and_retry', reason: 'chat_turn_processing_claim_failed' };
     }
-    turnProcessingClaim = turnClaim.claim;
+    if (turnClaim.kind === 'claimed') {
+      turnProcessingClaim = turnClaim.claim;
+      if (turnClaim.claimState === 'TAKEOVER') {
+        const recovered = await recoverCompletedBoundChatTurn(env, {
+          client,
+          eventKey,
+          messageId: message.name,
+          bodyText,
+          userSlug: userMapping.user_slug,
+        });
+        if (recovered.kind === 'completed') {
+          recoveredCompletedTurn = recovered.turn;
+        } else if (recovered.kind === 'pending') {
+          return {
+            kind: 'retry_later',
+            reason: recovered.reason,
+            delaySeconds: CHAT_TURN_PROCESSING_RETRY_DELAY_SECONDS,
+          };
+        }
+      }
+    }
 
     parentHeartbeat = await startParentLeaseHeartbeat(env, ctx, {
       eventKey,
@@ -808,21 +871,6 @@ export async function handleChatEvent(
         `[chat-event] schedule intent detected eventKey=${eventKey} command=${intent.command}`,
       );
     }
-  }
-
-  // ---- 6. orchestrate session ----
-  const client = buildAnthropicClient(env);
-  if (client === null) {
-    console.error(`[chat-event] no Anthropic API key eventKey=${eventKey}`);
-    await safeCommit(env, eventKey, claim, {
-      messageId: message.name,
-      userSlug: userMapping.user_slug,
-      reason: 'no_anthropic_api_key',
-      stage: 'anthropic_client_build',
-      outcome: 'skipped',
-      level: 'error',
-    });
-    return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
 
   // ---- 6-pre. attachment processing (Issue #186 既知 #1 + O) ----
@@ -1135,57 +1183,77 @@ export async function handleChatEvent(
   const sessionOutputMinCreatedAtMs = Date.now() - 60_000;
   try {
     try {
-      const orchestrated = await orchestrateChatTurn({
-        env,
-        client,
-        senderEmail,
-        spaceName,
-        spaceType,
-        threadName,
-        bodyText,
-        userMapping,
-        personaSpec: PERSONA_SPEC,
-        toolsSpec: TOOLS_SPEC,
-        extraContentBlocks,
-        ...(historyBlock ? { historyBlock } : {}),
-        ...(intent
-          ? {
-              intent: {
-                command: intent.command,
-                ...(intent.source ? { source: intent.source } : {}),
-                isActionSkill: intent.isActionSkill,
-              },
-            }
-          : {}),
-        toolDispatcher: (toolName, toolInput) =>
-          actorTrusted
-            ? dispatchMakotoTool(toolName, toolInput, {
-                env,
-                userSlug: userMapping.user_slug,
-                boundMessageId: '',
-                callerSessionId: sessionIdRef.current,
-                currentSpaceName: spaceName,
-                currentThreadName: threadName ?? undefined,
-                anthropic: client,
-              })
-            : gateExternalToolCall(env, {
-                eventKey,
-                messageId: message.name,
-                userSlug: userMapping.user_slug,
-                toolName,
-              }),
-        eventKey,
-        messageId: message.name,
-        onSessionIdResolved: (resolvedSessionId) => {
-          sessionIdRef.current = resolvedSessionId;
-        },
-        // Issue #208: mail skill は既存社員 agent / session へ統合するため
-        // forceFreshSession しない。その他 action skill は従来通り bypass。
-        forceFreshSession,
-        timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
-          ? MORNING_BRIEF_STREAM_TIMEOUT_MS
-          : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
-      });
+      let orchestrated:
+        | Awaited<ReturnType<typeof orchestrateChatTurn>>
+        | {
+            sessionId: string;
+            assistantText: string;
+            stopReason?: string;
+            toolUseCount: number;
+            toolUseNames: string[];
+          };
+      if (recoveredCompletedTurn) {
+        orchestrated = {
+          sessionId: recoveredCompletedTurn.sessionId,
+          assistantText: recoveredCompletedTurn.assistantText,
+          stopReason: recoveredCompletedTurn.stopReason,
+          toolUseCount: 0,
+          toolUseNames: [],
+        };
+        sessionIdRef.current = recoveredCompletedTurn.sessionId;
+      } else {
+        orchestrated = await orchestrateChatTurn({
+          env,
+          client,
+          senderEmail,
+          spaceName,
+          spaceType,
+          threadName,
+          bodyText,
+          userMapping,
+          personaSpec: PERSONA_SPEC,
+          toolsSpec: TOOLS_SPEC,
+          extraContentBlocks,
+          ...(historyBlock ? { historyBlock } : {}),
+          ...(intent
+            ? {
+                intent: {
+                  command: intent.command,
+                  ...(intent.source ? { source: intent.source } : {}),
+                  isActionSkill: intent.isActionSkill,
+                },
+              }
+            : {}),
+          toolDispatcher: (toolName, toolInput) =>
+            actorTrusted
+              ? dispatchMakotoTool(toolName, toolInput, {
+                  env,
+                  userSlug: userMapping.user_slug,
+                  boundMessageId: '',
+                  callerSessionId: sessionIdRef.current,
+                  currentSpaceName: spaceName,
+                  currentThreadName: threadName ?? undefined,
+                  anthropic: client,
+                })
+              : gateExternalToolCall(env, {
+                  eventKey,
+                  messageId: message.name,
+                  userSlug: userMapping.user_slug,
+                  toolName,
+                }),
+          eventKey,
+          messageId: message.name,
+          onSessionIdResolved: (resolvedSessionId) => {
+            sessionIdRef.current = resolvedSessionId;
+          },
+          // Issue #208: mail skill は既存社員 agent / session へ統合するため
+          // forceFreshSession しない。その他 action skill は従来通り bypass。
+          forceFreshSession,
+          timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+            ? MORNING_BRIEF_STREAM_TIMEOUT_MS
+            : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
+        });
+      }
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
@@ -2732,7 +2800,11 @@ export function chatTurnProcessingKey(eventKey: string): string {
 }
 
 type ChatTurnProcessingClaimResult =
-  | { kind: 'claimed'; claim: { key: string; owner: string; version: number } }
+  | {
+      kind: 'claimed';
+      claimState: 'NEW' | 'TAKEOVER';
+      claim: { key: string; owner: string; version: number };
+    }
   | { kind: 'duplicate'; reason: 'chat_turn_processing_alive' | 'chat_turn_processing_done' }
   | { kind: 'failed' };
 
@@ -2755,7 +2827,11 @@ async function claimChatTurnProcessing(
           source: 'chat-event-handler',
           detail: { claim_state: claim.state, lease_ttl_ms: CHAT_EVENT_LEASE_TTL_MS },
         });
-        return { kind: 'claimed', claim: { key, owner: claim.owner, version: claim.version } };
+        return {
+          kind: 'claimed',
+          claimState: claim.state,
+          claim: { key, owner: claim.owner, version: claim.version },
+        };
       }
       return { kind: 'failed' };
     }
@@ -2782,6 +2858,116 @@ async function claimChatTurnProcessing(
       detail: { error: err instanceof Error ? err.message : String(err) },
     });
     return { kind: 'failed' };
+  }
+}
+
+type CompletedBoundChatTurnRecovery =
+  | {
+      kind: 'completed';
+      turn: {
+        sessionId: string;
+        assistantText: string;
+        terminalEventType: string;
+        stopReason: string;
+      };
+    }
+  | {
+      kind: 'pending' | 'missing' | 'error';
+      reason:
+        | 'chat_turn_processing_alive'
+        | 'cma_session_bind_missing'
+        | 'cma_session_not_completed'
+        | 'cma_session_recovery_error';
+    };
+
+async function recoverCompletedBoundChatTurn(
+  env: Env,
+  input: {
+    client: import('@anthropic-ai/sdk').default | null;
+    eventKey: string;
+    messageId: string;
+    bodyText: string;
+    userSlug: string;
+  },
+): Promise<CompletedBoundChatTurnRecovery> {
+  if (!input.client) {
+    return { kind: 'pending', reason: 'chat_turn_processing_alive' };
+  }
+  try {
+    const bind = await env.DB
+      .prepare(
+        `SELECT session_id
+           FROM cma_session_binds
+          WHERE event_key = ?
+          ORDER BY created_at_ms DESC
+          LIMIT 1`,
+      )
+      .bind(input.eventKey)
+      .first<{ session_id: string }>();
+    const sessionId = bind?.session_id?.trim();
+    if (!sessionId) {
+      await recordRuntimeEvent(env, {
+        eventKey: input.eventKey,
+        messageId: input.messageId,
+        userSlug: input.userSlug,
+        eventType: 'cma_bound_session_recovery_wait',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { reason: 'cma_session_bind_missing' },
+      });
+      return { kind: 'missing', reason: 'cma_session_bind_missing' };
+    }
+
+    const completed = await readCompletedTurnFromSessionEvents(
+      input.client,
+      sessionId,
+    );
+    if (!completed) {
+      await recordRuntimeEvent(env, {
+        eventKey: input.eventKey,
+        sessionId,
+        messageId: input.messageId,
+        userSlug: input.userSlug,
+        eventType: 'cma_bound_session_recovery_wait',
+        source: 'chat-event-handler',
+        detail: { reason: 'cma_session_not_completed' },
+      });
+      return { kind: 'pending', reason: 'cma_session_not_completed' };
+    }
+
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      sessionId,
+      messageId: input.messageId,
+      userSlug: input.userSlug,
+      eventType: 'cma_completed_session_recovered',
+      source: 'chat-event-handler',
+      detail: {
+        assistant_chars: completed.assistantText.length,
+        terminal_event_type: completed.terminalEventType,
+        stop_reason: completed.stopReason,
+      },
+    });
+    return {
+      kind: 'completed',
+      turn: {
+        sessionId,
+        assistantText: completed.assistantText,
+        terminalEventType: completed.terminalEventType,
+        stopReason: completed.stopReason,
+      },
+    };
+  } catch (err) {
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      userSlug: input.userSlug,
+      eventType: 'cma_bound_session_recovery_error',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return { kind: 'error', reason: 'cma_session_recovery_error' };
   }
 }
 
@@ -3276,6 +3462,14 @@ export async function handleChatQueue(
           `[chat-event] release_and_retry eventKey=${msg.body?.eventKey} reason=${outcome.reason}`,
         );
         msg.retry();
+        continue;
+      }
+      if (outcome.kind === 'retry_later') {
+        console.warn(
+          `[chat-event] retry_later eventKey=${msg.body?.eventKey} ` +
+            `reason=${outcome.reason} delay=${outcome.delaySeconds}s`,
+        );
+        msg.retry({ delaySeconds: outcome.delaySeconds });
         continue;
       }
       msg.ack();

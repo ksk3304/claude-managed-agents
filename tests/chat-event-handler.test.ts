@@ -214,6 +214,7 @@ interface FakeAnthOpts {
   retrieveUsage?: Record<string, unknown>;
   retrieveModel?: string;
   sendCapturePayloads?: unknown[];
+  listEvents?: Array<Record<string, unknown>>;
   // Capture memory store list/retrieve/create/update calls for session-log
   memoryListReturns?: AsyncIterable<Record<string, unknown>>;
   memoryRetrieveContent?: string;
@@ -249,6 +250,9 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
   async function* emptyMemList(): AsyncIterable<Record<string, unknown>> {
     // nothing
   }
+  async function* sessionEventList(): AsyncIterable<Record<string, unknown>> {
+    for (const ev of opts.listEvents ?? []) yield ev;
+  }
   return {
     beta: {
       sessions: {
@@ -276,6 +280,9 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
             const callIndex = streamCallCount;
             streamCallCount += 1;
             return streamForCall(callIndex);
+          },
+          list(_sessionId: string, _o: unknown) {
+            return sessionEventList();
           },
         },
       },
@@ -587,7 +594,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches.at(-1)?.text).toContain('通常応答です。');
   });
 
-  it('duplicate Queue redelivery skips before sending another user.message into CMA', async () => {
+  it('duplicate Queue redelivery waits without sending another user.message while CMA session is still running', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({ text: '130秒待ってから返答して' });
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -606,7 +613,11 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
 
-    expect(result).toEqual({ kind: 'skipped', reason: 'chat_turn_processing_alive' });
+    expect(result).toEqual({
+      kind: 'retry_later',
+      reason: 'cma_session_bind_missing',
+      delaySeconds: 60,
+    });
     expect(createCapture).toEqual([]);
     expect(chatApiMock.posts).toHaveLength(0);
     expect(chatApiMock.patches).toHaveLength(0);
@@ -614,6 +625,63 @@ describe('handleChatEvent', () => {
       (row) => row.event_type === 'chat_turn_processing_duplicate_suppressed',
     );
     expect(duplicateEvent).toBeDefined();
+  });
+
+  it('duplicate Queue redelivery recovers a completed CMA session and posts the final answer', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '130秒待ってから返答して' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await preClaim(env, chatTurnProcessingKey(msg.eventKey), 'other-consumer');
+    await putMapping(env, 'alice@example.com');
+    await env.DB
+      .prepare(
+        `INSERT INTO cma_session_binds
+         (created_at_ms, expire_at_ms, session_key_hash, session_id, event_key,
+          message_id, user_slug, thread_name_hash, is_new_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+      )
+      .bind(
+        Date.now(),
+        Date.now() + 86_400_000,
+        'hash',
+        'sesn_recover_done',
+        msg.eventKey,
+        msg.payload.message.name,
+        'alice',
+        'thread_hash',
+        1,
+      )
+      .run();
+    const createCapture: unknown[] = [];
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_start',
+      createCapture,
+      events: [
+        { type: 'agent.message.text', text: '二重実行してはいけない' },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+      listEvents: [
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: `前置き\n${msg.payload.message.text}\n後続` }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'CMA完了済みの最終回答です。' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(createCapture).toEqual([]);
+    expect(chatApiMock.patches.at(-1)?.text).toContain('CMA完了済みの最終回答です。');
+    expect(runtimeEvents(env).map((row) => row.event_type)).toContain(
+      'cma_completed_session_recovered',
+    );
   });
 
   it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
