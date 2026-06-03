@@ -60,6 +60,21 @@ describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
       .map((tool) => tool.name);
     expect(customToolNames.sort()).toEqual([...MAKOTO_TOOL_NAMES].sort());
   });
+  it('chat_list_space_members is exposed as an optional-input custom tool', () => {
+    const tool = MAKOTO_AGENT_TOOLS.find(
+      (candidate) => candidate.type === 'custom' && candidate.name === 'chat_list_space_members',
+    ) as Record<string, unknown> | undefined;
+    expect(tool).toBeDefined();
+    expect(tool!.description).toContain('Google Chat space members');
+    expect(tool!.input_schema).toMatchObject({
+      type: 'object',
+      properties: {
+        space_name: { type: 'string' },
+        limit: { type: 'integer' },
+      },
+      required: [],
+    });
+  });
 });
 
 describe('dispatchMakotoTool error envelopes', () => {

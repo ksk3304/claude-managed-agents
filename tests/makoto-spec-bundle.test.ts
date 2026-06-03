@@ -98,4 +98,12 @@ describe('makoto-prime spec bundle (generated src/data/*.ts)', () => {
     expect(r.systemPrompt).toContain('`slash_skills` と `attached_skills`');
     expect(r.systemPrompt).toContain('`drive_stage_file` custom tool');
   });
+
+  it('Google Chat roster lookup instructions are bundled for LLM-side tool use', async () => {
+    const r = await buildMakotoSystemPrompt(PERSONA_SPEC, TOOLS_SPEC);
+    expect(r.systemPrompt).toContain('## Google Chat 名簿参照能力');
+    expect(r.systemPrompt).toContain('`chat_list_space_members` custom tool');
+    expect(r.systemPrompt).toContain('Worker は毎ターン名簿を自動注入しません');
+    expect(r.systemPrompt).toContain('{"space_name":"spaces/AAA...","limit":50}');
+  });
 });
