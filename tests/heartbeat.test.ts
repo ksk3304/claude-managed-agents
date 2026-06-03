@@ -226,6 +226,64 @@ describe('heartbeat scheduled enqueue', () => {
       globalThis.fetch = origFetch;
     }
   });
+
+  it('hydrates matched mail replies when listMessages omits body text', async () => {
+    const env = envWithQueue({
+      HEARTBEAT_ENABLED: '1',
+      AGENTMAIL_API_KEY: 'am_test',
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_test',
+    } as Partial<Env>);
+    addAsyncWaitTask(env);
+    const calls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/messages?')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                id: 'msg_bob',
+                from: 'bob@example.com',
+                subject: 'Re: ヒアリング',
+                received_at: '2026-06-03T07:12:00Z',
+              },
+              {
+                id: 'msg_alice',
+                from: 'Alice <alice@example.com>',
+                subject: 'Re: ヒアリング',
+                received_at: '2026-06-03T07:10:00Z',
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/messages/msg_bob')) {
+        return new Response(JSON.stringify({ extracted_text: 'Bob hydrated answer' }), {
+          status: 200,
+        });
+      }
+      if (url.endsWith('/messages/msg_alice')) {
+        return new Response(JSON.stringify({ extracted_text: 'Alice hydrated answer' }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({ error: 'unexpected test url' }), { status: 404 });
+    }) as typeof fetch;
+    try {
+      const result = await runHeartbeatTick(env, Date.parse('2026-06-03T08:00:00.000Z'));
+      expect(result).toEqual({ kind: 'completed', checked: 1, enqueued: 1, skipped: 0 });
+      expect(calls.some((url) => url.endsWith('/messages/msg_alice'))).toBe(true);
+      expect(calls.some((url) => url.endsWith('/messages/msg_bob'))).toBe(true);
+      const sent = env.MAKOTO_CHAT_QUEUE._sent[0]!;
+      expect(sent.payload.message?.text).toContain('Alice hydrated answer');
+      expect(sent.payload.message?.text).toContain('Bob hydrated answer');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });
 
 describe('heartbeat helpers', () => {
