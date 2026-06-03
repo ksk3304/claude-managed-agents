@@ -98,6 +98,8 @@ declare namespace Cloudflare {
     MAKOTO_DEBUG_TOKEN?: string;
     /** Temporary smoke token for issue-specific live verification. */
     MAKOTO_ISSUE250_SMOKE_TOKEN?: string;
+    /** Opt-in kill switch for Issue #245 heartbeat cron. Default unset/off. */
+    HEARTBEAT_ENABLED?: string;
 
     /**
      * Optional default user_slug for the Chat reactive path. When set,
