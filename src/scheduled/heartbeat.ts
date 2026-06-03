@@ -1,6 +1,8 @@
 import type { ChatEventPayload, ChatQueueMessage } from '../webhooks/google-chat';
 import { newClaimOwner, releaseClaim, tryClaim } from '../lib/dedupe';
 import { recordRuntimeEvent } from '../lib/observability';
+import { AgentMailClient } from '../lib/agentmail-api';
+import type { AgentMailMessage } from '../types/agentmail';
 
 export const HEARTBEAT_CRON = '*/30 * * * *';
 export const HEARTBEAT_JOB_ID = 'heartbeat_tick';
@@ -20,6 +22,17 @@ export interface HeartbeatTaskRow {
   target_scope: 'dm' | 'shared' | string;
   enabled: number;
   last_run_at: number | null;
+  status?: string | null;
+  stage?: string | null;
+  waiting_for?: string | null;
+  next_check_at?: number | null;
+  last_progress_at?: number | null;
+  attempt_count?: number | null;
+  stop_reason?: string | null;
+  thread_ref?: string | null;
+  user_visible_status?: string | null;
+  created_at?: number | null;
+  updated_at?: number | null;
 }
 
 export interface HeartbeatTickResult {
@@ -36,7 +49,8 @@ export interface HeartbeatEnqueueResult {
     | 'lease_alive'
     | 'failed'
     | 'unsupported_target'
-    | 'missing_target_space';
+    | 'missing_target_space'
+    | 'not_ready';
   eventKey: string;
 }
 
@@ -57,7 +71,10 @@ export async function runHeartbeatTick(
   let enqueued = 0;
   let skipped = candidates.length - due.length;
   for (const task of due) {
-    const result = await enqueueHeartbeatTask(env, task, nowMs);
+    const result =
+      task.kind === 'async_wait'
+        ? await processAsyncWaitTask(env, task, nowMs)
+        : await enqueueHeartbeatTask(env, task, nowMs);
     if (result.kind === 'enqueued') enqueued += 1;
     else skipped += 1;
   }
@@ -70,6 +87,47 @@ export async function runHeartbeatTick(
   });
 
   return { kind: 'completed', checked: candidates.length, enqueued, skipped };
+}
+
+export async function processAsyncWaitTask(
+  env: Env,
+  task: HeartbeatTaskRow,
+  nowMs: number = Date.now(),
+): Promise<HeartbeatEnqueueResult> {
+  const eventKey = heartbeatEventKey(task.task_id, nowMs);
+  if (task.target_scope !== 'dm') return { kind: 'unsupported_target', eventKey };
+  if (!task.target_space_name) return { kind: 'missing_target_space', eventKey };
+  if ((task.waiting_for ?? '').trim() !== 'mail_reply') {
+    await markAsyncWaitNotReady(env.DB, task, nowMs, 'unsupported waiting_for');
+    return { kind: 'not_ready', eventKey };
+  }
+
+  const state = await inspectMailReplyWait(env, task, nowMs);
+  if (!state.ready) {
+    await markAsyncWaitNotReady(env.DB, task, nowMs, state.statusText);
+    await recordRuntimeEvent(env, {
+      eventKey,
+      eventType: 'scheduled_heartbeat_async_wait_pending',
+      source: 'cron.heartbeat',
+      detail: {
+        task_id: task.task_id,
+        waiting_for: task.waiting_for,
+        matched: state.matched.length,
+        expected: state.expected.length,
+        status: state.statusText,
+      },
+    });
+    return { kind: 'not_ready', eventKey };
+  }
+
+  const result = await enqueueHeartbeatTask(env, {
+    ...task,
+    prompt: buildAsyncWaitResumePrompt(task, state),
+  }, nowMs);
+  if (result.kind === 'enqueued') {
+    await markAsyncWaitDone(env.DB, task.task_id, nowMs, state.statusText);
+  }
+  return result;
 }
 
 export async function enqueueHeartbeatTask(
@@ -191,12 +249,22 @@ async function selectDueHeartbeatTasks(db: D1Database, nowMs: number): Promise<H
   const result = await db
     .prepare(
       `SELECT task_id, owner_user_id, target_space_name, kind, prompt, interval_min,
-              active_hours, target_scope, enabled, last_run_at
+              active_hours, target_scope, enabled, last_run_at, status, stage,
+              waiting_for, next_check_at, last_progress_at, attempt_count,
+              stop_reason, thread_ref, user_visible_status
          FROM heartbeat_tasks
         WHERE enabled = 1
-          AND kind = 'patrol'
-          AND (last_run_at IS NULL OR ?1 - last_run_at >= interval_min * 60000)
-        ORDER BY COALESCE(last_run_at, 0), task_id
+          AND (
+            (kind = 'patrol'
+             AND (last_run_at IS NULL OR ?1 - last_run_at >= interval_min * 60000))
+            OR
+            (kind = 'async_wait'
+             AND status IN ('open', 'waiting')
+             AND waiting_for = 'mail_reply'
+             AND next_check_at IS NOT NULL
+             AND next_check_at <= ?1)
+          )
+        ORDER BY COALESCE(next_check_at, last_run_at, 0), task_id
         LIMIT ?2`,
     )
     .bind(nowMs, MAX_TASKS_PER_TICK)
@@ -209,6 +277,190 @@ async function markHeartbeatTaskRun(db: D1Database, taskId: string, nowMs: numbe
     .prepare(`UPDATE heartbeat_tasks SET last_run_at = ?2, updated_at = ?2 WHERE task_id = ?1`)
     .bind(taskId, nowMs)
     .run();
+}
+
+async function markAsyncWaitNotReady(
+  db: D1Database,
+  task: HeartbeatTaskRow,
+  nowMs: number,
+  statusText: string,
+): Promise<void> {
+  const nextCheckAt = nowMs + Math.max(1, Number(task.interval_min || 30)) * 60_000;
+  await db
+    .prepare(
+      `UPDATE heartbeat_tasks
+          SET status = 'waiting',
+              next_check_at = ?2,
+              last_run_at = ?3,
+              updated_at = ?3,
+              attempt_count = COALESCE(attempt_count, 0) + 1,
+              user_visible_status = ?4
+        WHERE task_id = ?1`,
+    )
+    .bind(task.task_id, nextCheckAt, nowMs, statusText.slice(0, 500))
+    .run();
+}
+
+async function markAsyncWaitDone(
+  db: D1Database,
+  taskId: string,
+  nowMs: number,
+  statusText: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE heartbeat_tasks
+          SET status = 'done',
+              enabled = 0,
+              last_run_at = ?2,
+              last_progress_at = ?2,
+              updated_at = ?2,
+              user_visible_status = ?3
+        WHERE task_id = ?1`,
+    )
+    .bind(taskId, nowMs, statusText.slice(0, 500))
+    .run();
+}
+
+interface MailReplyWaitRef {
+  inbox_id?: string;
+  expected_from?: string[];
+  since_ms?: number;
+  subject_contains?: string;
+}
+
+interface MailReplyMatch {
+  expected: string;
+  from: string;
+  subject: string;
+  body: string;
+  received_at: string;
+}
+
+interface MailReplyWaitState {
+  ready: boolean;
+  expected: string[];
+  matched: MailReplyMatch[];
+  missing: string[];
+  statusText: string;
+}
+
+async function inspectMailReplyWait(
+  env: Env,
+  task: HeartbeatTaskRow,
+  nowMs: number,
+): Promise<MailReplyWaitState> {
+  const ref = parseMailReplyWaitRef(task.thread_ref);
+  const inboxId = ref.inbox_id || env.AGENTMAIL_DEFAULT_INBOX_ID || '';
+  const expected = (ref.expected_from ?? [])
+    .map((value) => normalizeEmail(value))
+    .filter(Boolean);
+  if (!env.AGENTMAIL_API_KEY || !inboxId || expected.length === 0) {
+    return {
+      ready: false,
+      expected,
+      matched: [],
+      missing: expected,
+      statusText: 'mail_reply wait not configured',
+    };
+  }
+
+  const client = new AgentMailClient(
+    env.AGENTMAIL_API_KEY,
+    env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {},
+  );
+  const sinceMs = Number(ref.since_ms ?? task.last_progress_at ?? task.created_at ?? 0);
+  const after = Number.isFinite(sinceMs) && sinceMs > 0 ? new Date(sinceMs).toISOString() : undefined;
+  const listed = await client.listMessages(inboxId, {
+    limit: 100,
+    after,
+    includeSpam: true,
+    includeBlocked: true,
+    includeUnauthenticated: true,
+  });
+  const matches = matchExpectedReplies(expected, listed.messages, ref.subject_contains);
+  const matchedSet = new Set(matches.map((match) => match.expected));
+  const missing = expected.filter((email) => !matchedSet.has(email));
+  return {
+    ready: expected.length > 0 && missing.length === 0,
+    expected,
+    matched: matches,
+    missing,
+    statusText:
+      missing.length === 0
+        ? `mail replies ready (${matches.length}/${expected.length})`
+        : `waiting for mail replies (${matches.length}/${expected.length})`,
+  };
+}
+
+function parseMailReplyWaitRef(raw: string | null | undefined): MailReplyWaitRef {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as MailReplyWaitRef;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function matchExpectedReplies(
+  expected: string[],
+  messages: AgentMailMessage[],
+  subjectContains: string | undefined,
+): MailReplyMatch[] {
+  const matches = new Map<string, MailReplyMatch>();
+  const subjectNeedle = (subjectContains ?? '').trim().toLowerCase();
+  for (const message of messages) {
+    const from = normalizeEmail(String(message.from ?? ''));
+    if (!from) continue;
+    const expectedEmail = expected.find((email) => email === from);
+    if (!expectedEmail || matches.has(expectedEmail)) continue;
+    const subject = String(message.subject ?? '');
+    if (subjectNeedle && !subject.toLowerCase().includes(subjectNeedle)) continue;
+    matches.set(expectedEmail, {
+      expected: expectedEmail,
+      from,
+      subject,
+      body: String(message.extracted_text ?? message.text ?? '').trim().slice(0, 2000),
+      received_at: String(message.received_at ?? ''),
+    });
+  }
+  return [...matches.values()];
+}
+
+function buildAsyncWaitResumePrompt(task: HeartbeatTaskRow, state: MailReplyWaitState): string {
+  const replies = state.matched
+    .map((match, index) =>
+      [
+        `## 返信 ${index + 1}`,
+        `from: ${match.from}`,
+        `subject: ${match.subject || '(no subject)'}`,
+        `received_at: ${match.received_at || '(unknown)'}`,
+        '',
+        match.body || '(本文なし)',
+      ].join('\n'),
+    )
+    .join('\n\n');
+  return `${task.prompt.trim()}
+
+# 非同期継続
+待っていたメール返信が揃いました。以下の返信内容を元に、本人DMへ短く集計・次アクション案を出してください。
+
+期待返信者:
+${state.expected.map((email) => `- ${email}`).join('\n')}
+
+${replies}
+
+# 制約
+- メール送信、共有スペース投稿、外部変更は勝手に実行しない。
+- 未確認事項があれば「確認したいこと」として書く。
+- 内部状態・task id・実装事情は書かない。`;
+}
+
+function normalizeEmail(value: string): string {
+  const match = value.match(/<([^>]+)>/);
+  const raw = (match?.[1] ?? value).trim().toLowerCase();
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw) ? raw : '';
 }
 
 function heartbeatPrompt(prompt: string): string {

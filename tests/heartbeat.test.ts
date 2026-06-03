@@ -46,6 +46,25 @@ function addTask(env: Env, patch: Partial<HeartbeatTaskRow> = {}): HeartbeatTask
   return row;
 }
 
+function addAsyncWaitTask(env: Env, patch: Partial<HeartbeatTaskRow> = {}): HeartbeatTaskRow {
+  return addTask(env, {
+    task_id: 'takei_mail_collect',
+    kind: 'async_wait',
+    prompt: '3人からの返信を集計して、次アクション案を出す',
+    interval_min: 30,
+    status: 'waiting',
+    waiting_for: 'mail_reply',
+    next_check_at: Date.parse('2026-06-03T08:00:00.000Z'),
+    thread_ref: JSON.stringify({
+      inbox_id: 'inbox_test',
+      expected_from: ['alice@example.com', 'bob@example.com'],
+      since_ms: Date.parse('2026-06-03T07:00:00.000Z'),
+      subject_contains: 'ヒアリング',
+    }),
+    ...patch,
+  });
+}
+
 describe('heartbeat scheduled enqueue', () => {
   it('uses a 30 minute Cloudflare cron expression', () => {
     expect(HEARTBEAT_CRON).toBe('*/30 * * * *');
@@ -120,6 +139,92 @@ describe('heartbeat scheduled enqueue', () => {
     expect((await enqueueHeartbeatTask(env, noSpace)).kind).toBe('missing_target_space');
     expect((await enqueueHeartbeatTask(env, shared)).kind).toBe('unsupported_target');
     expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(0);
+  });
+
+  it('async_wait mail_reply stays silent until all expected replies arrive', async () => {
+    const env = envWithQueue({
+      HEARTBEAT_ENABLED: '1',
+      AGENTMAIL_API_KEY: 'am_test',
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_test',
+    } as Partial<Env>);
+    addAsyncWaitTask(env);
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: 'msg_alice',
+              from: 'Alice <alice@example.com>',
+              subject: 'Re: ヒアリング',
+              extracted_text: 'Alice answer',
+              received_at: '2026-06-03T07:10:00Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    try {
+      const result = await runHeartbeatTick(env, Date.parse('2026-06-03T08:00:00.000Z'));
+      expect(result).toEqual({ kind: 'completed', checked: 1, enqueued: 0, skipped: 1 });
+      expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(0);
+      const row = (env.DB as unknown as { _tables: { heartbeat_tasks: Map<string, HeartbeatTaskRow> } })
+        ._tables.heartbeat_tasks.get('takei_mail_collect')!;
+      expect(row.status).toBe('waiting');
+      expect(row.attempt_count).toBe(1);
+      expect(row.user_visible_status).toContain('waiting for mail replies (1/2)');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('async_wait mail_reply enqueues an aggregate turn once all replies arrive', async () => {
+    const env = envWithQueue({
+      HEARTBEAT_ENABLED: '1',
+      AGENTMAIL_API_KEY: 'am_test',
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_test',
+    } as Partial<Env>);
+    addAsyncWaitTask(env);
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: 'msg_bob',
+              from: 'bob@example.com',
+              subject: 'Re: ヒアリング',
+              extracted_text: 'Bob answer',
+              received_at: '2026-06-03T07:12:00Z',
+            },
+            {
+              id: 'msg_alice',
+              from: 'Alice <alice@example.com>',
+              subject: 'Re: ヒアリング',
+              extracted_text: 'Alice answer',
+              received_at: '2026-06-03T07:10:00Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    try {
+      const result = await runHeartbeatTick(env, Date.parse('2026-06-03T08:00:00.000Z'));
+      expect(result).toEqual({ kind: 'completed', checked: 1, enqueued: 1, skipped: 0 });
+      expect(env.MAKOTO_CHAT_QUEUE._sent).toHaveLength(1);
+      const sent = env.MAKOTO_CHAT_QUEUE._sent[0]!;
+      expect(sent.eventKey).toContain('scheduled:heartbeat_tick:takei_mail_collect:');
+      expect(sent.payload.message?.text).toContain('待っていたメール返信が揃いました');
+      expect(sent.payload.message?.text).toContain('Alice answer');
+      expect(sent.payload.message?.text).toContain('Bob answer');
+      const row = (env.DB as unknown as { _tables: { heartbeat_tasks: Map<string, HeartbeatTaskRow> } })
+        ._tables.heartbeat_tasks.get('takei_mail_collect')!;
+      expect(row.status).toBe('done');
+      expect(row.enabled).toBe(0);
+      expect(row.user_visible_status).toContain('mail replies ready (2/2)');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });
 

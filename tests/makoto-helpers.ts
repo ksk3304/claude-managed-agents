@@ -183,21 +183,30 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
 
     // ----- heartbeat_tasks -----
     if (
-      /^SELECT task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at FROM heartbeat_tasks WHERE enabled = 1 AND kind = 'patrol' AND \(last_run_at IS NULL OR \?1 - last_run_at >= interval_min \* 60000\) ORDER BY COALESCE\(last_run_at, 0\), task_id LIMIT \?2$/i.test(
+      /^SELECT task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at, status, stage, waiting_for, next_check_at, last_progress_at, attempt_count, stop_reason, thread_ref, user_visible_status FROM heartbeat_tasks WHERE enabled = 1 AND \(\s*\(kind = 'patrol' AND \(last_run_at IS NULL OR \?1 - last_run_at >= interval_min \* 60000\)\)\s*OR\s*\(kind = 'async_wait' AND status IN \('open', 'waiting'\) AND waiting_for = 'mail_reply' AND next_check_at IS NOT NULL AND next_check_at <= \?1\)\s*\) ORDER BY COALESCE\(next_check_at, last_run_at, 0\), task_id LIMIT \?2$/i.test(
         trimmed,
       )
     ) {
       const [nowMs, limit] = params as [number, number];
       const results = [...tables.heartbeat_tasks.values()]
         .filter((row) => Number(row.enabled) === 1)
-        .filter((row) => row.kind === 'patrol')
         .filter((row) => {
-          if (row.last_run_at === null || row.last_run_at === undefined) return true;
-          return Number(nowMs) - Number(row.last_run_at) >= Number(row.interval_min) * 60_000;
+          if (row.kind === 'patrol') {
+            if (row.last_run_at === null || row.last_run_at === undefined) return true;
+            return Number(nowMs) - Number(row.last_run_at) >= Number(row.interval_min) * 60_000;
+          }
+          return (
+            row.kind === 'async_wait' &&
+            (row.status === 'open' || row.status === 'waiting') &&
+            row.waiting_for === 'mail_reply' &&
+            row.next_check_at !== null &&
+            row.next_check_at !== undefined &&
+            Number(row.next_check_at) <= Number(nowMs)
+          );
         })
         .sort((a, b) => {
-          const aLast = a.last_run_at === null || a.last_run_at === undefined ? 0 : Number(a.last_run_at);
-          const bLast = b.last_run_at === null || b.last_run_at === undefined ? 0 : Number(b.last_run_at);
+          const aLast = Number(a.next_check_at ?? a.last_run_at ?? 0);
+          const bLast = Number(b.next_check_at ?? b.last_run_at ?? 0);
           if (aLast !== bLast) return aLast - bLast;
           return String(a.task_id).localeCompare(String(b.task_id));
         })
@@ -214,6 +223,38 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       if (!row) return { results: [], meta: { changes: 0 } };
       row.last_run_at = nowMs;
       row.updated_at = nowMs;
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (
+      /^UPDATE heartbeat_tasks SET status = 'waiting', next_check_at = \?2, last_run_at = \?3, updated_at = \?3, attempt_count = COALESCE\(attempt_count, 0\) \+ 1, user_visible_status = \?4 WHERE task_id = \?1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [taskId, nextCheckAt, nowMs, statusText] = params as [string, number, number, string];
+      const row = tables.heartbeat_tasks.get(taskId);
+      if (!row) return { results: [], meta: { changes: 0 } };
+      row.status = 'waiting';
+      row.next_check_at = nextCheckAt;
+      row.last_run_at = nowMs;
+      row.updated_at = nowMs;
+      row.attempt_count = Number(row.attempt_count ?? 0) + 1;
+      row.user_visible_status = statusText;
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (
+      /^UPDATE heartbeat_tasks SET status = 'done', enabled = 0, last_run_at = \?2, last_progress_at = \?2, updated_at = \?2, user_visible_status = \?3 WHERE task_id = \?1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [taskId, nowMs, statusText] = params as [string, number, string];
+      const row = tables.heartbeat_tasks.get(taskId);
+      if (!row) return { results: [], meta: { changes: 0 } };
+      row.status = 'done';
+      row.enabled = 0;
+      row.last_run_at = nowMs;
+      row.last_progress_at = nowMs;
+      row.updated_at = nowMs;
+      row.user_visible_status = statusText;
       return { results: [], meta: { changes: 1 } };
     }
 
