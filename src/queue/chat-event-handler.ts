@@ -88,7 +88,7 @@ import {
   recordChatPost,
   resolveSessionCostGuardConfig,
 } from '../lib/cost-guard';
-import { confirmOwner, commitDone, releaseClaim } from '../lib/dedupe';
+import { confirmOwner, commitDone, newClaimOwner, releaseClaim, tryClaim } from '../lib/dedupe';
 import { getThreadLock } from '../durable-objects/thread-lock';
 import {
   resolveCapRecoveryConfig,
@@ -582,8 +582,22 @@ export async function handleChatEvent(
   let pdfApprovedThroughUsdFloor: number | null = null;
   let pdfPreflightApprovalConsumed = false;
   let parentHeartbeat: LeaseHeartbeat | null = null;
+  let turnProcessingClaim: { key: string; owner: string; version: number } | null = null;
 
   try {
+    const turnClaim = await claimChatTurnProcessing(env, {
+      eventKey,
+      messageId: message.name,
+    });
+    if (turnClaim.kind === 'duplicate') {
+      return { kind: 'skipped', reason: turnClaim.reason };
+    }
+    if (turnClaim.kind === 'failed') {
+      await safeRelease(env, eventKey, claim);
+      return { kind: 'release_and_retry', reason: 'chat_turn_processing_claim_failed' };
+    }
+    turnProcessingClaim = turnClaim.claim;
+
     parentHeartbeat = await startParentLeaseHeartbeat(env, ctx, {
       eventKey,
       messageId: message.name,
@@ -1747,6 +1761,9 @@ export async function handleChatEvent(
     if (parentHeartbeat) {
       await parentHeartbeat.stop();
     }
+    if (turnProcessingClaim) {
+      await safeReleaseChatTurnProcessing(env, turnProcessingClaim);
+    }
     try {
       await chatScopeLock.release(chatScopeKey);
     } catch (err) {
@@ -2564,6 +2581,79 @@ function parseReactiveStreamTimeoutMs(raw: string | undefined): number | undefin
     return undefined;
   }
   return n;
+}
+
+export function chatTurnProcessingKey(eventKey: string): string {
+  return `chat_turn_processing:${eventKey}`;
+}
+
+type ChatTurnProcessingClaimResult =
+  | { kind: 'claimed'; claim: { key: string; owner: string; version: number } }
+  | { kind: 'duplicate'; reason: 'chat_turn_processing_alive' | 'chat_turn_processing_done' }
+  | { kind: 'failed' };
+
+async function claimChatTurnProcessing(
+  env: Env,
+  input: { eventKey: string; messageId: string },
+): Promise<ChatTurnProcessingClaimResult> {
+  const key = chatTurnProcessingKey(input.eventKey);
+  const owner = newClaimOwner('chat-turn');
+  try {
+    const claim = await tryClaim(env.DB, key, owner, {
+      leaseTtlMs: CHAT_EVENT_LEASE_TTL_MS,
+    });
+    if (claim.state === 'NEW' || claim.state === 'TAKEOVER') {
+      if (claim.owner !== undefined && claim.version !== undefined) {
+        await recordRuntimeEvent(env, {
+          eventKey: input.eventKey,
+          messageId: input.messageId,
+          eventType: 'chat_turn_processing_claimed',
+          source: 'chat-event-handler',
+          detail: { claim_state: claim.state, lease_ttl_ms: CHAT_EVENT_LEASE_TTL_MS },
+        });
+        return { kind: 'claimed', claim: { key, owner: claim.owner, version: claim.version } };
+      }
+      return { kind: 'failed' };
+    }
+    const reason =
+      claim.state === 'DONE_DUPLICATE'
+        ? 'chat_turn_processing_done'
+        : 'chat_turn_processing_alive';
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      eventType: 'chat_turn_processing_duplicate_suppressed',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { reason, claim_state: claim.state },
+    });
+    return { kind: 'duplicate', reason };
+  } catch (err) {
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      eventType: 'chat_turn_processing_claim_failed',
+      level: 'error',
+      source: 'chat-event-handler',
+      detail: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return { kind: 'failed' };
+  }
+}
+
+async function safeReleaseChatTurnProcessing(
+  env: Env,
+  claim: { key: string; owner: string; version: number },
+): Promise<void> {
+  try {
+    await releaseClaim(env.DB, claim.key, claim.owner, claim.version);
+  } catch (err) {
+    console.warn(
+      `[chat-event] chat turn processing release failed key=${claim.key}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }
 
 async function startParentLeaseHeartbeat(

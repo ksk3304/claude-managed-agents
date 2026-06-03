@@ -28,7 +28,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
 
-import { handleChatEvent } from '../src/queue/chat-event-handler';
+import { chatTurnProcessingKey, handleChatEvent } from '../src/queue/chat-event-handler';
 import {
   buildChatCapabilitySessionKey,
   chatThreadSessionKey,
@@ -585,6 +585,35 @@ describe('handleChatEvent', () => {
       interval_ms: 60_000,
     });
     expect(chatApiMock.patches.at(-1)?.text).toContain('通常応答です。');
+  });
+
+  it('duplicate Queue redelivery skips before sending another user.message into CMA', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '130秒待ってから返答して' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await preClaim(env, chatTurnProcessingKey(msg.eventKey), 'other-consumer');
+    await putMapping(env, 'alice@example.com');
+    const createCapture: unknown[] = [];
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_start',
+      createCapture,
+      events: [
+        { type: 'agent.message.text', text: '二重実行してはいけない' },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result).toEqual({ kind: 'skipped', reason: 'chat_turn_processing_alive' });
+    expect(createCapture).toEqual([]);
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(0);
+    const duplicateEvent = runtimeEvents(env).find(
+      (row) => row.event_type === 'chat_turn_processing_duplicate_suppressed',
+    );
+    expect(duplicateEvent).toBeDefined();
   });
 
   it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
