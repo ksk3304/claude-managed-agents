@@ -187,6 +187,8 @@ declare namespace Cloudflare {
      * Invalid / out-of-range values fail closed to default.
      */
     CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
+    /** Reactive Chat stream timeout override in milliseconds. Unset = 110000. */
+    CMA_REACTIVE_STREAM_TIMEOUT_MS?: string;
     /**
      * Explicit opt-in for short-lived `user.message` payload audit in
      * Cloudflare KV. Default off. Enable only while observing an incident.

@@ -114,7 +114,7 @@ describe('slugForMemoryPath', () => {
 // ============================================================================
 
 describe('sessionLogBasePath', () => {
-  it('shared: alias → slug', async () => {
+  it('shared: alias is transport metadata and does not split owner-agent log path', async () => {
     const path = await sessionLogBasePath({
       dateLabel: '2026-05-26',
       spaceType: 'ROOM',
@@ -124,9 +124,9 @@ describe('sessionLogBasePath', () => {
       sender: { name: 'users/u1', email: 'k.seto@makotoprime.com' },
       reverseResolveAlias: (sid) => (sid === 'spaces/AAA' ? 'it-dev' : null),
     });
-    expect(path).toBe('/2026-05-26/it-dev');
+    expect(path).toBe('/2026-05-26/agent-keisuke-seto');
   });
-  it('shared: alias 無し → displayName から slug', async () => {
+  it('shared: displayName is transport metadata and does not split owner-agent log path', async () => {
     const path = await sessionLogBasePath({
       dateLabel: '2026-05-26',
       spaceType: 'ROOM',
@@ -135,9 +135,9 @@ describe('sessionLogBasePath', () => {
       space: { name: 'spaces/BBB', displayName: 'Daily Standup', type: 'ROOM' },
       sender: { name: 'users/u1' },
     });
-    expect(path).toBe('/2026-05-26/daily-standup');
+    expect(path).toBe('/2026-05-26/agent-keisuke-seto');
   });
-  it('shared: displayName も無し → space.name の slug 化 (非 ASCII なら fallback hash)', async () => {
+  it('shared: space.name is transport metadata and does not split owner-agent log path', async () => {
     const path = await sessionLogBasePath({
       dateLabel: '2026-05-26',
       spaceType: 'ROOM',
@@ -146,9 +146,9 @@ describe('sessionLogBasePath', () => {
       space: { name: 'spaces/XYZ-123', type: 'ROOM' },
       sender: {},
     });
-    expect(path).toBe('/2026-05-26/spaces-xyz-123');
+    expect(path).toBe('/2026-05-26/agent-keisuke-seto');
   });
-  it('DM: `/YYYY-MM-DD/dm-<user_slug>`', async () => {
+  it('uses `/YYYY-MM-DD/agent-<user_slug>` for DM and shared spaces', async () => {
     const path = await sessionLogBasePath({
       dateLabel: '2026-05-26',
       spaceType: 'DM',
@@ -157,9 +157,9 @@ describe('sessionLogBasePath', () => {
       space: { name: 'spaces/DM1', type: 'DM' },
       sender: { name: 'users/u1', email: 'k.seto@makotoprime.com' },
     });
-    expect(path).toBe('/2026-05-26/dm-keisuke-seto');
+    expect(path).toBe('/2026-05-26/agent-keisuke-seto');
   });
-  it('DM: 非 ASCII user_slug → fallback hash', async () => {
+  it('non ASCII user_slug → fallback hash', async () => {
     const path = await sessionLogBasePath({
       dateLabel: '2026-05-26',
       spaceType: 'DM',
@@ -168,7 +168,7 @@ describe('sessionLogBasePath', () => {
       space: { type: 'DM' },
       sender: { name: 'users/u9' },
     });
-    expect(path).toMatch(/^\/2026-05-26\/dm-space-[0-9a-f]{8}$/);
+    expect(path).toMatch(/^\/2026-05-26\/agent-space-[0-9a-f]{8}$/);
   });
 });
 
@@ -198,7 +198,7 @@ describe('buildSessionLogEntry', () => {
         `- message_id: msg_456\n\n` +
         `### User\n\n` +
         `こんにちは\n\n` +
-        `### MAKOTOくん\n\n` +
+        `### Agent\n\n` +
         `はい、承知しました\n`,
     );
   });
@@ -217,7 +217,7 @@ describe('buildSessionLogEntry', () => {
     expect(entry).toContain('- session_id: n/a\n');
     expect(entry).toContain('- message_id: n/a\n');
     expect(entry).toContain('### User\n\n（空）\n\n');
-    expect(entry).toContain('### MAKOTOくん\n\n（空）\n');
+    expect(entry).toContain('### Agent\n\n（空）\n');
   });
   it('sanitizes inline control chars in thread / space / ids', () => {
     const entry = buildSessionLogEntry({
@@ -274,15 +274,25 @@ describe('selectSessionLogAttachment', () => {
     store_name: 'session_log_dm_store',
     instructions: 'DM (個人 1:1) のセッションログを記録',
   };
+  const numberedAtt: MemoryAttachment = {
+    memory_store_id: 'memstore_agent_0001_log',
+    access: 'read_write',
+    store_name: 'agent_0001_session_log_store',
+    instructions: 'agent 0001 セッションログを記録',
+  };
   const otherAtt: MemoryAttachment = {
     memory_store_id: 'memstore_other',
     access: 'read_only',
     store_name: 'persona_memory',
   };
 
-  it('selects shared store for shared spaces', () => {
+  it('selects owner legacy dm store even in shared spaces', () => {
     const att = selectSessionLogAttachment('ROOM', [otherAtt, sharedAtt, dmAtt]);
-    expect(att?.memory_store_id).toBe('memstore_shared');
+    expect(att?.memory_store_id).toBe('memstore_dm');
+  });
+  it('selects numbered owner-agent store before legacy aliases', () => {
+    const att = selectSessionLogAttachment('ROOM', [otherAtt, sharedAtt, dmAtt, numberedAtt]);
+    expect(att?.memory_store_id).toBe('memstore_agent_0001_log');
   });
   it('selects dm store for DM space', () => {
     const att = selectSessionLogAttachment('DM', [otherAtt, sharedAtt, dmAtt]);
@@ -306,7 +316,7 @@ describe('selectSessionLogAttachment', () => {
     };
     expect(
       selectSessionLogAttachment('ROOM', [legacyShared, legacyDm])?.memory_store_id,
-    ).toBe('memstore_legacy_shared');
+    ).toBe('memstore_legacy_dm');
     expect(
       selectSessionLogAttachment('DM', [legacyShared, legacyDm])?.memory_store_id,
     ).toBe('memstore_legacy_dm');
@@ -449,6 +459,12 @@ const DM_ATTACHMENT: MemoryAttachment = {
   store_name: 'session_log_dm_store',
   instructions: 'DM (個人 1:1) のセッションログ',
 };
+const NUMBERED_ATTACHMENT: MemoryAttachment = {
+  memory_store_id: 'memstore_agent_0001_log',
+  access: 'read_write',
+  store_name: 'agent_0001_session_log_store',
+  instructions: 'agent 0001 セッションログ',
+};
 
 const FIXED_NOW = new Date('2026-05-26T01:30:00.000Z'); // = 2026-05-26 10:30:00 JST.
 
@@ -485,7 +501,7 @@ describe('appendSessionLogMemory', () => {
     expect(mock.calls.create).toBe(0);
   });
 
-  it('creates a new memory when none exists at the target path (shared)', async () => {
+  it('creates a new memory when none exists at the owner-agent target path', async () => {
     const mock = makeMockClient();
     const result = await appendSessionLogMemory(
       deps({
@@ -496,7 +512,7 @@ describe('appendSessionLogMemory', () => {
         senderEmail: 'k.seto@makotoprime.com',
         spaceType: 'ROOM',
         userSlug: 'keisuke-seto',
-        memoryAttachments: [SHARED_ATTACHMENT],
+        memoryAttachments: [SHARED_ATTACHMENT, DM_ATTACHMENT, NUMBERED_ATTACHMENT],
         space: { name: 'spaces/AAA', displayName: 'IT Dev', type: 'ROOM' },
         sender: { name: 'users/u1', email: 'k.seto@makotoprime.com' },
         userText: 'はじめまして',
@@ -506,18 +522,18 @@ describe('appendSessionLogMemory', () => {
     );
     expect(result.appended).toBe(true);
     expect(result.action).toBe('create');
-    expect(result.path).toBe('/2026-05-26/it-dev.md');
+    expect(result.path).toBe('/2026-05-26/agent-keisuke-seto.md');
     expect(result.suffix).toBe(1);
     expect(mock.calls.create).toBe(1);
     expect(mock.calls.update).toBe(0);
     expect(mock.calls.retrieve).toBe(0);
 
-    const written = mock.store.get('/2026-05-26/it-dev.md');
+    const written = mock.store.get('/2026-05-26/agent-keisuke-seto.md');
     expect(written).toBeDefined();
     expect(written?.content).toContain('## 2026-05-26T10:30:00+09:00 k-seto\n');
     expect(written?.content).toContain('- session_id: sess_42\n');
     expect(written?.content).toContain('### User\n\nはじめまして\n');
-    expect(written?.content).toContain('### MAKOTOくん\n\nよろしくお願いします\n');
+    expect(written?.content).toContain('### Agent\n\nよろしくお願いします\n');
     // lstrip applied on new memory (no leading `\n---\n` after lstrip).
     expect(written?.content.startsWith('---\n')).toBe(true);
   });
@@ -526,7 +542,7 @@ describe('appendSessionLogMemory', () => {
     const existing: MemoryItem = {
       type: 'memory',
       id: 'mem_existing',
-      path: '/2026-05-26/dm-keisuke-seto.md',
+      path: '/2026-05-26/agent-keisuke-seto.md',
       content: '---\n## 既存エントリ\n\n旧本文\n',
       content_sha256: 'old-sha',
     };
@@ -546,16 +562,16 @@ describe('appendSessionLogMemory', () => {
     );
     expect(result.appended).toBe(true);
     expect(result.action).toBe('update');
-    expect(result.path).toBe('/2026-05-26/dm-keisuke-seto.md');
+    expect(result.path).toBe('/2026-05-26/agent-keisuke-seto.md');
     expect(result.suffix).toBe(1);
     expect(mock.calls.update).toBe(1);
     expect(mock.calls.create).toBe(0);
     expect(mock.calls.retrieve).toBe(1);
 
-    const written = mock.store.get('/2026-05-26/dm-keisuke-seto.md');
+    const written = mock.store.get('/2026-05-26/agent-keisuke-seto.md');
     expect(written?.content).toContain('## 既存エントリ');
     expect(written?.content).toContain('### User\n\n追記する');
-    expect(written?.content).toContain('### MAKOTOくん\n\n追記しました');
+    expect(written?.content).toContain('### Agent\n\n追記しました');
     // The append concatenates with one `\n` between old (rstrip-ed) and entry,
     // and lstrip is applied to the whole. The entry itself starts with `\n---\n`
     // → rstrip(old) + "\n" + "\n---\n..." = "旧本文\n\n---\n...".
@@ -569,7 +585,7 @@ describe('appendSessionLogMemory', () => {
     const existingFirst: MemoryItem = {
       type: 'memory',
       id: 'mem_first',
-      path: '/2026-05-26/dm-keisuke-seto.md',
+      path: '/2026-05-26/agent-keisuke-seto.md',
       content: filler,
       content_sha256: 'sha-first',
     };
@@ -590,11 +606,11 @@ describe('appendSessionLogMemory', () => {
     expect(result.appended).toBe(true);
     expect(result.action).toBe('create');
     expect(result.suffix).toBe(2);
-    expect(result.path).toBe('/2026-05-26/dm-keisuke-seto-2.md');
+    expect(result.path).toBe('/2026-05-26/agent-keisuke-seto-2.md');
     // The first file is untouched (still the filler).
-    expect(mock.store.get('/2026-05-26/dm-keisuke-seto.md')?.content).toBe(filler);
+    expect(mock.store.get('/2026-05-26/agent-keisuke-seto.md')?.content).toBe(filler);
     // The -2.md file was created.
-    expect(mock.store.has('/2026-05-26/dm-keisuke-seto-2.md')).toBe(true);
+    expect(mock.store.has('/2026-05-26/agent-keisuke-seto-2.md')).toBe(true);
   });
 
   it('iterates suffix loop until an empty slot is found', async () => {
@@ -605,14 +621,14 @@ describe('appendSessionLogMemory', () => {
       {
         type: 'memory',
         id: 'mem_1',
-        path: '/2026-05-26/dm-keisuke-seto.md',
+        path: '/2026-05-26/agent-keisuke-seto.md',
         content: filler,
         content_sha256: 'sha-1',
       },
       {
         type: 'memory',
         id: 'mem_2',
-        path: '/2026-05-26/dm-keisuke-seto-2.md',
+        path: '/2026-05-26/agent-keisuke-seto-2.md',
         content: filler,
         content_sha256: 'sha-2',
       },
@@ -633,8 +649,8 @@ describe('appendSessionLogMemory', () => {
     expect(result.appended).toBe(true);
     expect(result.action).toBe('create');
     expect(result.suffix).toBe(3);
-    expect(result.path).toBe('/2026-05-26/dm-keisuke-seto-3.md');
-    expect(mock.store.has('/2026-05-26/dm-keisuke-seto-3.md')).toBe(true);
+    expect(result.path).toBe('/2026-05-26/agent-keisuke-seto-3.md');
+    expect(mock.store.has('/2026-05-26/agent-keisuke-seto-3.md')).toBe(true);
   });
 
   it('exposes SESSION_LOG_MAX_BYTES = 100 * 1024 (byte-equivalent with Python)', () => {
@@ -647,7 +663,7 @@ describe('appendSessionLogMemory', () => {
       {
         type: 'memory',
         id: 'mem_real',
-        path: '/2026-05-26/dm-keisuke-seto.md',
+        path: '/2026-05-26/agent-keisuke-seto.md',
         content: 'old',
         content_sha256: 'sha-r',
       },
@@ -683,6 +699,6 @@ describe('appendSessionLogMemory', () => {
     // The real memory still wins (prefix marker is silently ignored).
     expect(result.appended).toBe(true);
     expect(result.action).toBe('update');
-    expect(result.path).toBe('/2026-05-26/dm-keisuke-seto.md');
+    expect(result.path).toBe('/2026-05-26/agent-keisuke-seto.md');
   });
 });

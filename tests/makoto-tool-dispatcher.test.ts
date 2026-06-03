@@ -120,8 +120,14 @@ describe('dispatchMakotoTool happy paths', () => {
     });
     expect(r.ok).toBe(true);
     const payload = r.payload as Record<string, unknown>;
-    expect(payload.product).toBe('MAKOTOくん Cloudflare版');
+    expect(payload.product).toBe('汎用CMAエージェント Cloudflare版');
     expect(payload.schema_version).toBe(2);
+    expect(payload.identity_model).toMatchObject({
+      template: 'generic_agent',
+    });
+    expect(
+      ((payload.identity_model as Record<string, unknown>).instance_variables as string[]),
+    ).toContain('agent_number');
     expect((payload.custom_tools as Array<Record<string, unknown>>).length).toBe(
       MAKOTO_TOOL_NAMES.length,
     );
@@ -129,8 +135,20 @@ describe('dispatchMakotoTool happy paths', () => {
       status: 'not_active_for_workspace',
       active_connectors: [],
     });
+    expect(payload.memory_strategy).toMatchObject({
+      plan: 'plan_b_memory_store_primary',
+      max_session_memory_stores: 8,
+    });
+    expect(payload.memory_router).toMatchObject({
+      strategy: 'plan_b_memory_store_router_v1',
+      hard_limit: 8,
+    });
+    expect(payload.system_memory_logic_classification).toBeDefined();
     expect(payload.cannot_claim).toContain(
       'Do not claim active MCP connectors for Google Workspace; they are not the current implementation path.',
+    );
+    expect(payload.cannot_claim).toContain(
+      'Do not claim the LLM automatically chooses which Memory Stores to mount; the Worker router chooses resources[].',
     );
     expect(payload).not.toHaveProperty('secrets');
   });

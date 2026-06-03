@@ -11,6 +11,7 @@ import {
   readUserMapping,
   readUserMappingWithDefault,
   resolveSenderToResources,
+  routeMemoryAttachmentsForSession,
 } from '../src/lib/memory-attach';
 import { makeKv } from './helpers';
 
@@ -262,7 +263,7 @@ describe('readChatSenderMappingWithAutoPending', () => {
   });
 });
 
-describe('shared-space personal memory filtering (Issue #191)', () => {
+describe('owner-agent unified memory routing (Issue #246)', () => {
   const mapping = {
     user_slug: 'alice',
     agent_id: 'agent_a',
@@ -294,23 +295,90 @@ describe('shared-space personal memory filtering (Issue #191)', () => {
     expect(filtered.filtered_personal_store_count).toBe(0);
   });
 
-  it('filters personal memory ids in shared-space sessions', () => {
+  it('does not filter owner memory in shared-space sessions', () => {
     const filtered = filterPersonalMemoryForSpace(mapping, 'ROOM');
     expect(filtered.memory_attachments.map((a) => a.memory_store_id)).toEqual([
       'mem_company',
+      'mem_dm_log',
+      'mem_dm_report',
       'mem_shared',
     ]);
-    expect(filtered.filtered_personal_store_count).toBe(2);
+    expect(filtered.filtered_personal_store_count).toBe(0);
   });
 
-  it('applies filtering through readUserMappingWithDefault', async () => {
+  it('keeps owner memory through readUserMappingWithDefault', async () => {
     const kv = makeKv();
     await kv.put('user_mapping:alice@example.com', JSON.stringify(mapping));
     const r = await readUserMappingWithDefault(kv, 'alice@example.com', undefined, 'GROUP_CHAT');
     expect(r?.mapping.memory_attachments.map((a) => a.memory_store_id)).toEqual([
       'mem_company',
+      'mem_dm_log',
+      'mem_dm_report',
       'mem_shared',
     ]);
-    expect(r?.mapping.filtered_personal_store_count).toBe(2);
+    expect(r?.mapping.filtered_personal_store_count).toBe(0);
+  });
+});
+
+describe('Memory Store router (Issue #246)', () => {
+  const attachments = [
+    { memory_store_id: 'mem_extra_1', access: 'read_only' as const, store_name: 'random_1' },
+    { memory_store_id: 'mem_corp_wiki', access: 'read_only' as const, store_name: 'corporate_wiki_memory' },
+    { memory_store_id: 'mem_company', access: 'read_only' as const, store_name: 'company_core_memory' },
+    { memory_store_id: 'mem_agent_identity', access: 'read_write' as const, store_name: 'agent_0001_identity_memory' },
+    { memory_store_id: 'mem_agent_support', access: 'read_write' as const, store_name: 'agent_0001_support_memory' },
+    { memory_store_id: 'mem_agent_daily', access: 'read_write' as const, store_name: 'agent_0001_daily_report_store' },
+    { memory_store_id: 'mem_agent_log', access: 'read_write' as const, store_name: 'agent_0001_session_log_store' },
+    { memory_store_id: 'mem_dm_log', access: 'read_write' as const, store_name: 'session_log_dm_store' },
+    { memory_store_id: 'mem_dm_report', access: 'read_write' as const, store_name: 'daily_report_dm_store' },
+    { memory_store_id: 'mem_shared_log', access: 'read_write' as const, store_name: 'session_log_shared_store' },
+    { memory_store_id: 'mem_shared_report', access: 'read_write' as const, store_name: 'daily_report_shared_store' },
+    { memory_store_id: 'mem_extra_2', access: 'read_only' as const, store_name: 'random_2' },
+    { memory_store_id: 'mem_extra_3', access: 'read_only' as const, store_name: 'random_3' },
+  ];
+
+  it('selects at most 8 stores and prioritizes corporate wiki / core / current-scope memory', () => {
+    const routed = routeMemoryAttachmentsForSession(attachments, { spaceType: 'DM' });
+    expect(routed.strategy).toBe('plan_b_memory_store_router_v1');
+    expect(routed.selected).toHaveLength(8);
+    expect(routed.dropped).toHaveLength(5);
+    expect(routed.selected_store_names).toEqual([
+      'corporate_wiki_memory',
+      'company_core_memory',
+      'agent_0001_identity_memory',
+      'agent_0001_support_memory',
+      'agent_0001_daily_report_store',
+      'agent_0001_session_log_store',
+      'daily_report_dm_store',
+      'session_log_dm_store',
+    ]);
+  });
+
+  it('keeps numbered owner-agent daily reports and logs ahead of legacy stores', () => {
+    const routed = routeMemoryAttachmentsForSession(attachments, {
+      spaceType: 'ROOM',
+      maxStores: 7,
+    });
+    expect(routed.selected_store_names).toEqual([
+      'corporate_wiki_memory',
+      'company_core_memory',
+      'agent_0001_identity_memory',
+      'agent_0001_support_memory',
+      'agent_0001_daily_report_store',
+      'agent_0001_session_log_store',
+      'daily_report_dm_store',
+    ]);
+    expect(routed.dropped_store_names).toContain('session_log_shared_store');
+  });
+
+  it('deduplicates by memory_store_id before ranking', () => {
+    const routed = routeMemoryAttachmentsForSession(
+      [attachments[0]!, attachments[0]!, attachments[1]!],
+      { spaceType: 'DM' },
+    );
+    expect(routed.selected.map((a) => a.memory_store_id)).toEqual([
+      'mem_corp_wiki',
+      'mem_extra_1',
+    ]);
   });
 });

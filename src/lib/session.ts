@@ -170,6 +170,9 @@ export interface SendAndStreamResult {
    *     sent `user.interrupt` to ask the agent to wind down.
    *   - `session_watchdog` … wall-clock cap was hit and the bridge
    *     sent `user.interrupt`.
+   *   - `custom_tool_timeout` … external timeout fired while a custom
+   *     tool result was pending; the bridge sent an error
+   *     `user.custom_tool_result` so the session does not remain blocked.
    *   - `stream_terminated` … `session.status_terminated` was seen.
    *   - undefined … loop exited without observing a stop signal (e.g.
    *     external `timeoutMs` AbortError thrown by `Promise.race`).
@@ -486,8 +489,13 @@ export async function sendAndStreamWithToolDispatch(
     string,
     { name: string; input: unknown }
   >();
+  const inFlightCustomToolUses = new Map<
+    string,
+    { name: string; input: unknown }
+  >();
   let builtinToolCalls = 0;
   const startedAtMs = Date.now();
+  let timedOut = false;
   let currentTurnStarted = false;
   let seenUserMessageEcho = input.startAfterUserMessageEcho !== true;
   const sentUserMessageText = input.startAfterUserMessageEcho
@@ -513,6 +521,49 @@ export async function sendAndStreamWithToolDispatch(
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+  };
+
+  const sendPendingCustomToolTimeoutResults = async (): Promise<boolean> => {
+    const unresolved = new Map([
+      ...pendingCustomToolUses.entries(),
+      ...inFlightCustomToolUses.entries(),
+    ]);
+    if (unresolved.size === 0) return false;
+    const events = [...unresolved.entries()].map(([eventId, pending]) => ({
+      type: 'user.custom_tool_result',
+      custom_tool_use_id: eventId,
+      content: [
+        {
+          type: 'text',
+          text: safeJsonStringify({
+            error: 'custom_tool_timeout',
+            tool: pending.name,
+            message: `custom tool did not finish before stream timeout (${timeoutMs}ms)`,
+          }),
+        },
+      ],
+      is_error: true,
+    }));
+    try {
+      await client.beta.sessions.events.send(input.sessionId, {
+        events,
+        betas: [ANTHROPIC_BETA],
+      } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+      pendingCustomToolUses.clear();
+      inFlightCustomToolUses.clear();
+      stopReason = 'custom_tool_timeout';
+      terminalEventType = 'error.custom_tool_timeout';
+      return true;
+    } catch (err) {
+      console.error(
+        `[session] custom tool timeout cleanup failed sessionId=${input.sessionId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      stopReason = 'events_send_failed';
+      terminalEventType = 'error.events_send';
+      return false;
     }
   };
 
@@ -662,6 +713,7 @@ export async function sendAndStreamWithToolDispatch(
               continue;
             }
             pendingCustomToolUses.delete(eventId);
+            inFlightCustomToolUses.set(eventId, pending);
             let result: ToolDispatchResult;
             if (requiresActionIters > maxToolCalls) {
               result = {
@@ -688,6 +740,8 @@ export async function sendAndStreamWithToolDispatch(
                 };
               }
             }
+            inFlightCustomToolUses.delete(eventId);
+            if (timedOut) break;
             const resultEvent: Record<string, unknown> = {
               type: 'user.custom_tool_result',
               custom_tool_use_id: eventId,
@@ -697,6 +751,7 @@ export async function sendAndStreamWithToolDispatch(
             resultEvents.push(resultEvent);
           }
           try {
+            if (timedOut) break;
             await client.beta.sessions.events.send(input.sessionId, {
               events: resultEvents,
               betas: [ANTHROPIC_BETA],
@@ -736,15 +791,37 @@ export async function sendAndStreamWithToolDispatch(
     }
   })();
 
-  await Promise.race([
-    drain,
-    new Promise<void>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`sendAndStreamWithToolDispatch timeout after ${timeoutMs}ms`)),
-        timeoutMs,
-      ),
-    ),
-  ]);
+  const drainPromise = drain.catch((err) => {
+    if (timedOut) {
+      console.warn(
+        `[session] drain ended after timeout sessionId=${input.sessionId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    throw err;
+  });
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<void>((resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      void sendPendingCustomToolTimeoutResults().then((handled) => {
+        if (handled) {
+          resolve();
+        } else {
+          reject(
+            new Error(`sendAndStreamWithToolDispatch timeout after ${timeoutMs}ms`),
+          );
+        }
+      });
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([drainPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 
   return {
     assistantText,

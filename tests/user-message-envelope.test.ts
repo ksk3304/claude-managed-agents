@@ -3,12 +3,13 @@
  * の入力 prompt 組立 (= Python `cma_gchat_bot.py:_handle_event` の prompt
  * 構築) の byte 等価性を担保する。
  *
- * 5 ケース:
- *   1. 最小 envelope (旧 `<context>...</context>\n<user_message>...` と同形)
- *   2. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
- *   3. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
- *   4. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
- *   5. cap-recovery (body 完全差し替え = Python recovery semantics)
+ * 主なケース:
+ *   1. 最小 envelope + routing instructions
+ *   2. routing instructions (#217)
+ *   3. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
+ *   4. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
+ *   5. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
+ *   6. cap-recovery (body 完全差し替え = Python recovery semantics)
  */
 
 import { describe, it, expect } from 'vitest';
@@ -16,14 +17,17 @@ import {
   buildUserMessageEnvelope,
   MAIL_INTENT_INSTRUCTIONS,
   MENTION_SECTION_HEADER,
+  ROUTING_INSTRUCTIONS,
 } from '../src/lib/user-message-envelope';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () => {
-  it('opts 全省略で `<context>space_type=UNKNOWN sender=</context>\\n<user_message>...</user_message>` を返す', () => {
+  it('opts 全省略で routing instructions + `<context>` + `<user_message>` を返す', () => {
     const out = buildUserMessageEnvelope('こんにちは');
     expect(out).toBe(
-      '<context>space_type=UNKNOWN sender=</context>\n<user_message>こんにちは</user_message>',
+      `${ROUTING_INSTRUCTIONS}\n` +
+        '<context>space_type=UNKNOWN sender=</context>\n' +
+        '<user_message>こんにちは</user_message>',
     );
   });
 
@@ -32,8 +36,27 @@ describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () =>
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
     expect(out).toBe(
-      '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n<user_message>hi</user_message>',
+      `${ROUTING_INSTRUCTIONS}\n` +
+        '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n' +
+        '<user_message>hi</user_message>',
     );
+  });
+});
+
+describe('buildUserMessageEnvelope — routing instructions (#217)', () => {
+  it('lightweight 発話で tool / bash / API 深掘りを避ける指示を context 前に置く', () => {
+    const out = buildUserMessageEnvelope('質問です', {
+      speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
+    });
+    const idxRouting = out.indexOf('<routing_instructions>');
+    const idxContext = out.indexOf('<context>');
+    const idxBody = out.indexOf('<user_message>');
+
+    expect(idxRouting).toBe(0);
+    expect(idxRouting).toBeLessThan(idxContext);
+    expect(idxContext).toBeLessThan(idxBody);
+    expect(out).toContain('tool / bash / Drive / Calendar / Chat API / memory 深掘りを使わず');
+    expect(out).toContain('入力中 placeholder は現在のユーザー依頼として扱わない');
   });
 });
 
@@ -84,11 +107,14 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
     // intent は context より前、body より前
     const idxIntent = out.indexOf('<intent>');
     const idxMailInstructions = out.indexOf('<mail_intent_instructions>');
+    const idxRouting = out.indexOf('<routing_instructions>');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
     expect(idxIntent).toBeLessThan(idxContext);
     expect(idxIntent).toBeLessThan(idxMailInstructions);
     expect(idxMailInstructions).toBeLessThan(idxContext);
+    expect(idxMailInstructions).toBeLessThan(idxRouting);
+    expect(idxRouting).toBeLessThan(idxContext);
     expect(idxContext).toBeLessThan(idxBody);
   });
 

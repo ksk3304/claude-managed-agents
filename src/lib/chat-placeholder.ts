@@ -4,6 +4,11 @@ import { recordRuntimeEvent } from './observability';
 
 export const PLACEHOLDER_TEXT = '... MAKOTOくんが入力中';
 
+export interface PostedChatPlaceholder {
+  name: string;
+  threadName?: string;
+}
+
 export interface PostChatPlaceholderParams {
   spaceName: string;
   threadName: string | null;
@@ -17,18 +22,26 @@ export async function postChatPlaceholder(
   env: Env,
   params: PostChatPlaceholderParams,
 ): Promise<string> {
+  const result = await postChatPlaceholderResult(env, params);
+  return result?.name ?? '';
+}
+
+export async function postChatPlaceholderResult(
+  env: Env,
+  params: PostChatPlaceholderParams,
+): Promise<PostedChatPlaceholder | null> {
   const saKey = env.CHAT_SA_KEY_JSON;
   if (!saKey) {
     console.warn(
       `[${params.source}] placeholder POST skipped eventKey=${params.eventKey} CHAT_SA_KEY_JSON missing`,
     );
-    return '';
+    return null;
   }
   if (!params.spaceName) {
     console.warn(
       `[${params.source}] placeholder POST skipped eventKey=${params.eventKey} empty space`,
     );
-    return '';
+    return null;
   }
   try {
     const outcome = await executeWithCommit({
@@ -58,7 +71,9 @@ export async function postChatPlaceholder(
         source: params.source,
         detail: { placeholder_name_present: Boolean(outcome.result.name) },
       });
-      return outcome.result.name;
+      const result: PostedChatPlaceholder = { name: outcome.result.name };
+      if (outcome.result.threadName) result.threadName = outcome.result.threadName;
+      return result;
     }
     if (outcome.outcome === 'already') {
       console.log(
@@ -71,18 +86,18 @@ export async function postChatPlaceholder(
         source: params.source,
         detail: { outcome: outcome.outcome },
       });
-      return '';
+      return null;
     }
     if (outcome.outcome === 'lease_alive') {
       console.warn(
         `[${params.source}] placeholder POST in-flight by another worker eventKey=${params.eventKey} space=${params.spaceName}`,
       );
-      return '';
+      return null;
     }
     console.warn(
       `[${params.source}] placeholder POST lease lost eventKey=${params.eventKey} space=${params.spaceName}`,
     );
-    return '';
+    return null;
   } catch (err) {
     const reason =
       err instanceof ChatApiError
@@ -101,6 +116,6 @@ export async function postChatPlaceholder(
       source: params.source,
       detail: { reason },
     });
-    return '';
+    return null;
   }
 }
