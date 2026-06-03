@@ -231,6 +231,7 @@ export async function buildMakotoIntrospection(
       instance_variables: [
         'agent_number',
         'agent_display_name',
+        'memory_store_company_name',
         'owner_display_name',
         'organization_name',
         'agent_role',
@@ -248,7 +249,7 @@ export async function buildMakotoIntrospection(
         raw_source: 'Google Drive meeting minutes and documents remain primary source links.',
       },
       logs_and_reports: {
-        naming: 'Numbered agent-specific stores, e.g. agent_0001_session_log_store and agent_0001_daily_report_store.',
+        naming: 'Company-numbered owner-agent stores, e.g. Makoto Prime_0001_session_log_store and Makoto Prime_0001_daily_report_store.',
         policy: 'Session logs and daily reports stay in one numbered owner-agent Memory Store regardless of DM or shared space.',
         drive_role: 'Drive is source/archive for primary documents, not the default memory carrier.',
       },
@@ -297,10 +298,10 @@ export async function buildMakotoIntrospection(
       priority_order: [
         'corporate_wiki_memory / corporate_brain / company_wiki',
         'company_core_memory',
-        'agent_0001_identity_memory / agent_0001_profile_memory / persona_memory',
-        'agent_0001_support_memory for the owner support context',
-        'agent_0001_daily_report_store / daily_report_store for the owner agent',
-        'agent_0001_session_log_store / session_log_store for the owner agent',
+        'Makoto Prime_0001_identity_memory / Makoto Prime_0001_profile_memory / persona_memory',
+        'Makoto Prime_0001_support_memory for the owner support context',
+        'Makoto Prime_0001_daily_report_store / daily_report_store for the owner agent',
+        'Makoto Prime_0001_session_log_store / session_log_store for the owner agent',
         'legacy DM/shared daily/log aliases as compatibility inputs',
         'remaining stores in declared order',
       ],
@@ -316,11 +317,12 @@ export async function buildMakotoIntrospection(
       system_prompt: [
         'Generic role, tone, output format, safety boundaries, trust boundary, and correct Cloudflare/CMA self-recognition.',
         'Instance-specific identity is injected by mapping/addendum/memory, not hard-coded in the generic prompt.',
+        'Company-numbered memory naming examples are variables, not generic prompt identity literals.',
         'What the agent must never claim, such as active Workspace MCP or Cloud Run as primary runtime.',
       ],
       memory: [
         'Corporate wiki / LLM Wiki on Memory Store as interpreted company brain.',
-        'Numbered agent-specific identity/profile/support memory, company core facts, session logs, and daily reports, with owner-agent unified logs.',
+        'Company-numbered owner-agent identity/profile/support memory, company core facts, session logs, and daily reports, with owner-agent unified logs.',
         'Google Drive links and primary source references recorded inside wiki/log entries when source tracing matters.',
       ],
       logic: [

@@ -3,8 +3,8 @@
  * 定期実行バッチ.
  *
  * DM / shared space では分けない。発話者に紐づく owner agent の
- * `agent_0001_session_log_store` のような numbered store から
- * `agent_0001_daily_report_store` を作る。旧 mapping では
+ * `Makoto Prime_0001_session_log_store` のような company-numbered store から
+ * `Makoto Prime_0001_daily_report_store` を作る。旧 mapping では
  * `agent_session_log_store` / `session_log_dm_store` 等を unified owner
  * store の legacy alias として扱う。
  *
@@ -150,8 +150,8 @@ function storeIdFromAliases(entry: UserMappingValue, storeName: string): string 
 
 function storeIdFromNumberedAlias(entry: UserMappingValue, storeName: string): string | null {
   const patternByStore: Readonly<Record<string, RegExp>> = {
-    agent_session_log_store: /^agent_\d{4}_session_log_store$/,
-    agent_daily_report_store: /^agent_\d{4}_daily_report_store$/,
+    agent_session_log_store: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+session_log_store$/i,
+    agent_daily_report_store: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+daily_report_store$/i,
   };
   const pattern = patternByStore[storeName];
   if (!pattern) return null;

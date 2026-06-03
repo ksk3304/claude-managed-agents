@@ -140,7 +140,7 @@ describe('initUserMemoryStores', () => {
     for (const [actualName, id] of Object.entries(r.stores)) {
       expect(kv._store.get(`memstore_id:${actualName}`)).toBe(id);
     }
-    // Names are agent_<number>_<purpose>.
+    // Names are <company>_<number>_<purpose>.
     for (const logical of AGENT_SCOPED_STORES) {
       const actual = actualStoreName(logical, '0001');
       expect(r.stores[actual]).toBeDefined();
@@ -326,11 +326,11 @@ describe('registerUserMapping', () => {
     expect(stored.agent_id).toBe('agent_y');
     expect(stored.memory_attachments.length).toBe(COMMON_STORES.length);
     const logAttachment = stored.memory_attachments.find(
-      (a: { store_name: string }) => a.store_name === 'agent_0001_session_log_store',
+      (a: { store_name: string }) => a.store_name === 'Makoto Prime_0001_session_log_store',
     );
     expect(logAttachment).toBeDefined();
     expect(logAttachment.memory_store_id).toBe(
-      'memstore_id_for_agent_0001_session_log_store',
+      'memstore_id_for_Makoto Prime_0001_session_log_store',
     );
     // audit row
     expect(audit._rows.length).toBe(1);
@@ -411,9 +411,15 @@ describe('store-config', () => {
     expect([...AGENT_SCOPED_STORE_SET].sort()).toEqual([...AGENT_SCOPED_STORES].sort());
   });
 
-  it('actualStoreName prefixes agent number only for agent-scoped stores', () => {
+  it('actualStoreName prefixes company and agent number only for agent-scoped stores', () => {
     expect(actualStoreName('agent_session_log_store', '1')).toBe(
-      'agent_0001_session_log_store',
+      'Makoto Prime_0001_session_log_store',
+    );
+    expect(actualStoreName('agent_session_log_store', '2', 'Example Inc')).toBe(
+      'Example Inc_0002_session_log_store',
+    );
+    expect(actualStoreName('agent_session_log_store', 'Makoto Prime_0003')).toBe(
+      'Makoto Prime_0003_session_log_store',
     );
     expect(actualStoreName('company_core_memory', '1')).toBe('company_core_memory');
   });
@@ -474,7 +480,7 @@ describe('CLI main', () => {
       ]);
       expect(code).toBe(0);
       const all = writes.join('');
-      expect(all).toMatch(/DRY_RUN_agent_0001_session_log_store/);
+      expect(all).toMatch(/DRY_RUN_Makoto Prime_0001_session_log_store/);
     } finally {
       process.stdout.write = origWrite;
     }

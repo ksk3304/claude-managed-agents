@@ -3,8 +3,8 @@
  *
  * Current design:
  *   - company-wide stores keep stable names (for example `company_core_memory`).
- *   - agent-specific stores use an agent number and a purpose suffix
- *     (for example `agent_0001_session_log_store`).
+ *   - agent-specific stores use a company prefix, agent number, and purpose suffix
+ *     (for example `Makoto Prime_0001_session_log_store`).
  *   - DM / shared-space split is a legacy alias only, not a store creation rule.
  */
 
@@ -78,20 +78,39 @@ export const COMMON_STORES: readonly string[] = [
 ];
 
 export const AGENT_SCOPED_STORE_SET: ReadonlySet<string> = new Set(AGENT_SCOPED_STORES);
+export const DEFAULT_MEMORY_STORE_COMPANY_NAME = 'Makoto Prime';
 
 export function normalizeAgentNumber(agentNumber: string): string {
-  const raw = agentNumber.trim().toLowerCase().replace(/^agent[_-]?/, '');
+  const normalized = agentNumber.trim().toLowerCase().replace(/^agent[_-]?/, '');
+  const raw = /^\d+$/.test(normalized)
+    ? normalized
+    : normalized.match(/[_-](\d+)$/)?.[1] ?? normalized;
   if (!/^\d+$/.test(raw)) {
     throw new Error(`invalid agent number: ${JSON.stringify(agentNumber)}`);
   }
   return raw.padStart(4, '0');
 }
 
-export function actualStoreName(logicalName: string, agentNumber: string): string {
+export function normalizeMemoryStoreCompanyName(companyName?: string): string {
+  const name = (companyName ?? DEFAULT_MEMORY_STORE_COMPANY_NAME)
+    .trim()
+    .replace(/\s+/g, ' ');
+  if (!name) {
+    throw new Error('memory store company name is empty');
+  }
+  return name;
+}
+
+export function actualStoreName(
+  logicalName: string,
+  agentNumber: string,
+  companyName?: string,
+): string {
   if (!AGENT_SCOPED_STORE_SET.has(logicalName)) {
     return logicalName;
   }
   const number = normalizeAgentNumber(agentNumber);
+  const company = normalizeMemoryStoreCompanyName(companyName);
   const suffix = logicalName.replace(/^agent_/, '');
-  return `agent_${number}_${suffix}`;
+  return `${company}_${number}_${suffix}`;
 }

@@ -130,6 +130,9 @@ describe('dispatchMakotoTool happy paths', () => {
     expect(
       ((payload.identity_model as Record<string, unknown>).instance_variables as string[]),
     ).toContain('agent_number');
+    expect(
+      ((payload.identity_model as Record<string, unknown>).instance_variables as string[]),
+    ).toContain('memory_store_company_name');
     expect((payload.custom_tools as Array<Record<string, unknown>>).length).toBe(
       MAKOTO_TOOL_NAMES.length,
     );

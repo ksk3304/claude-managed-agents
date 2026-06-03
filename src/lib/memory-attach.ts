@@ -425,7 +425,9 @@ function matchesAny(haystack: string, needles: readonly string[]): boolean {
 
 function matchesAgentNumberedStore(haystack: string, suffixes: readonly string[]): boolean {
   return suffixes.some((suffix) =>
-    new RegExp(`(?:^|_)agent_\\d{4}_${suffix}(?:_|$)`).test(haystack),
+    new RegExp(`(?:^|_)[a-z0-9]+(?:_[a-z0-9]+)*_\\d{4}_${suffix}(?:_|$)`).test(
+      haystack,
+    ),
   );
 }
 

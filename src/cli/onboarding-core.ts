@@ -140,10 +140,10 @@ export interface InitMemoryStoresResult {
  * 新規 agent 用 agent-scoped memory store を冪等に発行.
  *
  * 発行対象:
- *   - `agent_0001_identity_memory`
- *   - `agent_0001_support_memory`
- *   - `agent_0001_daily_report_store`
- *   - `agent_0001_session_log_store`
+ *   - `Makoto Prime_0001_identity_memory`
+ *   - `Makoto Prime_0001_support_memory`
+ *   - `Makoto Prime_0001_daily_report_store`
+ *   - `Makoto Prime_0001_session_log_store`
  *
  * 冪等性: KV `memstore_id:<actual_name>` に発行済 ID をキャッシュ。
  * cache hit 時は API を叩かない (= Python `ensure_store` 相当)。
@@ -158,6 +158,7 @@ export async function initUserMemoryStores(opts: {
   kv: KvLike;
   userSlug: string;
   agentNumber: string;
+  companyName?: string;
   dryRun: boolean;
 }): Promise<InitMemoryStoresResult> {
   void opts.userSlug;
@@ -168,7 +169,7 @@ export async function initUserMemoryStores(opts: {
 
   for (const logicalName of AGENT_SCOPED_STORES) {
     if (!AGENT_SCOPED_STORE_SET.has(logicalName)) continue; // defensive
-    const actualName = actualStoreName(logicalName, agentNumber);
+    const actualName = actualStoreName(logicalName, agentNumber, opts.companyName);
     const cacheKey = memstoreCacheKey(actualName);
 
     if (opts.dryRun) {
@@ -376,7 +377,7 @@ export interface RegisterMappingResult {
  *   - 新規 → 'register'
  *
  * memory_attachments は store-config の COMMON_STORES から build。
- * actualStoreName で agent-scoped store は `agent_0001_<purpose>` へ解決する。
+ * actualStoreName で agent-scoped store は `<company>_0001_<purpose>` へ解決する。
  *
  * dry_run=true なら KV / D1 write ゼロ、戻り値だけ返す (確認用)。
  */
@@ -387,6 +388,7 @@ export async function registerUserMapping(opts: {
   userEmail: string;
   userSlug: string;
   agentNumber: string;
+  companyName?: string;
   agentId: string;
   displayName: string;
   chatUserId?: string;
@@ -405,11 +407,11 @@ export async function registerUserMapping(opts: {
 
   // 1. memory_attachments を build (= Python build_user_mapping 相当の単体版).
   //    COMMON_STORES の各 logical_name について storeIds から actual_id を解決。
-  //    agent-scoped store は agent_<number>_<purpose>、共通 store は logical name で resolve。
+  //    agent-scoped store は <company>_<number>_<purpose>、共通 store は logical name で resolve。
   const attachments: MemoryAttachment[] = [];
   const missing: string[] = [];
   for (const logicalName of COMMON_STORES) {
-    const actualName = actualStoreName(logicalName, agentNumber);
+    const actualName = actualStoreName(logicalName, agentNumber, opts.companyName);
     const id = opts.storeIds[actualName];
     if (!id) {
       missing.push(actualName);
