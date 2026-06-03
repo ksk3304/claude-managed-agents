@@ -214,7 +214,8 @@ interface FakeAnthOpts {
   retrieveUsage?: Record<string, unknown>;
   retrieveModel?: string;
   sendCapturePayloads?: unknown[];
-  listEvents?: Array<Record<string, unknown>>;
+  listEvents?: Array<Record<string, unknown>> | (() => Array<Record<string, unknown>>);
+  sendImpl?: (sessionId: string, payload: unknown) => Promise<void>;
   // Capture memory store list/retrieve/create/update calls for session-log
   memoryListReturns?: AsyncIterable<Record<string, unknown>>;
   memoryRetrieveContent?: string;
@@ -251,7 +252,9 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
     // nothing
   }
   async function* sessionEventList(): AsyncIterable<Record<string, unknown>> {
-    for (const ev of opts.listEvents ?? []) yield ev;
+    const events =
+      typeof opts.listEvents === 'function' ? opts.listEvents() : (opts.listEvents ?? []);
+    for (const ev of events) yield ev;
   }
   return {
     beta: {
@@ -271,6 +274,7 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
           async send(sessionId: string, payload: unknown): Promise<void> {
             opts.sendCaptureSessionIds?.push(sessionId);
             opts.sendCapturePayloads?.push(payload);
+            if (opts.sendImpl) await opts.sendImpl(sessionId, payload);
           },
           async stream(
             _sessionId: string,
@@ -679,6 +683,111 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(createCapture).toEqual([]);
     expect(chatApiMock.patches.at(-1)?.text).toContain('CMA完了済みの最終回答です。');
+    expect(runtimeEvents(env).map((row) => row.event_type)).toContain(
+      'cma_completed_session_recovered',
+    );
+  });
+
+  it('duplicate Queue redelivery resumes a bound CMA session waiting on a custom tool result', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text:
+        'xlsx skillで A1 に issue-259-main-recovery-ok と入ったExcelを作って。ファイル名は issue259-main-recovery-ok.xlsx。',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await preClaim(env, chatTurnProcessingKey(msg.eventKey), 'other-consumer');
+    await putMapping(env, 'alice@example.com');
+    await env.DB
+      .prepare(
+        `INSERT INTO cma_session_binds
+         (created_at_ms, expire_at_ms, session_key_hash, session_id, event_key,
+          message_id, user_slug, thread_name_hash, is_new_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+      )
+      .bind(
+        Date.now(),
+        Date.now() + 86_400_000,
+        'hash',
+        'sesn_recover_requires_action',
+        msg.eventKey,
+        msg.payload.message.name,
+        'alice',
+        'thread_hash',
+        1,
+      )
+      .run();
+
+    const events: Array<Record<string, unknown>> = [
+      {
+        type: 'user.message',
+        content: [{ type: 'text', text: `前置き\n${msg.payload.message.text}\n後続` }],
+      },
+      {
+        type: 'agent.custom_tool_use',
+        id: 'tu_drive',
+        name: 'drive_create_file',
+        input: {
+          name: 'issue259-main-recovery-ok.xlsx',
+          content: '',
+          mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+      },
+      {
+        type: 'session.status_idle',
+        stop_reason: { type: 'requires_action', event_ids: ['tu_drive'] },
+      },
+    ];
+    const createCapture: unknown[] = [];
+    const sentPayloads: unknown[] = [];
+    const dispatched: Array<{ name: string; input: unknown; ctx: Record<string, unknown> }> = [];
+    (globalThis as unknown as {
+      __makotoToolDispatch?: (
+        name: string,
+        input: unknown,
+        ctx: unknown,
+      ) => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async (name, input, ctx) => {
+      dispatched.push({ name, input, ctx: ctx as Record<string, unknown> });
+      return { ok: false, payload: { error: 'schema', tool: name } };
+    };
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_start',
+      createCapture,
+      events: [],
+      listEvents: () => events,
+      sendCapturePayloads: sentPayloads,
+      sendImpl: async (_sessionId, payload) => {
+        const sentEvents = (payload as { events?: Array<Record<string, unknown>> }).events ?? [];
+        const customResult = sentEvents.find((ev) => ev.type === 'user.custom_tool_result');
+        if (!customResult) return;
+        events.push(
+          {
+            type: 'user.custom_tool_result',
+            custom_tool_use_id: customResult.custom_tool_use_id,
+            content: customResult.content,
+            ...(customResult.is_error ? { is_error: customResult.is_error } : {}),
+          },
+          {
+            type: 'agent.message',
+            content: [{ type: 'text', text: 'Drive URL はブリッジ処理後に追記されます。' }],
+          },
+          { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+        );
+      },
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(createCapture).toEqual([]);
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]!.name).toBe('drive_create_file');
+    expect(dispatched[0]!.ctx.callerSessionId).toBe('sesn_recover_requires_action');
+    expect(JSON.stringify(sentPayloads)).toContain('user.custom_tool_result');
+    expect(chatApiMock.patches.at(-1)?.text).toContain(
+      'Drive URL はブリッジ処理後に追記されます。',
+    );
     expect(runtimeEvents(env).map((row) => row.event_type)).toContain(
       'cma_completed_session_recovered',
     );

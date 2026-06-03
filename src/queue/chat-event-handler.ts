@@ -127,7 +127,9 @@ import type { SlashSkillHandlers } from '../lib/slash-skill';
 import {
   readCompletedTurnFromSessionEvents,
   retrieveSessionUsageSnapshot,
+  resumeTurnFromSessionEvents,
   sendAndStreamWithToolDispatch,
+  type ToolDispatcher,
 } from '../lib/session';
 import {
   maskInternalStateForChat,
@@ -157,6 +159,7 @@ const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const CHAT_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const CHAT_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const CHAT_TURN_PROCESSING_RETRY_DELAY_SECONDS = 60;
+const CHAT_BOUND_SESSION_RECOVERY_POLL_MS = 60 * 1000;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
@@ -598,6 +601,24 @@ export async function handleChatEvent(
     });
     return { kind: 'skipped', reason: 'no_anthropic_api_key' };
   }
+  const buildRecoveryToolDispatcher = (resolvedSessionId: string): ToolDispatcher =>
+    (toolName, toolInput) =>
+      actorTrusted
+        ? dispatchMakotoTool(toolName, toolInput, {
+            env,
+            userSlug: userMapping.user_slug,
+            boundMessageId: '',
+            callerSessionId: resolvedSessionId,
+            currentSpaceName: spaceName,
+            currentThreadName: threadName ?? undefined,
+            anthropic: client,
+          })
+        : gateExternalToolCall(env, {
+            eventKey,
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            toolName,
+          });
 
   let attachmentForProcessing = message.attachment ?? null;
   let pdfApprovedThroughUsdFloor: number | null = null;
@@ -626,6 +647,7 @@ export async function handleChatEvent(
         messageId: message.name,
         bodyText,
         userSlug: userMapping.user_slug,
+        buildToolDispatcher: buildRecoveryToolDispatcher,
       });
       if (recovered.kind === 'completed') {
         recoveredCompletedTurn = recovered.turn;
@@ -650,6 +672,7 @@ export async function handleChatEvent(
           messageId: message.name,
           bodyText,
           userSlug: userMapping.user_slug,
+          buildToolDispatcher: buildRecoveryToolDispatcher,
         });
         if (recovered.kind === 'completed') {
           recoveredCompletedTurn = recovered.turn;
@@ -2943,6 +2966,7 @@ async function recoverCompletedBoundChatTurn(
     messageId: string;
     bodyText: string;
     userSlug: string;
+    buildToolDispatcher: (sessionId: string) => ToolDispatcher;
   },
 ): Promise<CompletedBoundChatTurnRecovery> {
   if (!input.client) {
@@ -2973,10 +2997,24 @@ async function recoverCompletedBoundChatTurn(
       return { kind: 'missing', reason: 'cma_session_bind_missing' };
     }
 
-    const completed = await readCompletedTurnFromSessionEvents(
+    let completed = await readCompletedTurnFromSessionEvents(
       input.client,
       sessionId,
     );
+    if (!completed) {
+      const resumed = await resumeTurnFromSessionEvents(input.client, {
+        sessionId,
+        toolDispatcher: input.buildToolDispatcher(sessionId),
+        pollMs: CHAT_BOUND_SESSION_RECOVERY_POLL_MS,
+      });
+      if (resumed) {
+        completed = {
+          assistantText: resumed.assistantText,
+          terminalEventType: resumed.terminalEventType ?? 'session.status_idle',
+          stopReason: resumed.stopReason ?? 'end_turn',
+        };
+      }
+    }
     if (!completed) {
       await recordRuntimeEvent(env, {
         eventKey: input.eventKey,
@@ -3001,6 +3039,7 @@ async function recoverCompletedBoundChatTurn(
         assistant_chars: completed.assistantText.length,
         terminal_event_type: completed.terminalEventType,
         stop_reason: completed.stopReason,
+        recovery_poll_ms: CHAT_BOUND_SESSION_RECOVERY_POLL_MS,
       },
     });
     return {
