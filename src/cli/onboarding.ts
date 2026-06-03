@@ -6,9 +6,10 @@
  * 依存なしで Cloudflare 単独で新メンバーを追加できるようにする (= Issue #186 K).
  *
  * Sub-commands:
- *   init-user-memory-stores  --user-slug X
+ *   init-user-memory-stores  --user-slug X --agent-number 0001
  *   copy-agent               --from <template_agent_id> --to-slug X --display-name "..." --addendum "..."
  *   register-user-mapping    --slug X --email Y --agent-id A --display-name "..." [--chat-user-id ...] --addendum "..."
+ *                            --agent-number 0001
  *                            [--store-id "<actual_name>=<memstore_id>" ...]
  *
  * Common flags:
@@ -30,7 +31,7 @@
  *
  * 起動例:
  *   npx tsx src/cli/onboarding.ts --help
- *   npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --dry-run
+ *   npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --dry-run
  *
  * Issue: ksk3304/makoto-prime#186 (K)
  */
@@ -244,7 +245,7 @@ const USAGE = `MAKOTOくん 新メンバー onboarding CLI (Cloudflare 単独運
   npx tsx src/cli/onboarding.ts <subcommand> [flags]
 
 Sub-commands:
-  init-user-memory-stores   新規 user 用 DM-only memory store 2 種を発行
+  init-user-memory-stores   新規 agent 用 numbered memory store を発行
   copy-agent                雛形 agent を copy して新 user 用 agent を発行
   register-user-mapping     KV (user_mapping:<email>) に登録 + D1 audit 記録
 
@@ -254,13 +255,14 @@ Common flags:
   --help, -h                このメッセージを表示
 
 Sub-command flags:
-  init-user-memory-stores --user-slug <slug>
+  init-user-memory-stores --user-slug <slug> --agent-number <0001>
 
   copy-agent --from <template_agent_id> --to-slug <slug>
              --display-name "<name>" --addendum "<text>"
 
   register-user-mapping --slug <slug> --email <addr> --agent-id <id>
                         --display-name "<name>" --addendum "<text>"
+                        --agent-number <0001>
                         [--chat-user-id "users/...]
                         [--store-id <actual_name>=<memstore_id> ...]
 
@@ -276,13 +278,13 @@ KV/D1 への real write は wrangler subprocess (\`npx wrangler kv key put\` /
 で切替可能。
 
 例:
-  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --dry-run
+  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --dry-run
   npx tsx src/cli/onboarding.ts copy-agent --from agent_xxx --to-slug yamada \\
       --display-name "山田 太郎" --addendum "あなたは山田 太郎さん専属の MAKOTOくんです" --dry-run
   npx tsx src/cli/onboarding.ts register-user-mapping --slug yamada \\
       --email yamada@example.com --agent-id agent_yyy \\
-      --display-name "山田 太郎" --addendum "..." \\
-      --store-id "session_log_dm_store__yamada=memstore_xxx" \\
+      --display-name "山田 太郎" --addendum "..." --agent-number 0001 \\
+      --store-id "agent_0001_session_log_store=memstore_xxx" \\
       --store-id "company_core_memory=memstore_common_xxx" --dry-run
 `;
 
@@ -309,6 +311,7 @@ function parseStoreIdFlags(values: string[]): Record<string, string> {
 
 async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
   const userSlug = requireString(p, 'user-slug', 'init-user-memory-stores');
+  const agentNumber = requireString(p, 'agent-number', 'init-user-memory-stores');
   const dryRun = p.flags.has('dry-run');
 
   if (dryRun) {
@@ -319,6 +322,7 @@ async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
       anthropic: fakeAnthropic,
       kv: fakeKv,
       userSlug,
+      agentNumber,
       dryRun: true,
     });
   }
@@ -326,7 +330,7 @@ async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
   const { kvNamespaceId, remote } = resolveCfTargets();
   const anthropic = await makeAnthropic();
   const kv = makeWranglerKv(kvNamespaceId, remote);
-  return await initUserMemoryStores({ anthropic, kv, userSlug, dryRun: false });
+  return await initUserMemoryStores({ anthropic, kv, userSlug, agentNumber, dryRun: false });
 }
 
 async function cmdCopyAgent(p: ParsedArgs): Promise<CopyAgentResult> {
@@ -361,6 +365,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
   const userSlug = requireString(p, 'slug', 'register-user-mapping');
   const userEmail = requireString(p, 'email', 'register-user-mapping');
   const agentId = requireString(p, 'agent-id', 'register-user-mapping');
+  const agentNumber = requireString(p, 'agent-number', 'register-user-mapping');
   const displayName = requireString(p, 'display-name', 'register-user-mapping');
   const addendum = requireString(p, 'addendum', 'register-user-mapping');
   const chatUserId = getString(p, 'chat-user-id');
@@ -374,6 +379,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
       storeIds,
       userEmail,
       userSlug,
+      agentNumber,
       agentId,
       displayName,
       chatUserId,
@@ -391,6 +397,7 @@ async function cmdRegisterMapping(p: ParsedArgs): Promise<RegisterMappingResult>
     storeIds,
     userEmail,
     userSlug,
+    agentNumber,
     agentId,
     displayName,
     chatUserId,

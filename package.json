@@ -6,7 +6,7 @@
   "description": "Self-hosted Claude Managed Agent control plane on Cloudflare using the Sandbox SDK",
   "scripts": {
     "predeploy": "node scripts/deploy-guard.mjs",
-    "deploy": "npm run build && wrangler deploy --strict",
+    "deploy": "npm run build && node scripts/deploy-with-diagnostics.mjs --strict",
     "postdeploy": "npm run db:migrate:remote",
     "dev": "npm run build && wrangler dev",
     "start": "npm run dev",

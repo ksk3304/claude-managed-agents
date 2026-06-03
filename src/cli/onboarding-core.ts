@@ -24,11 +24,12 @@
 
 import type { MemoryAttachment } from '../types/memory';
 import {
+  AGENT_SCOPED_STORES,
+  AGENT_SCOPED_STORE_SET,
   COMMON_STORES,
-  DM_ONLY_STORES,
   STORES,
-  USER_SCOPED_STORES,
   actualStoreName,
+  normalizeAgentNumber,
 } from './store-config';
 import { MAKOTO_AGENT_TOOLS } from '../lib/makoto-capability-registry';
 
@@ -136,11 +137,13 @@ export interface InitMemoryStoresResult {
 }
 
 /**
- * 新規 user 用 DM-only memory store 2 種を冪等に発行 (= Python l.4053).
+ * 新規 agent 用 agent-scoped memory store を冪等に発行.
  *
- * 発行対象 = `USER_SCOPED_STORES` (= `_DM_ONLY_STORES`):
- *   - `session_log_dm_store__<user_slug>`
- *   - `daily_report_dm_store__<user_slug>`
+ * 発行対象:
+ *   - `agent_0001_identity_memory`
+ *   - `agent_0001_support_memory`
+ *   - `agent_0001_daily_report_store`
+ *   - `agent_0001_session_log_store`
  *
  * 冪等性: KV `memstore_id:<actual_name>` に発行済 ID をキャッシュ。
  * cache hit 時は API を叩かない (= Python `ensure_store` 相当)。
@@ -154,15 +157,18 @@ export async function initUserMemoryStores(opts: {
   anthropic: AnthropicClientLike;
   kv: KvLike;
   userSlug: string;
+  agentNumber: string;
   dryRun: boolean;
 }): Promise<InitMemoryStoresResult> {
+  void opts.userSlug;
+  const agentNumber = normalizeAgentNumber(opts.agentNumber);
   const out: Record<string, string> = {};
   const created: string[] = [];
   const cached: string[] = [];
 
-  for (const logicalName of DM_ONLY_STORES) {
-    if (!USER_SCOPED_STORES.has(logicalName)) continue; // defensive
-    const actualName = actualStoreName(logicalName, opts.userSlug);
+  for (const logicalName of AGENT_SCOPED_STORES) {
+    if (!AGENT_SCOPED_STORE_SET.has(logicalName)) continue; // defensive
+    const actualName = actualStoreName(logicalName, agentNumber);
     const cacheKey = memstoreCacheKey(actualName);
 
     if (opts.dryRun) {
@@ -337,6 +343,7 @@ function mergeMakotoAgentTools(templateTools: unknown): Array<Record<string, unk
 
 export interface UserMappingKvValue {
   user_slug: string;
+  agent_number: string;
   agent_id: string;
   /** Memory Store の attach 仕様。R-Mail bridge `readUserMapping` が読む正本。 */
   memory_attachments: MemoryAttachment[];
@@ -369,7 +376,7 @@ export interface RegisterMappingResult {
  *   - 新規 → 'register'
  *
  * memory_attachments は store-config の COMMON_STORES から build。
- * actualStoreName で user_scoped store には suffix を付ける。
+ * actualStoreName で agent-scoped store は `agent_0001_<purpose>` へ解決する。
  *
  * dry_run=true なら KV / D1 write ゼロ、戻り値だけ返す (確認用)。
  */
@@ -379,6 +386,7 @@ export async function registerUserMapping(opts: {
   storeIds: Record<string, string>; // actual_name → memstore_id (init の結果 + 既存共通)
   userEmail: string;
   userSlug: string;
+  agentNumber: string;
   agentId: string;
   displayName: string;
   chatUserId?: string;
@@ -391,16 +399,17 @@ export async function registerUserMapping(opts: {
 }): Promise<RegisterMappingResult> {
   const emailKey = normalizeMappingEmail(opts.userEmail);
   const kvKey = userMappingKey(emailKey);
+  const agentNumber = normalizeAgentNumber(opts.agentNumber);
   const nowMs = opts.nowMs ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
   // 1. memory_attachments を build (= Python build_user_mapping 相当の単体版).
   //    COMMON_STORES の各 logical_name について storeIds から actual_id を解決。
-  //    user_scoped store は <name>__<slug> で resolve、共通 store は <name> で resolve。
+  //    agent-scoped store は agent_<number>_<purpose>、共通 store は logical name で resolve。
   const attachments: MemoryAttachment[] = [];
   const missing: string[] = [];
   for (const logicalName of COMMON_STORES) {
-    const actualName = actualStoreName(logicalName, opts.userSlug);
+    const actualName = actualStoreName(logicalName, agentNumber);
     const id = opts.storeIds[actualName];
     if (!id) {
       missing.push(actualName);
@@ -428,6 +437,7 @@ export async function registerUserMapping(opts: {
 
   const value: UserMappingKvValue = {
     user_slug: opts.userSlug,
+    agent_number: agentNumber,
     agent_id: opts.agentId,
     memory_attachments: attachments,
     system_prompt_addendum: opts.addendum,

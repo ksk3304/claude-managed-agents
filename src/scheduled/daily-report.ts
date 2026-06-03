@@ -1,13 +1,12 @@
 /**
- * Daily report runner — MAKOTOくん の DM/共有スペース日報を Memory Store に
- * 書き込む定期実行バッチ. Cloud Run の `scripts/cma_daily_report.py` の
- * TS port (byte 等価).
+ * Daily report runner — owner agent 単位の日報を Memory Store に書き込む
+ * 定期実行バッチ.
  *
- * 2 経路を 1 cron tick で巡回する:
- *   - **DM 経路**: user 単位で `session_log_dm_store` → `daily_report_dm_store`
- *     (= per-user 複数 tuple)
- *   - **共有スペース経路**: 全 user 共通の singleton (= 最初の user mapping から
- *     shared store id を抜く)
+ * DM / shared space では分けない。発話者に紐づく owner agent の
+ * `agent_0001_session_log_store` のような numbered store から
+ * `agent_0001_daily_report_store` を作る。旧 mapping では
+ * `agent_session_log_store` / `session_log_dm_store` 等を unified owner
+ * store の legacy alias として扱う。
  *
  * 入力ソース:
  *   - KV: `user_mapping:<email>` を全件 list (= Python の
@@ -35,12 +34,9 @@ import { createSessionWithResources, sendAndStream } from '../lib/session';
 // Constants / route definitions
 // ============================================================================
 
-/**
- * Python `REPORT_ROUTES` (l.36-49) と byte 等価. shared / DM の 2 経路を
- * 1 cron tick で巡回する.
- */
+/** Owner-agent unified daily report route. */
 export interface ReportRoute {
-  kind: 'dm' | 'shared';
+  kind: 'owner_agent';
   source_store_name: string;
   target_store_name: string;
   title: string;
@@ -48,16 +44,10 @@ export interface ReportRoute {
 
 export const REPORT_ROUTES: readonly ReportRoute[] = [
   {
-    kind: 'dm',
-    source_store_name: 'session_log_dm_store',
-    target_store_name: 'daily_report_dm_store',
-    title: 'DM 日報',
-  },
-  {
-    kind: 'shared',
-    source_store_name: 'session_log_shared_store',
-    target_store_name: 'daily_report_shared_store',
-    title: '共有スペース日報',
+    kind: 'owner_agent',
+    source_store_name: 'agent_session_log_store',
+    target_store_name: 'agent_daily_report_store',
+    title: 'エージェント日報',
   },
 ] as const;
 
@@ -66,6 +56,8 @@ export const REPORT_ROUTES: readonly ReportRoute[] = [
  * store_name の attachment が無いとき instructions 文字列 substring 逆引き fallback.
  */
 const NEEDLES: Readonly<Record<string, readonly [string, string]>> = {
+  agent_session_log_store: ['セッションログ', ''],
+  agent_daily_report_store: ['日報', ''],
   session_log_dm_store: ['DM (個人 1:1)', 'セッションログ'],
   session_log_shared_store: ['共有スペース', 'セッションログ'],
   daily_report_dm_store: ['DM 軸', '日報'],
@@ -102,6 +94,8 @@ export function storeIdFromEntry(
   entry: UserMappingValue,
   storeName: string,
 ): string | null {
+  const aliasHit = storeIdFromAliases(entry, storeName);
+  if (aliasHit) return aliasHit;
   const needles = NEEDLES[storeName];
   if (!needles) {
     // 未知 store_name は store_name 一致のみで返す (= Python の KeyError と
@@ -121,12 +115,50 @@ export function storeIdFromEntry(
     if (
       fallback === null &&
       instructions.includes(needleA) &&
-      instructions.includes(needleB)
+      (needleB === '' || instructions.includes(needleB))
     ) {
       fallback = att.memory_store_id;
     }
   }
   return fallback;
+}
+
+function storeIdFromAliases(entry: UserMappingValue, storeName: string): string | null {
+  const aliases: Readonly<Record<string, readonly string[]>> = {
+    agent_session_log_store: [
+      'agent_session_log_store',
+      'session_log_store',
+      'session_log_dm_store',
+      'session_log_shared_store',
+    ],
+    agent_daily_report_store: [
+      'agent_daily_report_store',
+      'daily_report_store',
+      'daily_report_dm_store',
+      'daily_report_shared_store',
+    ],
+  };
+  const numberedHit = storeIdFromNumberedAlias(entry, storeName);
+  if (numberedHit) return numberedHit;
+  for (const alias of aliases[storeName] ?? [storeName]) {
+    for (const att of entry.memory_attachments || []) {
+      if (att.store_name === alias) return att.memory_store_id;
+    }
+  }
+  return null;
+}
+
+function storeIdFromNumberedAlias(entry: UserMappingValue, storeName: string): string | null {
+  const patternByStore: Readonly<Record<string, RegExp>> = {
+    agent_session_log_store: /^agent_\d{4}_session_log_store$/,
+    agent_daily_report_store: /^agent_\d{4}_daily_report_store$/,
+  };
+  const pattern = patternByStore[storeName];
+  if (!pattern) return null;
+  for (const att of entry.memory_attachments || []) {
+    if (pattern.test(att.store_name ?? '')) return att.memory_store_id;
+  }
+  return null;
 }
 
 /**
@@ -145,7 +177,8 @@ export function dailyReportPrompt(
   return (
     `${dateLabel} の ${route.title} を作成してください。\n` +
     '入力ログだけを根拠にし、推測で補完しないでください。\n' +
-    '個人DMと共有スペースの内容を混在させないでください。\n' +
+    'DM と共有スペースを分けず、同じ owner agent の出来事として扱ってください。\n' +
+    'ただし、ログ中の space_type / space / thread は場所情報として残してください。\n' +
     'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
     '形式:\n' +
     '# YYYY-MM-DD 日報\n' +
@@ -411,43 +444,15 @@ export async function summarizeLogs(
 
 /**
  * 1 route ぶんの store pair 配列を作る.
- * Python `_route_store_pairs` (l.86-103) の TS port.
- *
- * shared: singleton 1 件 (= 最初の email-sorted user mapping から抜く. 全 user
- * で同一 shared_store 前提).
- * DM: per-user 複数 tuple (= email 昇順で iterate, source/target 両方が
- * 揃った user のみ pair に含める).
+ * 1 route ぶんの store pair 配列を作る。
+ * owner agent 単位で email 昇順に iterate し、source/target 両方が
+ * 揃った user のみ pair に含める。
  */
 export function routeStorePairs(
   mapping: Map<string, UserMappingValue>,
   route: ReportRoute,
 ): ReportStorePair[] {
   const sortedEmails = Array.from(mapping.keys()).sort();
-  if (route.kind === 'shared') {
-    // Python `_store_id_from_mapping`: entries を順に走査して最初に見つかった
-    // store_id を採用 (entries は dict の values + default の順). TS では
-    // email-sorted user mapping を順に走査する近似で同一結果 (全 user で
-    // 共有 store は同じ id のはずなので、どの user から抜いても等価).
-    const orderedEmails = [
-      ...sortedEmails.filter((email) => email === 'k.seto@makotoprime.com'),
-      ...sortedEmails.filter((email) => email !== 'k.seto@makotoprime.com'),
-    ];
-    for (const email of orderedEmails) {
-      const entry = mapping.get(email)!;
-      const source = storeIdFromEntry(entry, route.source_store_name);
-      const target = storeIdFromEntry(entry, route.target_store_name);
-      if (source && target) {
-        return [{
-          label: 'shared',
-          sourceStoreId: source,
-          targetStoreId: target,
-          agentId: agentIdForEntry(email, entry),
-        }];
-      }
-    }
-    throw new Error(`store not found in mapping: ${route.source_store_name}`);
-  }
-
   const pairs: ReportStorePair[] = [];
   for (const email of sortedEmails) {
     const entry = mapping.get(email)!;
@@ -464,7 +469,7 @@ export function routeStorePairs(
     }
   }
   if (pairs.length === 0) {
-    throw new Error('no user-scoped DM daily-report stores found');
+    throw new Error('no owner-agent daily-report stores found');
   }
   return pairs;
 }
@@ -530,7 +535,7 @@ export async function generateDailyReports(
     } catch (error) {
       // mapping 不在 / store_name 不在は route 単位 fatal だが、他 route には
       // 影響させない. error を集約 result に載せる.
-      const key = route.kind === 'shared' ? 'shared' : `dm:_route_init`;
+      const key = 'agent:_route_init';
       result[key] = {
         source_store_id: '',
         target_store_id: '',
@@ -543,7 +548,7 @@ export async function generateDailyReports(
     }
 
     for (const pair of pairs) {
-      const key = route.kind === 'shared' ? 'shared' : `dm:${pair.label}`;
+      const key = `agent:${pair.label}`;
       try {
         const logs = await listDateSessionLogs(client, pair.sourceStoreId, dateLabel);
         const summary = await summarizeLogs(
