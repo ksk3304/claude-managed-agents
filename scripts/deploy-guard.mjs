@@ -19,6 +19,7 @@ export const REQUIRED_MARKERS = [
 
 export const PRODUCTION_BRANCHES = ['main', 'master'];
 export const MUST_PRESERVE_FILE = 'deploy-must-preserve.json';
+export const ACTIVE_CHAT_TURN_LIMIT = 5;
 
 function readText(file) {
   return readFileSync(file, 'utf8');
@@ -100,6 +101,115 @@ function versionMap(versions) {
     if (version?.id) byId.set(version.id, version);
   }
   return byId;
+}
+
+function readD1DatabaseName(root) {
+  const wranglerPath = path.join(root, 'wrangler.jsonc');
+  if (!existsSync(wranglerPath)) return 'DB';
+  const wrangler = readText(wranglerPath);
+  return wrangler.match(/^\s*"database_name"\s*:\s*"([^"]+)"/m)?.[1] ?? 'DB';
+}
+
+export function activeChatTurnSql(nowMs, limit = ACTIVE_CHAT_TURN_LIMIT) {
+  const safeNowMs = Number.isFinite(nowMs) ? Math.max(0, Math.floor(nowMs)) : Date.now();
+  const safeLimit = Math.max(1, Math.min(50, Math.floor(limit)));
+  return [
+    'SELECT event_key, claim_owner, lease_version, lease_expires_at_ms, committed_at_ms',
+    'FROM dedupe',
+    "WHERE event_key LIKE 'chat_turn_processing:chat:%'",
+    `AND COALESCE(lease_expires_at_ms, 0) > ${safeNowMs}`,
+    'AND committed_at_ms IS NULL',
+    'ORDER BY lease_expires_at_ms DESC',
+    `LIMIT ${safeLimit}`,
+  ].join(' ');
+}
+
+function rowsFromD1Json(raw) {
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return [];
+  const first = parsed[0];
+  return Array.isArray(first?.results) ? first.results : [];
+}
+
+export function collectActiveChatTurnGuard(root, options = {}) {
+  const env = options.env ?? process.env;
+  const nowMs = options.nowMs ?? Date.now();
+  const overrideEnabled = env.DEPLOY_GUARD_SKIP_ACTIVE_CHAT_TURN_CHECK === '1';
+  const overrideReason = (env.DEPLOY_GUARD_ACTIVE_CHAT_TURN_REASON || '').trim();
+  const overrideAccepted = overrideEnabled && overrideReason.length > 0;
+  const usingFixture =
+    options.activeChatTurns ||
+    options.activeChatTurnsJson ||
+    options.activeChatTurnsError ||
+    options.deployments ||
+    options.deploymentsJson;
+  let rows = [];
+  let readbackError = '';
+  let source = usingFixture ? 'fixture' : 'cloudflare-d1';
+
+  if (options.activeChatTurns) {
+    rows = options.activeChatTurns;
+  } else if (options.activeChatTurnsJson) {
+    try {
+      rows = rowsFromD1Json(options.activeChatTurnsJson);
+    } catch (err) {
+      readbackError = err instanceof Error ? err.message : String(err);
+    }
+  } else if (options.activeChatTurnsError) {
+    readbackError = options.activeChatTurnsError;
+  } else if (!usingFixture) {
+    try {
+      const raw = execFileSync(
+        'npx',
+        [
+          'wrangler',
+          'd1',
+          'execute',
+          readD1DatabaseName(root),
+          '--remote',
+          '--json',
+          '--command',
+          activeChatTurnSql(nowMs, options.activeChatTurnLimit ?? ACTIVE_CHAT_TURN_LIMIT),
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: options.cloudflareTimeoutMs ?? 30_000,
+        },
+      );
+      rows = rowsFromD1Json(raw);
+    } catch (err) {
+      readbackError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  const active = rows
+    .filter((row) => Number(row?.lease_expires_at_ms ?? 0) > nowMs && row?.committed_at_ms == null)
+    .map((row) => ({
+      eventKey: String(row.event_key ?? ''),
+      leaseExpiresAtMs: Number(row.lease_expires_at_ms ?? 0),
+      leaseVersion: Number(row.lease_version ?? 0),
+      claimOwner: String(row.claim_owner ?? ''),
+    }));
+  const failures = [];
+  if (readbackError && !overrideAccepted) {
+    failures.push(`could not read active Chat turn leases from D1: ${readbackError}`);
+  }
+  if (active.length > 0 && !overrideAccepted) {
+    failures.push(`active Chat turn processing leases exist (${active.length}); wait for completion or lease expiry before deploy`);
+  }
+  return {
+    ok: failures.length === 0,
+    source,
+    nowMs,
+    active,
+    readbackError,
+    overrideEnabled,
+    overrideReason,
+    overrideAccepted,
+    failures,
+  };
 }
 
 export function findEffectiveServingCommit(deployments, versions = []) {
@@ -437,6 +547,7 @@ export function evaluateDeployGuard(root, options = {}) {
   const runContextPolicy = evaluateRunContextPolicy(env);
   const markerChecks = checkRequiredMarkers(root, options.requirements ?? REQUIRED_MARKERS);
   const servingLineage = collectServingLineage(root, target, options);
+  const activeChatTurns = collectActiveChatTurnGuard(root, options);
   const failures = [];
 
   if (!runContextPolicy.ok) {
@@ -463,6 +574,7 @@ export function evaluateDeployGuard(root, options = {}) {
     }
   }
   failures.push(...servingLineage.failures);
+  failures.push(...activeChatTurns.failures);
 
   return {
     ok: failures.length === 0,
@@ -472,6 +584,7 @@ export function evaluateDeployGuard(root, options = {}) {
     runContextPolicy,
     markerChecks,
     servingLineage,
+    activeChatTurns,
     failures,
   };
 }
@@ -550,6 +663,24 @@ export function renderReport(result) {
         `[deploy-guard] ${check.ok ? 'OK' : 'BLOCK'} must-preserve ${shortCommit(check.commit)}` +
           (detail ? ` ${detail}` : ''),
       );
+    }
+  }
+  const chatTurns = result.activeChatTurns;
+  if (chatTurns) {
+    lines.push(
+      `[deploy-guard] active_chat_turns=${chatTurns.active.length} source=${chatTurns.source}`,
+    );
+    if (chatTurns.overrideAccepted) {
+      lines.push(`[deploy-guard] OVERRIDE active chat turn check skipped: ${chatTurns.overrideReason}`);
+    }
+    for (const turn of chatTurns.active.slice(0, ACTIVE_CHAT_TURN_LIMIT)) {
+      lines.push(
+        `[deploy-guard] ${chatTurns.overrideAccepted ? 'WARN' : 'BLOCK'} active chat turn ` +
+          `${turn.eventKey} lease_expires=${new Date(turn.leaseExpiresAtMs).toISOString()}`,
+      );
+    }
+    if (chatTurns.readbackError) {
+      lines.push(`[deploy-guard] ${chatTurns.overrideAccepted ? 'WARN' : 'BLOCK'} active chat turn readback: ${chatTurns.readbackError}`);
     }
   }
   if (result.ok) {

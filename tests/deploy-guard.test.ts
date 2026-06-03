@@ -5,7 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  activeChatTurnSql,
   checkRequiredMarkers,
+  collectActiveChatTurnGuard,
   collectGitContext,
   collectServingLineage,
   evaluateBranchPolicy,
@@ -413,6 +415,62 @@ describe("deploy guard", () => {
 
     expect(lineage.ok).toBe(true);
     expect(lineage.servingContained).toBe(true);
+  });
+
+  it("builds active chat turn SQL with the supplied clock", () => {
+    expect(activeChatTurnSql(1234567890, 3)).toContain("lease_expires_at_ms, 0) > 1234567890");
+    expect(activeChatTurnSql(1234567890, 3)).toContain("LIMIT 3");
+    expect(activeChatTurnSql(1234567890, 3)).toContain("chat_turn_processing:chat:%");
+  });
+
+  it("blocks deploy while a Chat turn-processing lease is alive", () => {
+    const root = makeGitRoot();
+    const head = git(root, ["rev-parse", "HEAD"]);
+    const nowMs = 1_780_474_000_000;
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      nowMs,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(head),
+      activeChatTurns: [
+        {
+          event_key: "chat_turn_processing:chat:msgname:spaces/x/messages/y.y",
+          lease_expires_at_ms: nowMs + 60_000,
+          committed_at_ms: null,
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.activeChatTurns.active).toHaveLength(1);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("active Chat turn processing leases exist"),
+    );
+  });
+
+  it("allows an explicit active Chat turn guard override with a reason", () => {
+    const guard = collectActiveChatTurnGuard(makeRoot(), {
+      nowMs: 1000,
+      env: {
+        DEPLOY_GUARD_SKIP_ACTIVE_CHAT_TURN_CHECK: "1",
+        DEPLOY_GUARD_ACTIVE_CHAT_TURN_REASON: "emergency rollback",
+      },
+      activeChatTurns: [
+        {
+          event_key: "chat_turn_processing:chat:msgname:spaces/x/messages/y.y",
+          lease_expires_at_ms: 2000,
+          committed_at_ms: null,
+        },
+      ],
+    });
+
+    expect(guard.ok).toBe(true);
+    expect(guard.overrideAccepted).toBe(true);
+    expect(guard.active).toHaveLength(1);
   });
 
   it("ignores inherited DEPLOY_GUARD_SERVING_COMMIT and uses Cloudflare metadata fixtures", () => {
