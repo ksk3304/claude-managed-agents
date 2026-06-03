@@ -70,7 +70,7 @@ export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
-const SESSION_STREAM_TIMEOUT_MS = 110_000;
+const SESSION_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
@@ -179,6 +179,8 @@ export interface OrchestrateChatTurnInput {
   kv?: KVNamespace;
   /** Stream timeout override (test 用)。 */
   timeoutMs?: number;
+  /** Called after resolving/creating the session id, before stream/tool dispatch. */
+  onSessionIdResolved?: (sessionId: string) => void;
   /** Session watchdog override (test / incident-debug 用)。 */
   sessionWatchdogSec?: number;
   /**
@@ -496,6 +498,8 @@ export async function orchestrateChatTurn(
         `memory_stores=${resources.length}/${routedMemory.max_stores}`,
     );
   }
+
+  input.onSessionIdResolved?.(sessionId);
 
   if (input.eventKey) {
     await recordSessionBind(input.env, {

@@ -158,6 +158,10 @@ import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
+const ORCHESTRATOR_SESSION_CREATE_NOTICE =
+  'MAKOTOくんの処理を開始できませんでした。ログ確認対象として記録しました。';
+const ORCHESTRATOR_STREAM_FAILED_NOTICE =
+  'MAKOTOくんの応答完了を確認できませんでした。ログ確認対象として記録しました。';
 const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
@@ -1268,6 +1272,9 @@ export async function handleChatEvent(
               }),
         eventKey,
         messageId: message.name,
+        onSessionIdResolved: (resolvedSessionId) => {
+          sessionIdRef.current = resolvedSessionId;
+        },
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
         // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
@@ -1433,7 +1440,10 @@ export async function handleChatEvent(
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          const notice = '一時的なエラーです。少し時間を置いて再送してください。';
+          const notice =
+            err.reason === 'sessions_create_failed'
+              ? ORCHESTRATOR_SESSION_CREATE_NOTICE
+              : ORCHESTRATOR_STREAM_FAILED_NOTICE;
           await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
           await recordRuntimeEvent(env, {
             eventKey,

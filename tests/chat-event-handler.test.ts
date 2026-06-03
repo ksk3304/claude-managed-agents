@@ -124,11 +124,15 @@ vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async (name: string, input: unknown) => {
+    dispatchMakotoTool: async (name: string, input: unknown, ctx: unknown) => {
       const override = (globalThis as unknown as {
-        __makotoToolDispatch?: (name: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>;
+        __makotoToolDispatch?: (
+          name: string,
+          input: unknown,
+          ctx: unknown,
+        ) => Promise<{ ok: boolean; payload: unknown }>;
       }).__makotoToolDispatch;
-      if (override) return override(name, input);
+      if (override) return override(name, input, ctx);
       return { ok: false, payload: { error: 'mocked' } };
     },
   };
@@ -1943,7 +1947,9 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.deletes).toHaveLength(0);
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).toBe(
+      'MAKOTOくんの応答完了を確認できませんでした。ログ確認対象として記録しました。',
+    );
     expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
     const runtimeEvents = (env.DB as unknown as {
       _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
@@ -2580,6 +2586,61 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
+  it('drive_stage_file custom tool receives resolved session id before streaming dispatch', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'Drive上のExcelテンプレートを使ってB2を更新して',
+      placeholderName: 'spaces/AAA/messages/ingress_stage',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const capturedCalls: Array<{ name: string; input: unknown; ctx: Record<string, unknown> }> = [];
+    (globalThis as unknown as {
+      __makotoToolDispatch?: (
+        name: string,
+        input: unknown,
+        ctx: unknown,
+      ) => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async (name, input, ctx) => {
+      capturedCalls.push({ name, input, ctx: ctx as Record<string, unknown> });
+      return {
+        ok: true,
+        payload: { mount_path: '/mnt/session/uploads/template.xlsx' },
+      };
+    };
+
+    installFakeAnthropic({
+      sessionId: 'sesn_stage_before_stream',
+      events: [
+        {
+          type: 'agent.custom_tool_use',
+          id: 'tu_stage',
+          name: 'drive_stage_file',
+          input: { file_id: '1WaqevWkTHVDbDizf7YhS7Y7Q7ENt1FjJ', name: 'template.xlsx' },
+        },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_stage'] },
+        },
+        {
+          type: 'agent.message.text',
+          text: 'https://drive.google.com/file/d/mock-drive-file/view',
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(capturedCalls).toHaveLength(1);
+    expect(capturedCalls[0]!.name).toBe('drive_stage_file');
+    expect(capturedCalls[0]!.ctx.callerSessionId).toBe('sesn_stage_before_stream');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('https://drive.google.com/file/d/mock-drive-file/view');
+  });
+
   it('custom tool timeout: PATCHes visible notice instead of leaving placeholder text', async () => {
     const env = buildEnv({
       envOverrides: { CMA_REACTIVE_STREAM_TIMEOUT_MS: '10' },
@@ -2643,7 +2704,9 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
-    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).toBe(
+      'MAKOTOくんの処理を開始できませんでした。ログ確認対象として記録しました。',
+    );
     expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
     const runtimeEvents = (env.DB as unknown as {
       _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
