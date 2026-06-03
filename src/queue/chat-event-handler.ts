@@ -1217,10 +1217,8 @@ export async function handleChatEvent(
       });
   const placeholderName = ingressPlaceholderName || postedPlaceholder?.name || '';
   const placeholderThreadName = postedPlaceholder?.threadName ?? null;
-  // Per-event session id holder. tool dispatcher が agent.custom_tool_use
-  // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
-  // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
-  // stream event より前) ため、box で参照を共有する。
+  // Per-event session id holder. orchestrator が sessions.create / KV lookup
+  // を解決した直後、stream/tool dispatch の前に書き込む。
   const sessionIdRef: { current: string } = { current: '' };
   let sessionId: string;
   let assistantText: string;
@@ -1268,6 +1266,9 @@ export async function handleChatEvent(
               }),
         eventKey,
         messageId: message.name,
+        onSessionIdResolved: (resolvedSessionId) => {
+          sessionIdRef.current = resolvedSessionId;
+        },
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
         // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,

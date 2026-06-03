@@ -7,10 +7,16 @@ import {
 } from '../src/lib/session-orchestrator';
 import { makeKv } from './helpers';
 
-function makeClient(calls: string[]): Anthropic {
+function makeClient(
+  calls: string[],
+  streamEvents?: Array<Record<string, unknown>>,
+): Anthropic {
   async function* stream(): AsyncIterable<Record<string, unknown>> {
-    yield { type: 'agent.message.text_delta', text: 'ok' };
-    yield { type: 'session.status_idle', stop_reason: 'end_turn' };
+    const events = streamEvents ?? [
+      { type: 'agent.message.text_delta', text: 'ok' },
+      { type: 'session.status_idle', stop_reason: 'end_turn' },
+    ];
+    for (const event of events) yield event;
   }
 
   return {
@@ -170,5 +176,57 @@ describe('orchestrateChatTurn', () => {
       'mem_shared_log',
       'mem_extra_1',
     ]);
+  });
+
+  it('exposes the active session id before custom tool dispatch', async () => {
+    const calls: string[] = [];
+    const kv = makeKv();
+    const client = makeClient(calls, [
+      {
+        type: 'agent.custom_tool_use',
+        id: 'tu_stage',
+        name: 'drive_stage_file',
+        input: { file_id: 'file123' },
+      },
+      {
+        type: 'session.status_idle',
+        stop_reason: { type: 'requires_action', event_ids: ['tu_stage'] },
+      },
+      { type: 'agent.message', content: [{ type: 'text', text: 'done' }] },
+      { type: 'session.status_idle', stop_reason: 'end_turn' },
+    ]);
+    let resolvedSessionId = '';
+    let dispatcherSawSessionId = '';
+
+    const result = await orchestrateChatTurn({
+      env: {
+        ENVIRONMENT_ID: 'env_employee',
+        MAKOTO_KV: kv,
+      } as Env,
+      client,
+      senderEmail: 'alice@example.com',
+      spaceName: 'spaces/AAA',
+      spaceType: 'DM',
+      threadName: 'spaces/AAA/threads/T3',
+      bodyText: 'テンプレを更新して',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [],
+      },
+      personaSpec: 'persona',
+      toolsSpec: '## Drive\nstage',
+      onSessionIdResolved: (sessionId) => {
+        resolvedSessionId = sessionId;
+      },
+      toolDispatcher: async () => {
+        dispatcherSawSessionId = resolvedSessionId;
+        return { ok: true, payload: { mount_path: '/mnt/session/uploads/template.xlsx' } };
+      },
+    });
+
+    expect(result.sessionId).toBe('sesn_new');
+    expect(dispatcherSawSessionId).toBe('sesn_new');
+    expect(calls).toEqual(['sessions.create', 'events.send', 'events.stream', 'events.send']);
   });
 });
