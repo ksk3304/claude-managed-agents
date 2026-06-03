@@ -41,7 +41,7 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(13);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(14);
     expect(MAKOTO_TOOL_NAMES).toContain('chat_list_space_members');
     expect(MAKOTO_TOOL_NAMES).toContain('drive_stage_file');
     expect(MAKOTO_TOOL_NAMES).toContain('agentmail_read');
