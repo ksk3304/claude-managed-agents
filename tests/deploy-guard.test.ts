@@ -269,6 +269,44 @@ describe("deploy guard", () => {
     });
   });
 
+  it("reads cf-repo from version annotations when deployment annotations omit messages", () => {
+    const deployments = [
+      {
+        id: "code",
+        created_on: "2026-06-01T20:35:16Z",
+        annotations: { "workers/triggered_by": "deployment" },
+        versions: [{ version_id: "version-code", percentage: 100 }],
+      },
+      {
+        id: "secret",
+        created_on: "2026-06-01T21:40:26Z",
+        annotations: { "workers/triggered_by": "secret" },
+        versions: [{ version_id: "version-secret", percentage: 100 }],
+      },
+    ];
+    const versions = [
+      {
+        id: "version-code",
+        annotations: {
+          "workers/message": "issue=250 cf-repo=c19059547b5c34219e631ee63bf5d94306195e00",
+        },
+      },
+      {
+        id: "version-secret",
+        annotations: { "workers/triggered_by": "secret" },
+      },
+    ];
+
+    expect(findEffectiveServingCommit(deployments, versions)).toMatchObject({
+      ok: true,
+      latestHadCfRepo: false,
+      source: "previous_code_deployment",
+      commit: "c19059547b5c34219e631ee63bf5d94306195e00",
+      latestDeploymentId: "secret",
+      codeDeploymentId: "code",
+    });
+  });
+
   it("blocks deploy when HEAD would drop the current serving hotfix", () => {
     const root = makeGitRoot();
     git(root, ["checkout", "-b", "codex/serving-hotfix"]);

@@ -60,13 +60,31 @@ export function extractCfRepoCommit(message = '') {
   return message.match(/(?:^|\s)cf-repo=([0-9a-f]{7,40})(?:\s|$)/i)?.[1] ?? '';
 }
 
-function deploymentMessage(deployment) {
+function annotationMessage(item) {
   return (
-    deployment?.annotations?.['workers/message'] ??
-    deployment?.annotations?.workers_message ??
-    deployment?.message ??
+    item?.annotations?.['workers/message'] ??
+    item?.annotations?.workers_message ??
+    item?.message ??
     ''
   );
+}
+
+function deploymentVersionIds(deployment) {
+  if (!Array.isArray(deployment?.versions)) return [];
+  return deployment.versions
+    .map((version) => version?.version_id ?? version?.id ?? '')
+    .filter(Boolean);
+}
+
+function deploymentMessage(deployment, versionsById = new Map()) {
+  const ownMessage = annotationMessage(deployment);
+  if (ownMessage) return ownMessage;
+
+  for (const versionId of deploymentVersionIds(deployment)) {
+    const versionMessage = annotationMessage(versionsById.get(versionId));
+    if (versionMessage) return versionMessage;
+  }
+  return '';
 }
 
 function deploymentCreatedAt(deployment) {
@@ -75,7 +93,16 @@ function deploymentCreatedAt(deployment) {
   return Number.isFinite(ts) ? ts : 0;
 }
 
-export function findEffectiveServingCommit(deployments) {
+function versionMap(versions) {
+  const byId = new Map();
+  if (!Array.isArray(versions)) return byId;
+  for (const version of versions) {
+    if (version?.id) byId.set(version.id, version);
+  }
+  return byId;
+}
+
+export function findEffectiveServingCommit(deployments, versions = []) {
   if (!Array.isArray(deployments) || deployments.length === 0) {
     return {
       ok: false,
@@ -86,9 +113,10 @@ export function findEffectiveServingCommit(deployments) {
       codeDeploymentId: '',
     };
   }
+  const versionsById = versionMap(versions);
   const ordered = [...deployments].sort((a, b) => deploymentCreatedAt(b) - deploymentCreatedAt(a));
   const latest = ordered[0];
-  const latestCommit = extractCfRepoCommit(deploymentMessage(latest));
+  const latestCommit = extractCfRepoCommit(deploymentMessage(latest, versionsById));
   if (latestCommit) {
     return {
       ok: true,
@@ -100,7 +128,7 @@ export function findEffectiveServingCommit(deployments) {
     };
   }
   for (const deployment of ordered.slice(1)) {
-    const commit = extractCfRepoCommit(deploymentMessage(deployment));
+    const commit = extractCfRepoCommit(deploymentMessage(deployment, versionsById));
     if (commit) {
       return {
         ok: true,
@@ -256,7 +284,9 @@ function commitIsAncestor(root, commit, descendant = 'HEAD') {
 export function collectServingLineage(root, target, options = {}) {
   const env = options.env ?? process.env;
   let deployments = null;
+  let versions = null;
   let readbackError = '';
+  let versionReadbackError = '';
   let readbackSource = 'cloudflare';
   const failures = [];
 
@@ -287,8 +317,33 @@ export function collectServingLineage(root, target, options = {}) {
       readbackError = err instanceof Error ? err.message : String(err);
     }
   }
+  if (options.versions) {
+    versions = options.versions;
+  } else if (options.versionsJson) {
+    try {
+      versions = JSON.parse(options.versionsJson);
+    } catch (err) {
+      versionReadbackError = err instanceof Error ? err.message : String(err);
+    }
+  } else if (!options.deployments && !options.deploymentsJson) {
+    try {
+      const raw = execFileSync(
+        'npx',
+        ['wrangler', 'versions', 'list', '--name', target.workerName, '--json'],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: options.cloudflareTimeoutMs ?? 30_000,
+        },
+      );
+      versions = JSON.parse(raw);
+    } catch (err) {
+      versionReadbackError = err instanceof Error ? err.message : String(err);
+    }
+  }
 
-  const effective = findEffectiveServingCommit(deployments);
+  const effective = findEffectiveServingCommit(deployments, versions);
   let mustPreserve = [];
   try {
     mustPreserve = readMustPreserveCommits(root, env);
@@ -298,6 +353,9 @@ export function collectServingLineage(root, target, options = {}) {
 
   if (readbackError) {
     failures.push(`could not read Cloudflare deployments for serving lineage: ${readbackError}`);
+  }
+  if (versionReadbackError && !effective.ok) {
+    failures.push(`could not read Cloudflare Worker versions for serving lineage: ${versionReadbackError}`);
   }
   if (!effective.ok) {
     failures.push('could not determine serving cf-repo from Cloudflare deployment metadata');
