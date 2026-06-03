@@ -1,5 +1,5 @@
 /**
- * Session-log memory append — MAKOTOくん bot が 1 ターン応答した後、
+ * Session-log memory append — agent bot が 1 ターン応答した後、
  * 応答内容を Memory Store (Anthropic Managed Agents) の
  * `/YYYY-MM-DD/<slug>.md` に append する lib.
  *
@@ -9,15 +9,14 @@
  * 上限は厳密に踏襲する.
  *
  * 機能の役割:
- *   1. shared space (ROOM / GROUP_CHAT / SPACE / 未知) → space 単位の
- *      `session_log_shared_store`、DM → user 単位の `session_log_dm_store`
- *      に保存先 attachment を分岐 (`selectSessionLogAttachment`).
- *   2. JST date label (`YYYY-MM-DD`) + slug 化 (shared: space displayName /
- *      alias、DM: `dm-<sender_slug>`) で base path 構築
- *      (`sessionLogBasePath`).
+ *   1. owner agent 単位の番号付き store (`agent_0001_session_log_store`
+ *      等) を優先し、旧 mapping は unified owner log の legacy alias
+ *      として使う。
+ *   2. JST date label (`YYYY-MM-DD`) + owner slug で base path 構築
+ *      (`/YYYY-MM-DD/agent-<user_slug>`).
  *   3. 1 entry の markdown を組み立てる (`buildSessionLogEntry`) — header
  *      に `space_type` / `space` / `thread` / `session_id` / `message_id`、
- *      本文に User / MAKOTOくん の発話.
+ *      本文に User / Agent の発話.
  *   4. 既存 memory を list → 該当 path が無ければ create、有れば retrieve
  *      → entry append → `<= max_bytes` なら update / 超過なら suffix を
  *      `-2 / -3 / ...` と進めて再試行 (`appendSessionLogMemory`).
@@ -187,28 +186,20 @@ export interface SessionLogBasePathParams {
 }
 
 /**
- * `/YYYY-MM-DD/<slug>` を構築する. shared space では space alias / displayName /
- * id から slug 化、DM では `dm-<user_slug_or_email_slug>`.
+ * `/YYYY-MM-DD/agent-<owner_slug>` を構築する。DM / shared space で
+ * path を分けず、発話者に紐づく owner agent の 1 日ログへ集約する。
  *
  * `cma_gchat_bot.py:_session_log_base_path` (l.321-340) の TS port.
  */
 export async function sessionLogBasePath(
   params: SessionLogBasePathParams,
 ): Promise<string> {
-  let slug: string;
-  if (isSharedSpace(params.spaceType)) {
-    const spaceId = params.space.name ?? '';
-    const aliased = params.reverseResolveAlias?.(spaceId) ?? null;
-    const alias = aliased || params.space.displayName || spaceId;
-    slug = await slugForMemoryPath(alias, spaceId || alias);
-  } else {
-    // DM: `dm-<slug>`. Python は user_slug を内側の slug 化に通す
-    // (already-slugged 文字列を再度通すと no-op) ので等価.
-    const fallbackSeed = params.sender.name || params.senderEmail;
-    const inner = await slugForMemoryPath(params.userSlug, fallbackSeed);
-    slug = `dm-${inner}`;
-  }
-  return `/${params.dateLabel}/${slug}`;
+  void params.spaceType;
+  void params.space;
+  void params.reverseResolveAlias;
+  const fallbackSeed = params.sender.name || params.senderEmail;
+  const inner = await slugForMemoryPath(params.userSlug, fallbackSeed);
+  return `/${params.dateLabel}/agent-${inner}`;
 }
 
 export interface SessionLogEntryParams {
@@ -257,7 +248,7 @@ export function buildSessionLogEntry(params: SessionLogEntryParams): string {
     `- session_id: ${safeSessionId}\n` +
     `- message_id: ${safeMessageId}\n\n` +
     `### User\n\n${userBody}\n\n` +
-    `### MAKOTOくん\n\n${finalBody}\n`
+    `### Agent\n\n${finalBody}\n`
   );
 }
 
@@ -266,29 +257,39 @@ export function buildSessionLogEntry(params: SessionLogEntryParams): string {
 // ============================================================================
 
 /**
- * `cma_gchat_bot.py:_select_session_log_attachment` (l.293-310) の TS port.
- *
- * shared space では `session_log_shared_store` / DM では `session_log_dm_store`
- * を `store_name` 一致で選ぶ. 後方互換として store_name が空の旧 mapping
- * では `instructions` 文字列に「共有スペース」/「DM (個人 1:1)」 +
- * 「セッションログ」が含まれているかで判定する.
+ * Unified owner-agent memory. DM / shared space で保存先を分けない。
+ * New mappings should use numbered stores such as `agent_0001_session_log_store`;
+ * old mappings can keep `agent_session_log_store` or `session_log_dm_store`
+ * as owner log aliases.
  */
 export function selectSessionLogAttachment(
   spaceType: string,
   attachments: MemoryAttachment[],
 ): MemoryAttachment | null {
-  const target = isSharedSpace(spaceType)
-    ? 'session_log_shared_store'
-    : 'session_log_dm_store';
-  for (const att of attachments) {
-    if (att.store_name === target) return att;
+  void spaceType;
+  const preferred: Array<(storeName: string) => boolean> = [
+    (storeName) => /^agent_\d{4}_session_log_store$/.test(storeName),
+    (storeName) => storeName === 'agent_session_log_store',
+    (storeName) => storeName === 'session_log_store',
+    (storeName) => storeName === 'session_log_dm_store',
+    (storeName) => storeName === 'session_log_shared_store',
+  ];
+  for (const matches of preferred) {
+    for (const att of attachments) {
+      if (matches(att.store_name ?? '')) return att;
+    }
   }
-  // Backward compatibility: instructions 文字列で判定.
-  const needle =
-    target === 'session_log_shared_store' ? '共有スペース' : 'DM (個人 1:1)';
+  // Backward compatibility: instructions 文字列で判定。DM legacy を先に見る。
+  const instructionNeedles = ['agent', 'DM (個人 1:1)', '共有スペース'];
+  for (const needle of instructionNeedles) {
+    for (const att of attachments) {
+      const ins = att.instructions ?? '';
+      if (ins.includes(needle) && ins.includes('セッションログ')) return att;
+    }
+  }
   for (const att of attachments) {
-    const ins = att.instructions ?? '';
-    if (ins.includes(needle) && ins.includes('セッションログ')) return att;
+    const name = att.store_name ?? '';
+    if (name.includes('session') && name.includes('log')) return att;
   }
   return null;
 }

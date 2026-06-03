@@ -1,6 +1,6 @@
 /**
- * Unit tests for `src/scheduled/daily-report.ts` — Cloud Run の
- * `scripts/cma_daily_report.py` の TS port が byte 等価で動くことを担保する.
+ * Unit tests for `src/scheduled/daily-report.ts` — owner-agent unified
+ * daily-report routing.
  *
  * 純関数 (storeIdFromEntry / dailyReportPrompt / defaultDateLabel /
  * routeStorePairs) と SDK-driven (`generateDailyReports`) の 2 群に分け、
@@ -30,12 +30,12 @@ describe('storeIdFromEntry', () => {
       user_slug: 'alice',
       agent_id: 'agent_x',
       memory_attachments: [
-        { memory_store_id: 'memstore_dm_log', access: 'read_write', store_name: 'session_log_dm_store' },
-        { memory_store_id: 'memstore_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
+        { memory_store_id: 'memstore_agent_log', access: 'read_write', store_name: 'agent_0001_session_log_store' },
+        { memory_store_id: 'memstore_agent_report', access: 'read_write', store_name: 'agent_0001_daily_report_store' },
       ],
     };
-    expect(storeIdFromEntry(entry, 'session_log_dm_store')).toBe('memstore_dm_log');
-    expect(storeIdFromEntry(entry, 'session_log_shared_store')).toBe('memstore_shared_log');
+    expect(storeIdFromEntry(entry, 'agent_session_log_store')).toBe('memstore_agent_log');
+    expect(storeIdFromEntry(entry, 'agent_daily_report_store')).toBe('memstore_agent_report');
   });
 
   it('falls back to instructions substring match when store_name missing (legacy mapping)', () => {
@@ -88,16 +88,17 @@ describe('storeIdFromEntry', () => {
 // ============================================================================
 
 describe('dailyReportPrompt', () => {
-  it('produces byte-equivalent prompt to Python _daily_report_prompt', () => {
-    const route = REPORT_ROUTES[1]; // shared
+  it('produces the owner-agent unified report prompt', () => {
+    const route = REPORT_ROUTES[0];
     const logs: Array<[string, string]> = [
-      ['/2026-05-25/dm-keisuke-seto.md', 'こんにちは'],
-      ['/2026-05-25/it-dev.md', 'プロジェクト議論'],
+      ['/2026-05-25/agent-keisuke-seto.md', 'DMの会話'],
+      ['/2026-05-25/agent-keisuke-seto-2.md', '共有スペースの会話'],
     ];
     const expected =
-      '2026-05-25 の 共有スペース日報 を作成してください。\n' +
+      '2026-05-25 の エージェント日報 を作成してください。\n' +
       '入力ログだけを根拠にし、推測で補完しないでください。\n' +
-      '個人DMと共有スペースの内容を混在させないでください。\n' +
+      'DM と共有スペースを分けず、同じ owner agent の出来事として扱ってください。\n' +
+      'ただし、ログ中の space_type / space / thread は場所情報として残してください。\n' +
       'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
       '形式:\n' +
       '# YYYY-MM-DD 日報\n' +
@@ -105,10 +106,10 @@ describe('dailyReportPrompt', () => {
       '## 決定事項\n' +
       '## 未完了・次アクション\n' +
       '## 注意点\n\n' +
-      '## Source: /2026-05-25/dm-keisuke-seto.md\n\n' +
-      'こんにちは\n\n' +
-      '## Source: /2026-05-25/it-dev.md\n\n' +
-      'プロジェクト議論';
+      '## Source: /2026-05-25/agent-keisuke-seto.md\n\n' +
+      'DMの会話\n\n' +
+      '## Source: /2026-05-25/agent-keisuke-seto-2.md\n\n' +
+      '共有スペースの会話';
     expect(dailyReportPrompt(route, '2026-05-25', logs)).toBe(expected);
   });
 
@@ -124,8 +125,8 @@ describe('dailyReportPrompt', () => {
   });
 
   it('uses the route.title verbatim', () => {
-    const dm = dailyReportPrompt(REPORT_ROUTES[0], '2026-05-25', [['/2026-05-25/x.md', 'x']]);
-    expect(dm.startsWith('2026-05-25 の DM 日報 を作成してください。\n')).toBe(true);
+    const prompt = dailyReportPrompt(REPORT_ROUTES[0], '2026-05-25', [['/2026-05-25/x.md', 'x']]);
+    expect(prompt.startsWith('2026-05-25 の エージェント日報 を作成してください。\n')).toBe(true);
   });
 });
 
@@ -154,8 +155,8 @@ const aliceMapping: UserMappingValue = {
   user_slug: 'alice',
   agent_id: 'agent_a',
   memory_attachments: [
-    { memory_store_id: 'memstore_alice_dm_log', access: 'read_write', store_name: 'session_log_dm_store' },
-    { memory_store_id: 'memstore_alice_dm_report', access: 'read_write', store_name: 'daily_report_dm_store' },
+    { memory_store_id: 'memstore_alice_agent_log', access: 'read_write', store_name: 'agent_0001_session_log_store' },
+    { memory_store_id: 'memstore_alice_agent_report', access: 'read_write', store_name: 'agent_0001_daily_report_store' },
     { memory_store_id: 'memstore_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
     { memory_store_id: 'memstore_shared_report', access: 'read_write', store_name: 'daily_report_shared_store' },
   ],
@@ -164,51 +165,37 @@ const bobMapping: UserMappingValue = {
   user_slug: 'bob',
   agent_id: 'agent_b',
   memory_attachments: [
-    { memory_store_id: 'memstore_bob_dm_log', access: 'read_write', store_name: 'session_log_dm_store' },
-    { memory_store_id: 'memstore_bob_dm_report', access: 'read_write', store_name: 'daily_report_dm_store' },
+    { memory_store_id: 'memstore_bob_agent_log', access: 'read_write', store_name: 'agent_0002_session_log_store' },
+    { memory_store_id: 'memstore_bob_agent_report', access: 'read_write', store_name: 'agent_0002_daily_report_store' },
     { memory_store_id: 'memstore_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
     { memory_store_id: 'memstore_shared_report', access: 'read_write', store_name: 'daily_report_shared_store' },
   ],
 };
 
 describe('routeStorePairs', () => {
-  it('shared route returns one singleton tuple', () => {
-    const mapping = new Map<string, UserMappingValue>([
-      ['alice@example.com', aliceMapping],
-      ['bob@example.com', bobMapping],
-    ]);
-    const pairs = routeStorePairs(mapping, REPORT_ROUTES[1]); // shared
-    expect(pairs).toEqual([{
-      label: 'shared',
-      sourceStoreId: 'memstore_shared_log',
-      targetStoreId: 'memstore_shared_report',
-      agentId: 'agent_a',
-    }]);
-  });
-
-  it('DM route returns per-user tuples sorted by email', () => {
+  it('owner-agent route returns per-user tuples sorted by email', () => {
     const mapping = new Map<string, UserMappingValue>([
       ['bob@example.com', bobMapping],
       ['alice@example.com', aliceMapping],
     ]);
-    const pairs = routeStorePairs(mapping, REPORT_ROUTES[0]); // dm
+    const pairs = routeStorePairs(mapping, REPORT_ROUTES[0]);
     expect(pairs).toEqual([
       {
         label: 'alice',
-        sourceStoreId: 'memstore_alice_dm_log',
-        targetStoreId: 'memstore_alice_dm_report',
+        sourceStoreId: 'memstore_alice_agent_log',
+        targetStoreId: 'memstore_alice_agent_report',
         agentId: 'agent_a',
       },
       {
         label: 'bob',
-        sourceStoreId: 'memstore_bob_dm_log',
-        targetStoreId: 'memstore_bob_dm_report',
+        sourceStoreId: 'memstore_bob_agent_log',
+        targetStoreId: 'memstore_bob_agent_report',
         agentId: 'agent_b',
       },
     ]);
   });
 
-  it('DM route skips users with incomplete attachment set', () => {
+  it('owner-agent route skips users with incomplete attachment set', () => {
     const incomplete: UserMappingValue = {
       user_slug: 'carol',
       agent_id: 'agent_c',
@@ -225,8 +212,8 @@ describe('routeStorePairs', () => {
     expect(pairs).toEqual([
       {
         label: 'alice',
-        sourceStoreId: 'memstore_alice_dm_log',
-        targetStoreId: 'memstore_alice_dm_report',
+        sourceStoreId: 'memstore_alice_agent_log',
+        targetStoreId: 'memstore_alice_agent_report',
         agentId: 'agent_a',
       },
     ]);
@@ -245,7 +232,7 @@ describe('routeStorePairs', () => {
     expect(pairs[0]?.agentId).toBe('agent_015g2g4SKACdzaPyQ8QiSi2o');
   });
 
-  it('throws when no user-scoped DM pair is found', () => {
+  it('throws when no owner-agent pair is found', () => {
     const mapping = new Map<string, UserMappingValue>([
       [
         'alice@example.com',
@@ -256,7 +243,7 @@ describe('routeStorePairs', () => {
         },
       ],
     ]);
-    expect(() => routeStorePairs(mapping, REPORT_ROUTES[0])).toThrow(/no user-scoped DM daily-report stores/);
+    expect(() => routeStorePairs(mapping, REPORT_ROUTES[0])).toThrow(/no owner-agent daily-report stores/);
   });
 });
 
@@ -442,13 +429,10 @@ function makeMockClient(
   return { client, stores, captured, calls };
 }
 
-const DM_LOG_ALICE = 'memstore_alice_dm_log';
-const DM_REPORT_ALICE = 'memstore_alice_dm_report';
-const DM_LOG_BOB = 'memstore_bob_dm_log';
-const DM_REPORT_BOB = 'memstore_bob_dm_report';
-const SHARED_LOG = 'memstore_shared_log';
-const SHARED_REPORT = 'memstore_shared_report';
-
+const AGENT_LOG_ALICE = 'memstore_alice_agent_log';
+const AGENT_REPORT_ALICE = 'memstore_alice_agent_report';
+const AGENT_LOG_BOB = 'memstore_bob_agent_log';
+const AGENT_REPORT_BOB = 'memstore_bob_agent_report';
 async function seedMapping(kv: ReturnType<typeof makeKv>) {
   await kv.put('user_mapping:alice@example.com', JSON.stringify(aliceMapping));
   await kv.put('user_mapping:bob@example.com', JSON.stringify(bobMapping));
@@ -460,13 +444,12 @@ describe('generateDailyReports', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
-  it('iterates DM per-user + shared singleton in one tick', async () => {
+  it('iterates owner-agent reports per user in one tick', async () => {
     const kv = makeKv();
     await seedMapping(kv);
     const mock = makeMockClient({
-      [DM_LOG_ALICE]: [{ type: 'memory', id: 'mem_a1', path: '/2026-05-25/x.md', content: 'alice log' }],
-      [DM_LOG_BOB]: [{ type: 'memory', id: 'mem_b1', path: '/2026-05-25/x.md', content: 'bob log' }],
-      [SHARED_LOG]: [{ type: 'memory', id: 'mem_s1', path: '/2026-05-25/x.md', content: 'shared log' }],
+      [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'mem_a1', path: '/2026-05-25/x.md', content: 'alice log' }],
+      [AGENT_LOG_BOB]: [{ type: 'memory', id: 'mem_b1', path: '/2026-05-25/x.md', content: 'bob log' }],
     });
 
     const result = await generateDailyReports({
@@ -479,16 +462,14 @@ describe('generateDailyReports', () => {
       dryRun: false,
     });
 
-    expect(Object.keys(result).sort()).toEqual(['dm:alice', 'dm:bob', 'shared']);
-    expect(result['dm:alice'].log_count).toBe(1);
-    expect(result['dm:bob'].log_count).toBe(1);
-    expect(result['shared'].log_count).toBe(1);
-    expect(result['dm:alice'].session_id).toBeDefined();
-    expect(result['dm:bob'].session_id).toBeDefined();
-    expect(result['shared'].session_id).toBeDefined();
-    expect(result['dm:alice'].tool_use_count).toBe(0);
-    expect(mock.calls.sessions).toBe(3);
-    expect(mock.calls.create).toBe(3); // 3 reports written.
+    expect(Object.keys(result).sort()).toEqual(['agent:alice', 'agent:bob']);
+    expect(result['agent:alice'].log_count).toBe(1);
+    expect(result['agent:bob'].log_count).toBe(1);
+    expect(result['agent:alice'].session_id).toBeDefined();
+    expect(result['agent:bob'].session_id).toBeDefined();
+    expect(result['agent:alice'].tool_use_count).toBe(0);
+    expect(mock.calls.sessions).toBe(2);
+    expect(mock.calls.create).toBe(2);
   });
 
   it('emits the empty-log fallback string verbatim when logs are 0 (no LLM call)', async () => {
@@ -508,12 +489,9 @@ describe('generateDailyReports', () => {
     });
 
     expect(mock.calls.sessions).toBe(0);
-    // 3 writes (alice/bob DM + shared) with the empty-log marker.
-    expect(mock.calls.create).toBe(3);
-    const written = mock.stores.get(DM_REPORT_ALICE)?.get('/2026-05-25.md');
-    expect(written?.content).toBe('# 2026-05-25 DM 日報\n\n新着セッションなし。\n');
-    const sharedWritten = mock.stores.get(SHARED_REPORT)?.get('/2026-05-25.md');
-    expect(sharedWritten?.content).toBe('# 2026-05-25 共有スペース日報\n\n新着セッションなし。\n');
+    expect(mock.calls.create).toBe(2);
+    const written = mock.stores.get(AGENT_REPORT_ALICE)?.get('/2026-05-25.md');
+    expect(written?.content).toBe('# 2026-05-25 エージェント日報\n\n新着セッションなし。\n');
   });
 
   it('writes the response content[0].text + newline when logs are present', async () => {
@@ -521,7 +499,7 @@ describe('generateDailyReports', () => {
     await seedMapping(kv);
     const mock = makeMockClient(
       {
-        [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
+        [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
       },
       { summarizeText: () => '# 2026-05-25 日報\n\n## 主な話題\n- 進捗共有' },
     );
@@ -534,7 +512,7 @@ describe('generateDailyReports', () => {
       environmentId: 'env_test',
       dryRun: false,
     });
-    const written = mock.stores.get(DM_REPORT_ALICE)?.get('/2026-05-25.md');
+    const written = mock.stores.get(AGENT_REPORT_ALICE)?.get('/2026-05-25.md');
     // Python: `"".join(chunks).strip() + "\n"`.
     expect(written?.content).toBe('# 2026-05-25 日報\n\n## 主な話題\n- 進捗共有\n');
   });
@@ -544,7 +522,7 @@ describe('generateDailyReports', () => {
     await seedMapping(kv);
     const mock = makeMockClient(
       {
-        [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
+        [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
       },
       { emitToolUse: true },
     );
@@ -559,10 +537,10 @@ describe('generateDailyReports', () => {
       dryRun: false,
     });
 
-    expect(result['dm:alice'].session_id).toMatch(/^ses_/);
-    expect(result['dm:alice'].error).toMatch(/tool use forbidden/);
-    expect(result['dm:alice'].tool_use_count).toBe(0);
-    expect(mock.stores.get(DM_REPORT_ALICE)?.get('/2026-05-25.md')).toBeUndefined();
+    expect(result['agent:alice'].session_id).toMatch(/^ses_/);
+    expect(result['agent:alice'].error).toMatch(/tool use forbidden/);
+    expect(result['agent:alice'].tool_use_count).toBe(0);
+    expect(mock.stores.get(AGENT_REPORT_ALICE)?.get('/2026-05-25.md')).toBeUndefined();
   });
 
   it('requires explicit or known mapping agent_id even when logs are empty', async () => {
@@ -584,8 +562,7 @@ describe('generateDailyReports', () => {
       dryRun: false,
     });
 
-    expect(result['dm:alice'].error).toMatch(/daily-report agent_id missing/);
-    expect(result['shared'].error).toMatch(/daily-report agent_id missing/);
+    expect(result['agent:alice'].error).toMatch(/daily-report agent_id missing/);
     expect(mock.calls.sessions).toBe(0);
     expect(mock.calls.create).toBe(0);
   });
@@ -595,8 +572,8 @@ describe('generateDailyReports', () => {
     await seedMapping(kv);
     const mock = makeMockClient(
       {
-        [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'log' }],
-        [DM_REPORT_ALICE]: [{ type: 'memory', id: 'r1', path: '/2026-05-25.md', content: '旧日報' }],
+        [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'log' }],
+        [AGENT_REPORT_ALICE]: [{ type: 'memory', id: 'r1', path: '/2026-05-25.md', content: '旧日報' }],
       },
       { summarizeText: () => '新日報' },
     );
@@ -609,7 +586,7 @@ describe('generateDailyReports', () => {
       environmentId: 'env_test',
       dryRun: false,
     });
-    const written = mock.stores.get(DM_REPORT_ALICE)?.get('/2026-05-25.md');
+    const written = mock.stores.get(AGENT_REPORT_ALICE)?.get('/2026-05-25.md');
     expect(written?.id).toBe('r1'); // same id = update path
     expect(written?.content).toBe('新日報\n');
     // alice DM report was updated, bob's was created (no preseed).
@@ -620,7 +597,7 @@ describe('generateDailyReports', () => {
     const kv = makeKv();
     await seedMapping(kv);
     const mock = makeMockClient({
-      [SHARED_LOG]: [{ type: 'memory', id: 's1', path: '/2026-05-25/it-dev.md', content: 'プロジェクト議論' }],
+      [AGENT_LOG_ALICE]: [{ type: 'memory', id: 's1', path: '/2026-05-25/agent-alice.md', content: 'プロジェクト議論' }],
     });
     await generateDailyReports({
       kv,
@@ -631,15 +608,15 @@ describe('generateDailyReports', () => {
       environmentId: 'env_test',
       dryRun: false,
     });
-    // The shared-route managed session call is the one we want to inspect.
-    const sharedCapture = mock.captured.find((c) => c.user_prompt.includes('共有スペース日報'));
-    expect(sharedCapture).toBeDefined();
-    expect(sharedCapture!.agent_id).toBe('agent_a');
-    expect(sharedCapture!.environment_id).toBe('env_test');
-    expect(sharedCapture!.user_prompt).toBe(
-        '2026-05-25 の 共有スペース日報 を作成してください。\n' +
+    const capture = mock.captured.find((c) => c.user_prompt.includes('エージェント日報'));
+    expect(capture).toBeDefined();
+    expect(capture!.agent_id).toBe('agent_a');
+    expect(capture!.environment_id).toBe('env_test');
+    expect(capture!.user_prompt).toBe(
+        '2026-05-25 の エージェント日報 を作成してください。\n' +
         '入力ログだけを根拠にし、推測で補完しないでください。\n' +
-        '個人DMと共有スペースの内容を混在させないでください。\n' +
+        'DM と共有スペースを分けず、同じ owner agent の出来事として扱ってください。\n' +
+        'ただし、ログ中の space_type / space / thread は場所情報として残してください。\n' +
         'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
         '形式:\n' +
         '# YYYY-MM-DD 日報\n' +
@@ -647,7 +624,7 @@ describe('generateDailyReports', () => {
         '## 決定事項\n' +
         '## 未完了・次アクション\n' +
         '## 注意点\n\n' +
-        '## Source: /2026-05-25/it-dev.md\n\n' +
+        '## Source: /2026-05-25/agent-alice.md\n\n' +
         'プロジェクト議論',
     );
   });
@@ -655,13 +632,11 @@ describe('generateDailyReports', () => {
   it('isolates managed session failure to one user', async () => {
     const kv = makeKv();
     await seedMapping(kv);
-    // Alice session stream throws (prompt starts with '2026-05-25 の DM');
-    // Bob and shared continue to succeed.
+    // Alice session stream throws; Bob continues to succeed.
     const mock = makeMockClient(
       {
-        [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
-        [DM_LOG_BOB]: [{ type: 'memory', id: 'b1', path: '/2026-05-25/x.md', content: 'bob本文' }],
-        [SHARED_LOG]: [{ type: 'memory', id: 's1', path: '/2026-05-25/x.md', content: 'shared本文' }],
+        [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
+        [AGENT_LOG_BOB]: [{ type: 'memory', id: 'b1', path: '/2026-05-25/x.md', content: 'bob本文' }],
       },
       {
         // Inject failure only on alice's call by matching her log content.
@@ -678,18 +653,16 @@ describe('generateDailyReports', () => {
       environmentId: 'env_test',
       dryRun: false,
     });
-    expect(result['dm:alice'].error).toMatch(/session stream injected failure/);
-    expect(result['dm:bob'].error).toBeUndefined();
-    expect(result['shared'].error).toBeUndefined();
-    // Bob + shared still wrote (alice did not).
-    expect(mock.calls.create).toBe(2);
+    expect(result['agent:alice'].error).toMatch(/session stream injected failure/);
+    expect(result['agent:bob'].error).toBeUndefined();
+    expect(mock.calls.create).toBe(1);
   });
 
   it('does not write when dryRun is true', async () => {
     const kv = makeKv();
     await seedMapping(kv);
     const mock = makeMockClient({
-      [DM_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
+      [AGENT_LOG_ALICE]: [{ type: 'memory', id: 'a1', path: '/2026-05-25/x.md', content: 'alice本文' }],
     });
     await generateDailyReports({
       kv,

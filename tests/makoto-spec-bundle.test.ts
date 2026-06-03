@@ -96,5 +96,6 @@ describe('makoto-prime spec bundle (generated src/data/*.ts)', () => {
     expect(r.systemPrompt).toContain('attached Managed Agent skill');
     expect(r.systemPrompt).toContain('custom tool / action marker');
     expect(r.systemPrompt).toContain('`slash_skills` と `attached_skills`');
+    expect(r.systemPrompt).toContain('`drive_stage_file` custom tool');
   });
 });

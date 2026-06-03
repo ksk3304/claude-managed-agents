@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildDefaultDeployMessage,
   buildDeployFailureMessage,
+  hasDeployMessageArg,
   isWorkersAuthFailure,
 } from "../scripts/deploy-with-diagnostics.mjs";
 
@@ -30,5 +32,17 @@ describe("deploy diagnostics", () => {
 
   it("can be imported by tests without running deploy", () => {
     expect(typeof buildDeployFailureMessage).toBe("function");
+  });
+
+  it("detects explicit deploy messages", () => {
+    expect(hasDeployMessageArg(["--strict", "--message", "cf-repo=abc"])).toBe(true);
+    expect(hasDeployMessageArg(["--strict", "--message=cf-repo=abc"])).toBe(true);
+    expect(hasDeployMessageArg(["--strict"])).toBe(false);
+  });
+
+  it("prefers CF_DEPLOY_MESSAGE for deploy lineage", () => {
+    expect(buildDefaultDeployMessage({ CF_DEPLOY_MESSAGE: "cf-repo=abc issue=246" })).toBe(
+      "cf-repo=abc issue=246",
+    );
   });
 });

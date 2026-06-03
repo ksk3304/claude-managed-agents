@@ -36,7 +36,10 @@ import {
   ensureManagedAgentMcp,
   playwrightMcpHash,
 } from './managed-agent-mcp';
-import type { UserMappingValue } from './memory-attach';
+import {
+  routeMemoryAttachmentsForSession,
+  type UserMappingValue,
+} from './memory-attach';
 import {
   buildAnthropicClient,
   createSessionWithResources,
@@ -104,14 +107,21 @@ export function buildChatCapabilitySessionKeyFromHashes(
   return `tools-${desiredAgentToolsHash}:skills-${attachedSkillsHash}:mcp-${mcpHash}`;
 }
 
-export async function buildChatCapabilitySessionKey(env: Env): Promise<string> {
+export async function buildChatCapabilitySessionKey(
+  env: Env,
+  resources: MemoryStoreResourceParam[] = [],
+): Promise<string> {
   const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
   const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
   const desiredMcpHash = await playwrightMcpHash(buildPlaywrightMcpConfig(env));
-  return buildChatCapabilitySessionKeyFromHashes(
-    desiredAgentToolsHash,
-    attachedSkillsHash,
-    desiredMcpHash,
+  const memoryResourcesHash = await toolsHash(resources.map((resource) => ({ ...resource })));
+  return (
+    buildChatCapabilitySessionKeyFromHashes(
+      desiredAgentToolsHash,
+      attachedSkillsHash,
+      desiredMcpHash,
+    ) +
+    `:memory-${memoryResourcesHash}`
   );
 }
 
@@ -239,6 +249,10 @@ export interface OrchestrateChatTurnResult {
    * `'stream_terminated'` / `'events_send_failed'` 等。
    */
   stopReason?: string;
+  /** stream 中に観測した tool-use event 件数。 */
+  toolUseCount: number;
+  /** stream 中に観測した tool 名。重複なし、観測順。 */
+  toolUseNames: string[];
   /** 起動ログ用に取得した system prompt sha 等。caller が必要なら参照. */
   systemPromptInfo: SystemPromptResult;
 }
@@ -432,6 +446,19 @@ export async function orchestrateChatTurn(
     );
   }
 
+  // ---- Memory Store router ----
+  // sessions.create の resources[] は caller 側が決める。1 session 最大
+  // 8 Memory Store に収めるため、Cloudflare 側で選定してから session key
+  // と resources の両方へ反映する。
+  const routedMemory = routeMemoryAttachmentsForSession(
+    input.userMapping.memory_attachments,
+    { spaceType: input.spaceType },
+  );
+  const resources: MemoryStoreResourceParam[] = routedMemory.selected.map(toResourceParam);
+  const memoryResourcesHash = await toolsHash(
+    resources.map((resource) => ({ ...resource })),
+  );
+
   // ---- thread session 解決 ----
   // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
   // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
@@ -441,7 +468,7 @@ export async function orchestrateChatTurn(
     desiredAgentToolsHash,
     attachedSkillsHash,
     desiredMcpHash,
-  );
+  ) + `:memory-${memoryResourcesHash}`;
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
     ? null
@@ -466,8 +493,6 @@ export async function orchestrateChatTurn(
 
   let isNewSession = false;
   if (sessionId === null) {
-    const resources: MemoryStoreResourceParam[] =
-      input.userMapping.memory_attachments.map(toResourceParam);
     const agentId = input.userMapping.agent_id;
     const environmentId = input.env.ENVIRONMENT_ID;
     const attachedSkills = input.attachedSkills ?? null;
@@ -496,7 +521,8 @@ export async function orchestrateChatTurn(
     isNewSession = true;
     console.log(
       `[chat-event] created session=${sessionId} agent=${agentId} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}` +
+        `user=${input.userMapping.user_slug} space=${input.spaceName} ` +
+        `memory_stores=${resources.length}/${routedMemory.max_stores}` +
         (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
     if (sessionKey !== null) {
@@ -514,7 +540,8 @@ export async function orchestrateChatTurn(
   } else {
     console.log(
       `[chat-event] continuing session=${sessionId} agent=${input.userMapping.agent_id} ` +
-        `user=${input.userMapping.user_slug} space=${input.spaceName}`,
+        `user=${input.userMapping.user_slug} space=${input.spaceName} ` +
+        `memory_stores=${resources.length}/${routedMemory.max_stores}`,
     );
   }
 
@@ -541,6 +568,12 @@ export async function orchestrateChatTurn(
         session_key_kind: sessionKey === null ? 'none' : 'chat_thread',
         thread_name_present: Boolean(input.threadName),
         has_thread_session_key: sessionKey !== null,
+        memory_router_strategy: routedMemory.strategy,
+        memory_store_count: resources.length,
+        memory_store_dropped_count: routedMemory.dropped.length,
+        selected_memory_store_names: routedMemory.selected_store_names,
+        dropped_memory_store_names: routedMemory.dropped_store_names,
+        memory_resources_hash: memoryResourcesHash,
       },
     });
   }
@@ -688,6 +721,8 @@ export async function orchestrateChatTurn(
     sessionId,
     isNewSession,
     assistantText: streamResult.assistantText,
+    toolUseCount: streamResult.toolUseCount,
+    toolUseNames: streamResult.toolUseNames,
     systemPromptInfo,
   };
   if (streamResult.terminalEventType !== undefined) {

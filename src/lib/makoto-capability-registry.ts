@@ -10,6 +10,7 @@ export type MakotoToolName =
   | 'drive_get_file_metadata'
   | 'drive_read_export'
   | 'drive_create_file'
+  | 'drive_stage_file'
   | 'drive_delete'
   | 'sheets_create'
   | 'sheets_read'
@@ -19,7 +20,16 @@ export type MakotoToolName =
   | 'agentmail_read'
   | 'makoto_introspect';
 
-type IntrospectionDetail = 'summary' | 'tools' | 'skills' | 'limits' | 'mcp' | 'all';
+type IntrospectionDetail =
+  | 'summary'
+  | 'tools'
+  | 'skills'
+  | 'limits'
+  | 'mcp'
+  | 'memory'
+  | 'routing'
+  | 'classification'
+  | 'all';
 
 const INTROSPECTION_DETAILS = new Set<IntrospectionDetail>([
   'summary',
@@ -27,6 +37,9 @@ const INTROSPECTION_DETAILS = new Set<IntrospectionDetail>([
   'skills',
   'limits',
   'mcp',
+  'memory',
+  'routing',
+  'classification',
   'all',
 ]);
 
@@ -57,6 +70,13 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
   {
     name: 'drive_create_file',
     description: 'Create a Google Drive file within size limits.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: true,
+  },
+  {
+    name: 'drive_stage_file',
+    description:
+      'Download an existing Drive Office/PDF binary and mount it into the active session for document skills; save edited output under /mnt/session/outputs.',
     status: 'cloudflare_code_live_unverified',
     requires_workspace_oauth: true,
   },
@@ -187,7 +207,7 @@ export async function buildMakotoIntrospection(
 
   const base: Record<string, unknown> = {
     schema_version: 2,
-    product: 'MAKOTOくん Cloudflare版',
+    product: '汎用CMAエージェント Cloudflare版',
     runtime: 'cloudflare_worker',
     generated_at: new Date().toISOString(),
     requested_detail: detail,
@@ -201,15 +221,44 @@ export async function buildMakotoIntrospection(
     prompt_source: promptSource,
     summary: [
       'Google Chat and AgentMail entrypoints drive Anthropic Managed Agent sessions on Cloudflare Workers.',
-      'MAKOTO uses per-user Google Workspace OAuth only through Worker-side tools; credentials are not exposed to the agent.',
-      'Memory attachments are resolved by user/scope before creating or reusing a session.',
+      'The agent uses per-user Google Workspace OAuth only through Worker-side tools; credentials are not exposed to the agent.',
+      'Memory attachments are resolved by Cloudflare-side routing before creating or reusing a session.',
       'External write/send/delete operations are guarded by custom tool or marker contracts.',
       'MCP is not an active Google Workspace path; current Workspace access is Worker-side REST tooling.',
       'Playwright MCP is feature-flagged and only attaches when URL and safety gates pass.',
     ],
+    identity_model: {
+      template: 'generic_agent',
+      instance_identity_source: 'agent/user mapping and per-agent memory, not hard-coded system prompt literals.',
+      instance_variables: [
+        'agent_number',
+        'agent_display_name',
+        'owner_display_name',
+        'organization_name',
+        'agent_role',
+        'voice_style',
+      ],
+    },
+    memory_strategy: {
+      plan: 'plan_b_memory_store_primary',
+      max_session_memory_stores: 8,
+      router_owner: 'src/lib/memory-attach.ts + src/lib/session-orchestrator.ts',
+      selection_point: 'Cloudflare Worker selects sessions.create resources[] before the CMA session starts.',
+      corporate_wiki: {
+        role: 'Interpreted corporate brain / LLM Wiki built on Memory Store.',
+        mount_policy: 'Always selected first when present.',
+        raw_source: 'Google Drive meeting minutes and documents remain primary source links.',
+      },
+      logs_and_reports: {
+        naming: 'Numbered agent-specific stores, e.g. agent_0001_session_log_store and agent_0001_daily_report_store.',
+        policy: 'Session logs and daily reports stay in one numbered owner-agent Memory Store regardless of DM or shared space.',
+        drive_role: 'Drive is source/archive for primary documents, not the default memory carrier.',
+      },
+    },
     cannot_claim: [
       'Do not claim active MCP connectors for Google Workspace; they are not the current implementation path.',
       'Do not claim Cloud Run is the primary runtime for Cloudflare版.',
+      'Do not claim the LLM automatically chooses which Memory Stores to mount; the Worker router chooses resources[].',
       'Do not claim env-specific Workspace operations are available for a user before OAuth/bootstrap/live verification.',
       'Do not expose secret names, token state, raw payload audit, session ids, or internal stack traces to normal Chat users.',
     ],
@@ -260,6 +309,47 @@ export async function buildMakotoIntrospection(
     };
   }
 
+  if (detail === 'memory' || detail === 'routing' || detail === 'classification' || detail === 'all') {
+    base.memory_router = {
+      strategy: 'plan_b_memory_store_router_v1',
+      hard_limit: 8,
+      priority_order: [
+        'corporate_wiki_memory / corporate_brain / company_wiki',
+        'company_core_memory',
+        'agent_0001_identity_memory / agent_0001_profile_memory / persona_memory',
+        'agent_0001_support_memory for the owner support context',
+        'agent_0001_daily_report_store / daily_report_store for the owner agent',
+        'agent_0001_session_log_store / session_log_store for the owner agent',
+        'legacy DM/shared daily/log aliases as compatibility inputs',
+        'remaining stores in declared order',
+      ],
+      privacy_rule:
+        'Owner-agent memory is unified across DM and shared spaces; shared-space replies still apply speaker/space permission and should not disclose unrelated private owner context.',
+      session_reuse_rule:
+        'Memory resources hash is included in the Chat session key so changed attachments do not reuse a stale session.',
+    };
+  }
+
+  if (detail === 'classification' || detail === 'all') {
+    base.system_memory_logic_classification = {
+      system_prompt: [
+        'Generic role, tone, output format, safety boundaries, trust boundary, and correct Cloudflare/CMA self-recognition.',
+        'Instance-specific identity is injected by mapping/addendum/memory, not hard-coded in the generic prompt.',
+        'What the agent must never claim, such as active Workspace MCP or Cloud Run as primary runtime.',
+      ],
+      memory: [
+        'Corporate wiki / LLM Wiki on Memory Store as interpreted company brain.',
+        'Numbered agent-specific identity/profile/support memory, company core facts, session logs, and daily reports, with owner-agent unified logs.',
+        'Google Drive links and primary source references recorded inside wiki/log entries when source tracing matters.',
+      ],
+      logic: [
+        'Cloudflare session resolver and Memory Store router selecting sessions.create resources[].',
+        'Permission gates for Workspace/AgentMail/Chat writes and per-user OAuth subject resolution.',
+        'Routing prompt / envelope logic that keeps lightweight turns from unnecessary tool, bash, Drive, or memory deep dives.',
+      ],
+    };
+  }
+
   if (detail === 'limits' || detail === 'all') {
     base.safety_boundaries = [
       'Does not expose secrets, OAuth tokens, environment keys, raw Cloudflare logs, or raw payload audit.',
@@ -267,7 +357,7 @@ export async function buildMakotoIntrospection(
       'Workspace tools execute with the resolved caller user permission, not borrowed agent ownership.',
       'Drive deletion is trash-only and requires confirmation token flow.',
       'Email, Chat posting, and schedule changes use bot-side markers and server-side gates.',
-      'Shared-space memory must not expose another person private DM memory or personal data.',
+      'Shared-space replies must not expose private owner memory unless the current request and permissions justify it.',
     ];
   }
 
@@ -352,6 +442,14 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
         },
         ['name', 'content'],
       );
+    case 'drive_stage_file':
+      return objectSchema(
+        {
+          file_id: stringProp('Google Drive file id for an existing .xlsx/.xlsm/.docx/.pptx/.pdf binary.'),
+          name: stringProp('Optional session mount filename with extension.'),
+        },
+        ['file_id'],
+      );
     case 'drive_delete':
       return objectSchema(
         {
@@ -410,7 +508,17 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
       return objectSchema(
         {
           detail: enumProp(
-            ['summary', 'tools', 'skills', 'limits', 'mcp', 'all'],
+            [
+              'summary',
+              'tools',
+              'skills',
+              'limits',
+              'mcp',
+              'memory',
+              'routing',
+              'classification',
+              'all',
+            ],
             'Requested inventory scope. Use all when unsure.',
           ),
           include_sources: {

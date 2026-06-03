@@ -16,9 +16,9 @@ import {
   type KvLike,
 } from '../src/cli/onboarding-core';
 import {
+  AGENT_SCOPED_STORES,
+  AGENT_SCOPED_STORE_SET,
   COMMON_STORES,
-  DM_ONLY_STORES,
-  USER_SCOPED_STORES,
   actualStoreName,
 } from '../src/cli/store-config';
 import { MAKOTO_TOOL_NAMES } from '../src/lib/makoto-capability-registry';
@@ -112,10 +112,11 @@ describe('initUserMemoryStores', () => {
       anthropic: ant,
       kv,
       userSlug: 'yamada',
+      agentNumber: '0001',
       dryRun: true,
     });
     expect(Object.keys(r.stores).sort()).toEqual(
-      DM_ONLY_STORES.map((n) => actualStoreName(n, 'yamada')).sort(),
+      AGENT_SCOPED_STORES.map((n) => actualStoreName(n, '0001')).sort(),
     );
     for (const id of Object.values(r.stores)) {
       expect(id.startsWith('DRY_RUN_')).toBe(true);
@@ -131,17 +132,17 @@ describe('initUserMemoryStores', () => {
       anthropic: ant,
       kv,
       userSlug: 'yamada',
+      agentNumber: '0001',
       dryRun: false,
     });
-    // 2 stores created (= DM_ONLY_STORES)
-    expect(ant._created.length).toBe(DM_ONLY_STORES.length);
+    expect(ant._created.length).toBe(AGENT_SCOPED_STORES.length);
     // KV cached
     for (const [actualName, id] of Object.entries(r.stores)) {
       expect(kv._store.get(`memstore_id:${actualName}`)).toBe(id);
     }
-    // Names are <logical>__<slug>
-    for (const logical of DM_ONLY_STORES) {
-      const actual = `${logical}__yamada`;
+    // Names are agent_<number>_<purpose>.
+    for (const logical of AGENT_SCOPED_STORES) {
+      const actual = actualStoreName(logical, '0001');
       expect(r.stores[actual]).toBeDefined();
     }
   });
@@ -150,7 +151,13 @@ describe('initUserMemoryStores', () => {
     const kv = makeKvFake();
     const ant = makeAnthropicFake();
     // 1st run: create
-    await initUserMemoryStores({ anthropic: ant, kv, userSlug: 'yamada', dryRun: false });
+    await initUserMemoryStores({
+      anthropic: ant,
+      kv,
+      userSlug: 'yamada',
+      agentNumber: '0001',
+      dryRun: false,
+    });
     const createdFirst = ant._created.length;
     expect(createdFirst).toBeGreaterThan(0);
     // 2nd run: should hit KV cache
@@ -158,16 +165,17 @@ describe('initUserMemoryStores', () => {
       anthropic: ant,
       kv,
       userSlug: 'yamada',
+      agentNumber: '0001',
       dryRun: false,
     });
     expect(ant._created.length).toBe(createdFirst); // no new creates
     expect(r2.created).toEqual([]);
-    expect(r2.cached.length).toBe(DM_ONLY_STORES.length);
+    expect(r2.cached.length).toBe(AGENT_SCOPED_STORES.length);
   });
 
   it('falls back to list() when KV cache is empty but the store already exists upstream', async () => {
     const kv = makeKvFake();
-    const actualName = actualStoreName('session_log_dm_store', 'yamada');
+    const actualName = actualStoreName('agent_session_log_store', '0001');
     const ant = makeAnthropicFake({
       existing: [{ id: 'memstore_pre_existing_1', name: actualName }],
     });
@@ -175,11 +183,11 @@ describe('initUserMemoryStores', () => {
       anthropic: ant,
       kv,
       userSlug: 'yamada',
+      agentNumber: '0001',
       dryRun: false,
     });
     expect(r.stores[actualName]).toBe('memstore_pre_existing_1');
-    // The other DM-only store still needs creation
-    expect(ant._created.length).toBe(DM_ONLY_STORES.length - 1);
+    expect(ant._created.length).toBe(AGENT_SCOPED_STORES.length - 1);
     // KV is now populated for both
     expect(kv._store.get(`memstore_id:${actualName}`)).toBe('memstore_pre_existing_1');
   });
@@ -262,10 +270,10 @@ describe('copyAgent', () => {
 // ---- registerUserMapping ----
 
 describe('registerUserMapping', () => {
-  function makeStoreIdsForSlug(slug: string): Record<string, string> {
+  function makeStoreIdsForAgent(agentNumber: string): Record<string, string> {
     const out: Record<string, string> = {};
     for (const logical of COMMON_STORES) {
-      const actual = actualStoreName(logical, slug);
+      const actual = actualStoreName(logical, agentNumber);
       out[actual] = `memstore_id_for_${actual}`;
     }
     return out;
@@ -280,6 +288,7 @@ describe('registerUserMapping', () => {
       storeIds: {}, // dry-run なので missing チェックは走らない (skip)
       userEmail: 'YAMADA@Example.COM',
       userSlug: 'yamada',
+      agentNumber: '0001',
       agentId: 'agent_y',
       displayName: '山田 太郎',
       addendum: 'addendum',
@@ -298,9 +307,10 @@ describe('registerUserMapping', () => {
     const r = await registerUserMapping({
       kv,
       audit,
-      storeIds: makeStoreIdsForSlug('yamada'),
+      storeIds: makeStoreIdsForAgent('0001'),
       userEmail: 'yamada@example.com',
       userSlug: 'yamada',
+      agentNumber: '0001',
       agentId: 'agent_y',
       displayName: '山田 太郎',
       chatUserId: 'users/12345',
@@ -312,15 +322,15 @@ describe('registerUserMapping', () => {
     expect(kv._store.get('user_mapping:yamada@example.com')).toBeDefined();
     const stored = JSON.parse(kv._store.get('user_mapping:yamada@example.com')!);
     expect(stored.user_slug).toBe('yamada');
+    expect(stored.agent_number).toBe('0001');
     expect(stored.agent_id).toBe('agent_y');
     expect(stored.memory_attachments.length).toBe(COMMON_STORES.length);
-    // user-scoped store には slug suffix 付き actual_name で resolve されている
-    const dmAttachment = stored.memory_attachments.find(
-      (a: { store_name: string }) => a.store_name === 'session_log_dm_store__yamada',
+    const logAttachment = stored.memory_attachments.find(
+      (a: { store_name: string }) => a.store_name === 'agent_0001_session_log_store',
     );
-    expect(dmAttachment).toBeDefined();
-    expect(dmAttachment.memory_store_id).toBe(
-      'memstore_id_for_session_log_dm_store__yamada',
+    expect(logAttachment).toBeDefined();
+    expect(logAttachment.memory_store_id).toBe(
+      'memstore_id_for_agent_0001_session_log_store',
     );
     // audit row
     expect(audit._rows.length).toBe(1);
@@ -336,7 +346,7 @@ describe('registerUserMapping', () => {
   it('re-register (same email, new agent_id) marks event_type as re-register', async () => {
     const kv = makeKvFake();
     const audit = makeAuditFake();
-    const storeIds = makeStoreIdsForSlug('yamada');
+    const storeIds = makeStoreIdsForAgent('0001');
     // 1st: register
     await registerUserMapping({
       kv,
@@ -344,6 +354,7 @@ describe('registerUserMapping', () => {
       storeIds,
       userEmail: 'yamada@example.com',
       userSlug: 'yamada',
+      agentNumber: '0001',
       agentId: 'agent_first',
       displayName: '山田',
       addendum: 'x',
@@ -356,6 +367,7 @@ describe('registerUserMapping', () => {
       storeIds,
       userEmail: 'yamada@example.com',
       userSlug: 'yamada',
+      agentNumber: '0001',
       agentId: 'agent_second',
       displayName: '山田',
       addendum: 'x',
@@ -378,6 +390,7 @@ describe('registerUserMapping', () => {
         storeIds: {}, // missing all
         userEmail: 'yamada@example.com',
         userSlug: 'yamada',
+        agentNumber: '0001',
         agentId: 'agent_y',
         displayName: '山田',
         addendum: 'x',
@@ -394,15 +407,15 @@ describe('registerUserMapping', () => {
 // ---- store-config sanity ----
 
 describe('store-config', () => {
-  it('USER_SCOPED_STORES = DM_ONLY_STORES', () => {
-    expect([...USER_SCOPED_STORES].sort()).toEqual([...DM_ONLY_STORES].sort());
+  it('AGENT_SCOPED_STORE_SET = AGENT_SCOPED_STORES', () => {
+    expect([...AGENT_SCOPED_STORE_SET].sort()).toEqual([...AGENT_SCOPED_STORES].sort());
   });
 
-  it('actualStoreName appends slug only for user-scoped stores', () => {
-    expect(actualStoreName('session_log_dm_store', 'yamada')).toBe(
-      'session_log_dm_store__yamada',
+  it('actualStoreName prefixes agent number only for agent-scoped stores', () => {
+    expect(actualStoreName('agent_session_log_store', '1')).toBe(
+      'agent_0001_session_log_store',
     );
-    expect(actualStoreName('company_core_memory', 'yamada')).toBe('company_core_memory');
+    expect(actualStoreName('company_core_memory', '1')).toBe('company_core_memory');
   });
 });
 
@@ -455,11 +468,13 @@ describe('CLI main', () => {
         'init-user-memory-stores',
         '--user-slug',
         'yamada',
+        '--agent-number',
+        '0001',
         '--dry-run',
       ]);
       expect(code).toBe(0);
       const all = writes.join('');
-      expect(all).toMatch(/DRY_RUN_session_log_dm_store__yamada/);
+      expect(all).toMatch(/DRY_RUN_agent_0001_session_log_store/);
     } finally {
       process.stdout.write = origWrite;
     }
