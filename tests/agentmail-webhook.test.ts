@@ -135,6 +135,20 @@ describe('handleAgentMailWebhook', () => {
     expect(sent[0]!.svix_id).toBe(svixId);
   });
 
+  it('200 + enqueues signed spam receive events', async () => {
+    const env = envWith();
+    const body = '{"id":"evt-spam","type":"event","event_type":"message.received.spam","timestamp":"x","message":{"id":"msg_spam","message_id":"<spam@example.com>"}}';
+    const { req, svixId } = await signedRequest(body);
+    const resp = await handleAgentMailWebhook(req, env);
+    expect(resp.status).toBe(200);
+    const sent = (env.MAKOTO_QUEUE as unknown as { _sent: AgentMailQueueMessage[] })._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.svix_id).toBe(svixId);
+    expect(
+      (sent[0]!.event as unknown as { event_type?: string }).event_type,
+    ).toBe('message.received.spam');
+  });
+
   it('transport-dedupes by svix-id (second delivery is duplicate)', async () => {
     const env = envWith();
     const body = '{"id":"evt-1","type":"t","timestamp":"x","data":{}}';

@@ -312,6 +312,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           userSlug,
           boundMessageId: rfc822MsgId,
           callerSessionId: sessionId!,
+          anthropic: client,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
       payloadAudit: {

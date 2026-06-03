@@ -66,6 +66,9 @@ export interface AgentMailWebhookEvent<T = unknown> {
  */
 export type AgentMailEventType =
   | 'message.received'
+  | 'message.received.spam'
+  | 'message.received.blocked'
+  | 'message.received.unauthenticated'
   | 'message.sent'
   | 'message.delivered'
   | 'message.bounced'

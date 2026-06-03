@@ -2,6 +2,7 @@ import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { BUILT_IN_DOCUMENT_SKILL_IDS } from './attached-skills';
+import { buildPlaywrightMcpConfig } from './managed-agent-mcp';
 import { buildMakotoSystemPrompt } from './persona-builder';
 
 export type MakotoToolName =
@@ -9,6 +10,7 @@ export type MakotoToolName =
   | 'drive_get_file_metadata'
   | 'drive_read_export'
   | 'drive_create_file'
+  | 'drive_stage_file'
   | 'drive_delete'
   | 'sheets_create'
   | 'sheets_read'
@@ -69,6 +71,13 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
   {
     name: 'drive_create_file',
     description: 'Create a Google Drive file within size limits.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: true,
+  },
+  {
+    name: 'drive_stage_file',
+    description:
+      'Download an existing Drive Office/PDF binary and mount it into the active session for document skills; save edited output under /mnt/session/outputs.',
     status: 'cloudflare_code_live_unverified',
     requires_workspace_oauth: true,
   },
@@ -224,6 +233,7 @@ export async function buildMakotoIntrospection(
       'Google Chat space roster is not injected every turn; the agent can call chat_list_space_members when needed.',
       'External write/send/delete operations are guarded by custom tool or marker contracts.',
       'MCP is not an active Google Workspace path; current Workspace access is Worker-side REST tooling.',
+      'Playwright MCP is feature-flagged and only attaches when URL and safety gates pass.',
     ],
     identity_model: {
       template: 'generic_agent',
@@ -283,10 +293,28 @@ export async function buildMakotoIntrospection(
   }
 
   if (detail === 'mcp' || detail === 'all') {
+    const playwrightMcp = buildPlaywrightMcpConfig(env);
     base.mcp = {
-      active_connectors: [],
-      status: 'not_active_for_workspace',
+      active_connectors: playwrightMcp.attach
+        ? [
+            {
+              name: 'playwright',
+              status: 'configured',
+              enabled_tools: playwrightMcp.enabledTools,
+              url_redacted: true,
+              local_insecure_allowed: playwrightMcp.localInsecureAllowed,
+            },
+          ]
+        : [],
+      status: playwrightMcp.attach ? 'configured_for_browser_automation' : 'not_active_for_workspace',
       current_workspace_path: 'Worker-side REST custom tools with per-user OAuth.',
+      playwright: {
+        status: playwrightMcp.status,
+        attach: playwrightMcp.attach,
+        enabled_tools: playwrightMcp.enabledTools,
+        url_redacted: true,
+        reason: playwrightMcp.reason,
+      },
       reserved_future_path: 'Anthropic Vault/MCP may be revisited later, but is not current production capability.',
     };
   }
@@ -424,6 +452,14 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
           parents: arrayProp('Optional parent Drive folder ids.'),
         },
         ['name', 'content'],
+      );
+    case 'drive_stage_file':
+      return objectSchema(
+        {
+          file_id: stringProp('Google Drive file id for an existing .xlsx/.xlsm/.docx/.pptx/.pdf binary.'),
+          name: stringProp('Optional session mount filename with extension.'),
+        },
+        ['file_id'],
       );
     case 'drive_delete':
       return objectSchema(

@@ -35,8 +35,10 @@ import {
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveStageFile,
   type DriveToolDeps,
 } from '../tools/drive';
+import type Anthropic from '@anthropic-ai/sdk';
 import {
   sheetsAppend,
   sheetsCreate,
@@ -94,6 +96,8 @@ export interface MakotoToolDispatchContext {
   currentSpaceName?: string;
   /** Current inbound Google Chat thread resource name, for tool result context only. */
   currentThreadName?: string;
+  /** Optional — required for tools that mount files into the active session. */
+  anthropic?: Anthropic;
   /** Optional fetch override for tests. */
   fetchImpl?: typeof fetch;
 }
@@ -230,6 +234,10 @@ export async function dispatchMakotoTool(
       case 'drive_create_file':
         return ok(
           await driveCreateFile(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
+        );
+      case 'drive_stage_file':
+        return ok(
+          await driveStageFile(args, driveDeps(ctx, initialAccessToken, refreshAccessToken, false)),
         );
       case 'drive_delete':
         // drive_delete requires the confirm token store + bound message id.
@@ -460,6 +468,8 @@ function driveDeps(
 ): DriveToolDeps {
   const deps: DriveToolDeps = { accessToken, refreshAccessToken };
   if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
+  if (ctx.anthropic) deps.anthropic = ctx.anthropic;
+  if (ctx.callerSessionId) deps.sessionId = ctx.callerSessionId;
   if (withConfirmStore) {
     deps.confirmTokenStore = createKvConfirmTokenStore(ctx.env.MAKOTO_KV);
     if (ctx.boundMessageId) deps.boundMessageId = ctx.boundMessageId;

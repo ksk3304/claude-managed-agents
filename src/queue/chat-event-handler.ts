@@ -80,7 +80,7 @@ import {
   handleCostGuardCommand,
 } from '../lib/cost-guard-command';
 import { parseNaturalCostGuardCommand } from '../lib/cost-guard-natural-command';
-import { extractFinalMarkerText } from '../lib/final-marker';
+import { extractFinalMarkerText, extractHeartbeatNothingText } from '../lib/final-marker';
 import {
   evaluateSessionCostAfterTurn,
   handlePendingSessionApproval,
@@ -1126,10 +1126,8 @@ export async function handleChatEvent(
       });
   const placeholderName = ingressPlaceholderName || postedPlaceholder?.name || '';
   const placeholderThreadName = postedPlaceholder?.threadName ?? null;
-  // Per-event session id holder. tool dispatcher が agent.custom_tool_use
-  // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
-  // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
-  // stream event より前) ため、box で参照を共有する。
+  // Per-event session id holder. orchestrator が sessions.create / KV lookup
+  // を解決した直後、stream/tool dispatch の前に書き込む。
   const sessionIdRef: { current: string } = { current: '' };
   let sessionId: string;
   let assistantText: string;
@@ -1168,6 +1166,7 @@ export async function handleChatEvent(
                 callerSessionId: sessionIdRef.current,
                 currentSpaceName: spaceName,
                 currentThreadName: threadName ?? undefined,
+                anthropic: client,
               })
             : gateExternalToolCall(env, {
                 eventKey,
@@ -1177,6 +1176,9 @@ export async function handleChatEvent(
               }),
         eventKey,
         messageId: message.name,
+        onSessionIdResolved: (resolvedSessionId) => {
+          sessionIdRef.current = resolvedSessionId;
+        },
         // Issue #208: mail skill は既存社員 agent / session へ統合するため
         // forceFreshSession しない。その他 action skill は従来通り bypass。
         forceFreshSession,
@@ -1188,20 +1190,21 @@ export async function handleChatEvent(
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
       if (orchestrated.stopReason === 'custom_tool_timeout') {
-        assistantText =
-          'ファイル作成中にツール実行がタイムアウトしました。作成完了を確認できていないため、担当者がログを確認します。';
         await recordRuntimeEvent(env, {
           eventKey,
           sessionId,
           messageId: message.name,
-          eventType: 'custom_tool_timeout_visible_notice',
+          eventType: 'custom_tool_timeout_retry_no_notice',
           level: 'warn',
           source: 'chat-event-handler',
           detail: {
             tool_use_count: orchestrated.toolUseCount,
             tool_use_names: orchestrated.toolUseNames,
+            placeholder_name_present: Boolean(placeholderName),
           },
         });
+        await safeRelease(env, eventKey, claim);
+        return { kind: 'release_and_retry', reason: 'custom_tool_timeout' };
       }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
@@ -1342,27 +1345,21 @@ export async function handleChatEvent(
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          const notice = '一時的なエラーです。少し時間を置いて再送してください。';
-          await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
           await recordRuntimeEvent(env, {
             eventKey,
             messageId: message.name,
             userSlug: userMapping.user_slug,
-            eventType: 'orchestrator_transient_visible_notice',
+            eventType: 'orchestrator_transient_retry_no_notice',
             level: 'warn',
             source: 'chat-event-handler',
-            detail: { reason: err.reason, error: redactPiiInText(err.message).slice(0, 1000) },
+            detail: {
+              reason: err.reason,
+              error: redactPiiInText(err.message).slice(0, 1000),
+              placeholder_name_present: Boolean(placeholderName),
+            },
           });
-          await safeCommit(env, eventKey, claim, {
-            messageId: message.name,
-            userSlug: userMapping.user_slug,
-            reason: err.reason,
-            stage: 'orchestrator',
-            outcome: 'committed',
-            level: 'warn',
-            detail: { visible_notice: true },
-          });
-          return { kind: 'committed' };
+          await safeRelease(env, eventKey, claim);
+          return { kind: 'release_and_retry', reason: err.reason };
         }
         if (placeholderName) {
           await safeDeletePlaceholder(env, placeholderName, eventKey);
@@ -1407,6 +1404,7 @@ export async function handleChatEvent(
   }
 
   // ---- 7. parse markers + dispatch ----
+  const heartbeatEvent = isHeartbeatEventKey(eventKey);
   // 7a. EMAIL_SEND markers
   const emailParsed = parseAssistantText(assistantText);
   for (const f of emailParsed.failures) {
@@ -1414,10 +1412,16 @@ export async function handleChatEvent(
       `[chat-event] EMAIL_SEND parse failure eventKey=${eventKey} reason=${f.reason} raw=${f.raw.slice(0, 200)}`,
     );
   }
+  if (heartbeatEvent && emailParsed.markers.length > 0) {
+    await recordHeartbeatExternalToolSuppressed(env, eventKey, message.name, userMapping.user_slug, {
+      toolFamily: 'EMAIL_SEND',
+      markerCount: emailParsed.markers.length,
+    });
+  }
   const emailDispatchSummaries = await dispatchEmailMarkers(
     env,
     eventKey,
-    emailParsed.markers,
+    heartbeatEvent ? [] : emailParsed.markers,
     sessionId,
     userMapping.agent_id,
     claim,
@@ -1435,50 +1439,74 @@ export async function handleChatEvent(
   // のスキップ等価)。これにより未確認ユーザー混在 thread から別 space への
   // 横展開 (= 権限事故源) を機械的に塞ぐ。gate されなかった場合 (hasUnresolved=false
   // or DM) は素通し = 旧挙動温存。
-  const chatPostGateApplication = applyChatPostGateToText(
-    emailParsed.cleanedText,
-    hasUnresolvedSpeakers || !actorTrusted,
-  );
-  if (chatPostGateApplication.decision.gate) {
-    console.log(
-      `[chat-event] CHAT_POST gated eventKey=${eventKey} ` +
-        `reason=${chatPostGateApplication.decision.reason} ` +
-        (actorTrusted ? `(unresolved speakers in history)` : `(default actor fallback)`),
-    );
-    if (!actorTrusted) {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        messageId: message.name,
-        userSlug: userMapping.user_slug,
-        eventType: 'external_tool_gated',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { tool_family: 'CHAT_POST', actor_source: 'default_user_fallback' },
-      });
-    }
+  const heartbeatChatPostMarkerCount = heartbeatEvent
+    ? countChatPostMarkers(emailParsed.cleanedText)
+    : 0;
+  if (heartbeatChatPostMarkerCount > 0) {
+    await recordHeartbeatExternalToolSuppressed(env, eventKey, message.name, userMapping.user_slug, {
+      toolFamily: 'CHAT_POST',
+      markerCount: heartbeatChatPostMarkerCount,
+    });
   }
-  const chatPostResult = await dispatchChatPostMarkers(
-    env,
-    eventKey,
-    chatPostGateApplication.text,
-    spaceName,
-    threadName,
-    claim,
-  );
+  const chatPostResult = heartbeatEvent
+    ? { cleanedText: stripChatPostMarkersForHeartbeat(emailParsed.cleanedText) }
+    : await (async () => {
+        const chatPostGateApplication = applyChatPostGateToText(
+          emailParsed.cleanedText,
+          hasUnresolvedSpeakers || !actorTrusted,
+        );
+        if (chatPostGateApplication.decision.gate) {
+          console.log(
+            `[chat-event] CHAT_POST gated eventKey=${eventKey} ` +
+              `reason=${chatPostGateApplication.decision.reason} ` +
+              (actorTrusted ? `(unresolved speakers in history)` : `(default actor fallback)`),
+          );
+          if (!actorTrusted) {
+            await recordRuntimeEvent(env, {
+              eventKey,
+              messageId: message.name,
+              userSlug: userMapping.user_slug,
+              eventType: 'external_tool_gated',
+              level: 'warn',
+              source: 'chat-event-handler',
+              detail: { tool_family: 'CHAT_POST', actor_source: 'default_user_fallback' },
+            });
+          }
+        }
+        return dispatchChatPostMarkers(
+          env,
+          eventKey,
+          chatPostGateApplication.text,
+          spaceName,
+          threadName,
+          claim,
+        );
+      })();
 
   // 7c. SCHEDULE_ACTION markers (Issue #186 #5 follow-up = 実 dispatch)。
   //     env (CHAT_SA_KEY_JSON + GCP_SCHEDULER_PROJECT + GCP_SCHEDULER_LOCATION)
   //     が揃っているときだけ activate する (= 既存挙動破壊しない、deploy
   //     gradual rollout の余地を残す)。失敗は WARN log + 元 cleanedText
   //     で投稿継続 (failure isolation)。
-  const scheduleResult = await dispatchScheduleActionMarkers(
-    env,
-    eventKey,
-    message.name,
-    threadName,
-    chatPostResult.cleanedText,
-    { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
-  );
+  const heartbeatScheduleMarkers = heartbeatEvent
+    ? parseScheduleActionMarkers(chatPostResult.cleanedText)
+    : [];
+  if (heartbeatScheduleMarkers.length > 0) {
+    await recordHeartbeatExternalToolSuppressed(env, eventKey, message.name, userMapping.user_slug, {
+      toolFamily: 'SCHEDULE_ACTION',
+      markerCount: heartbeatScheduleMarkers.length,
+    });
+  }
+  const scheduleResult = heartbeatEvent
+    ? { cleanedText: stripScheduleActionMarkers(chatPostResult.cleanedText).trim() }
+    : await dispatchScheduleActionMarkers(
+        env,
+        eventKey,
+        message.name,
+        threadName,
+        chatPostResult.cleanedText,
+        { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
+      );
 
   // 7d. current space 投稿 (clean 後本文)
   // 7d-1. internal-state redaction を最終ガード (= safety net)。
@@ -1486,8 +1514,24 @@ export async function handleChatEvent(
   if (finalMarkerExtraction.markerFound) {
     console.log(`[chat-event] final marker extracted eventKey=${eventKey}`);
   }
+  const heartbeatNothingExtraction = extractHeartbeatNothingText(finalMarkerExtraction.text);
+  if (heartbeatNothingExtraction.suppress) {
+    console.log(`[chat-event] heartbeat nothing marker suppressed eventKey=${eventKey}`);
+    if (placeholderName) {
+      await safeDeletePlaceholder(env, placeholderName, eventKey);
+    }
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'heartbeat_nothing_marker',
+      stage: 'final_chat_reply',
+      outcome: 'committed',
+      detail: { marker: 'HEARTBEAT_NOTHING' },
+    });
+    return { kind: 'committed' };
+  }
   const displayText = normalizeEmailPreviewEscapedNewlines(
-    finalMarkerExtraction.text,
+    heartbeatNothingExtraction.text,
     emailParsed.markers.length,
   );
   const markerLeakScrubbed = scrubActionMarkerLeakForChat(
@@ -1504,6 +1548,7 @@ export async function handleChatEvent(
     env,
     sessionId,
     sourceText: markerLeakScrubbed.text,
+    artifactHintText: bodyText,
     minCreatedAtMs: sessionOutputMinCreatedAtMs,
     eventKey,
     resolveDriveDeps: async () => {
@@ -2036,11 +2081,23 @@ function scrubActionMarkerLeakForChat(
   const leaks =
     rawMarkerSyntax || botProcessingMarkerTalk;
   if (!leaks) return { text, scrubbed: false, reason: '' };
+  const redactedText = redactActionMarkerTermsForChat(text).trim();
   return {
-    text: '送信処理の状態を確認できませんでした。担当者がログを確認します。',
+    text: redactedText || '内部用の実行記法を伏せました。',
     scrubbed: true,
     reason: 'action_marker_terms',
   };
+}
+
+function redactActionMarkerTermsForChat(text: string): string {
+  return text
+    .replace(
+      /`?\b(email_send|chat_post|schedule_action)\b`?\s*:\s*\{[\s\S]*?\}/gi,
+      '（内部用の実行記法を伏せました）',
+    )
+    .replace(/`?\b(email_send|chat_post|schedule_action)\b`?/gi, '内部用マーカー')
+    .replace(/bot\s*側/gi, '内部側')
+    .replace(/bot側/gi, '内部側');
 }
 
 function normalizeEmailPreviewEscapedNewlines(
@@ -3108,6 +3165,42 @@ async function deletePendingPdfPreflightApproval(
   threadSessionKey: string,
 ): Promise<void> {
   await kv.delete(pendingPdfPreflightApprovalKey(threadSessionKey));
+}
+
+function isHeartbeatEventKey(eventKey: string): boolean {
+  return eventKey.startsWith('scheduled:heartbeat_tick:');
+}
+
+function countChatPostMarkers(text: string): number {
+  const globalMarker = new RegExp(CHAT_POST_MARKER_REGEX.source, 'g');
+  return [...text.matchAll(globalMarker)].length;
+}
+
+function stripChatPostMarkersForHeartbeat(text: string): string {
+  const globalMarker = new RegExp(CHAT_POST_MARKER_REGEX.source, 'g');
+  return text.replace(globalMarker, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function recordHeartbeatExternalToolSuppressed(
+  env: Env,
+  eventKey: string,
+  messageId: string,
+  userSlug: string,
+  input: { toolFamily: 'EMAIL_SEND' | 'CHAT_POST' | 'SCHEDULE_ACTION'; markerCount: number },
+): Promise<void> {
+  await recordRuntimeEvent(env, {
+    eventKey,
+    messageId,
+    userSlug,
+    eventType: 'external_tool_gated',
+    level: 'warn',
+    source: 'chat-event-handler',
+    detail: {
+      tool_family: input.toolFamily,
+      marker_count: input.markerCount,
+      actor_source: 'scheduled_heartbeat',
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
