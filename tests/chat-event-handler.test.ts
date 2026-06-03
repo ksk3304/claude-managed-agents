@@ -553,6 +553,40 @@ describe('handleChatEvent', () => {
     ).resolves.toBe(1);
   });
 
+  it('normal Chat turn renews the parent claim so Queue redelivery cannot replay the user message mid-turn', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({ text: '130秒待ってから返答して' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const leaseBefore = Number(dedupe.get(msg.eventKey)!.lease_expires_at_ms);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_parent_lease_heartbeat',
+      events: [
+        { type: 'agent.message.text', text: '通常応答です。' },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(Number(dedupe.get(msg.eventKey)!.lease_expires_at_ms)).toBeGreaterThan(
+      leaseBefore + 500_000,
+    );
+    const heartbeatEvent = runtimeEvents(env).find(
+      (row) => row.event_type === 'chat_parent_lease_heartbeat_started',
+    );
+    expect(heartbeatEvent).toBeDefined();
+    expect(JSON.parse(String(heartbeatEvent!.detail_json))).toMatchObject({
+      lease_ttl_ms: 900_000,
+      interval_ms: 60_000,
+    });
+    expect(chatApiMock.patches.at(-1)?.text).toContain('通常応答です。');
+  });
+
   it('PDF preflight prompts before Anthropic when projected PDF read crosses the session threshold', async () => {
     const env = buildEnv({
       envOverrides: {
