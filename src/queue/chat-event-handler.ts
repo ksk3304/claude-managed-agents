@@ -102,7 +102,7 @@ import {
   type ActionSkillIntent,
   type SkillsData,
 } from '../lib/intent-detector';
-import { readChatSenderMappingWithAutoPending } from '../lib/memory-attach';
+import { normalizeSenderEmail, readChatSenderMappingWithAutoPending } from '../lib/memory-attach';
 import {
   handleScheduleActionMarker,
   parseScheduleActionMarkers,
@@ -158,6 +158,7 @@ const CHAT_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
+const CHAT_DM_SPACE_KV_PREFIX = 'chat_dm_space:';
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -439,6 +440,7 @@ export async function handleChatEvent(
   }
   const userMapping = mappingResolution.mapping;
   const actorTrusted = mappingResolution.actorTrusted;
+  await rememberSenderDmSpace(env.MAKOTO_KV, senderEmail, spaceName, spaceType);
   if (!actorTrusted) {
     console.info(
       `[chat-event] untrusted_actor_fallback eventKey=${eventKey} ` +
@@ -2069,8 +2071,25 @@ async function maybeRegisterMailReplyAsyncWait(
 ): Promise<{ text: string }> {
   const sent = input.emailDispatchSummaries.filter((summary) => summary.status === 'sent');
   if (sent.length === 0) return { text: '' };
-  if (input.spaceType !== 'DM') return { text: '' };
   if (!isMailReplyWaitRequest(input.bodyText)) return { text: '' };
+
+  const target = await resolveAsyncWaitTargetSpace(env.MAKOTO_KV, input.senderEmail, input.spaceName, input.spaceType);
+  if (!target.spaceName) {
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      userSlug: input.userSlug,
+      eventType: 'heartbeat_async_wait_register_skipped',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { reason: 'missing_sender_dm_space', space_type: input.spaceType },
+    });
+    return {
+      text:
+        '⚠️ メール送信は完了しましたが、返信待ち登録はできませんでした。\n' +
+        '本人DMの宛先が未記録です。先にDMで一度話しかけてください。',
+    };
+  }
 
   const expectedFrom = uniqueStrings(sent.map((summary) => normalizeEmailAddress(summary.to)));
   if (expectedFrom.length === 0) return { text: '' };
@@ -2101,7 +2120,7 @@ async function maybeRegisterMailReplyAsyncWait(
       .bind(
         taskId,
         input.senderEmail,
-        input.spaceName,
+        target.spaceName,
         prompt,
         1,
         nowMs + 60_000,
@@ -2120,13 +2139,16 @@ async function maybeRegisterMailReplyAsyncWait(
         task_id: taskId,
         expected_count: expectedFrom.length,
         subject_contains: subjectContains ?? null,
+        target_route: target.route,
       },
     });
     return {
       text:
         `⏳ 返信待ちを登録しました\n` +
         `対象: ${expectedFrom.length}件\n` +
-        `返信が揃ったら、このDMに集計して再開します。`,
+        (target.route === 'current_dm'
+          ? `返信が揃ったら、このDMに集計して再開します。`
+          : `返信が揃ったら、本人DMに集計して再開します。`),
     };
   } catch (error) {
     await recordRuntimeEvent(env, {
@@ -2140,6 +2162,39 @@ async function maybeRegisterMailReplyAsyncWait(
     });
     return { text: '⚠️ メール送信は完了しましたが、返信待ち登録に失敗しました。' };
   }
+}
+
+async function rememberSenderDmSpace(
+  kv: KVNamespace,
+  senderEmail: string,
+  spaceName: string,
+  spaceType: string,
+): Promise<void> {
+  if (spaceType !== 'DM' || !spaceName) return;
+  const email = normalizeSenderEmail(senderEmail);
+  if (!email) return;
+  try {
+    await kv.put(`${CHAT_DM_SPACE_KV_PREFIX}${email}`, spaceName);
+  } catch (error) {
+    console.warn(
+      `[chat-event] remember dm space failed email_hash=${stableHash(email)}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function resolveAsyncWaitTargetSpace(
+  kv: KVNamespace,
+  senderEmail: string,
+  currentSpaceName: string,
+  spaceType: string,
+): Promise<{ spaceName: string | null; route: 'current_dm' | 'sender_dm_kv' | 'missing_sender_dm_space' }> {
+  if (spaceType === 'DM') return { spaceName: currentSpaceName, route: 'current_dm' };
+  const email = normalizeSenderEmail(senderEmail);
+  if (!email) return { spaceName: null, route: 'missing_sender_dm_space' };
+  const dmSpaceName = await kv.get(`${CHAT_DM_SPACE_KV_PREFIX}${email}`);
+  if (!dmSpaceName) return { spaceName: null, route: 'missing_sender_dm_space' };
+  return { spaceName: dmSpaceName, route: 'sender_dm_kv' };
 }
 
 function isMailReplyWaitRequest(text: string): boolean {
