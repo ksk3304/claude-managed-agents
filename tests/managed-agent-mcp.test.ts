@@ -98,6 +98,20 @@ describe('Playwright MCP config', () => {
     expect(config.enabledTools).toEqual(['browser_navigate', 'browser_snapshot']);
   });
 
+  it('allows screenshots only when explicitly configured', () => {
+    const config = buildPlaywrightMcpConfig({
+      PLAYWRIGHT_MCP_URL: 'https://playwright.example.com/mcp',
+      PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED: '1',
+      PLAYWRIGHT_MCP_ENABLED_TOOLS:
+        'browser_navigate,browser_snapshot,browser_take_screenshot',
+    } as Env);
+    expect(config.enabledTools).toEqual([
+      'browser_navigate',
+      'browser_snapshot',
+      'browser_take_screenshot',
+    ]);
+  });
+
   it('hash changes only when MCP attaches', async () => {
     await expect(playwrightMcpHash(buildPlaywrightMcpConfig({} as Env))).resolves.toBe('none');
     const hash = await playwrightMcpHash(

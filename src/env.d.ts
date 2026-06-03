@@ -137,7 +137,10 @@ declare namespace Cloudflare {
      * also require PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL=1.
      */
     PLAYWRIGHT_MCP_URL?: string;
-    /** Comma-separated allowlist. Default: browser_navigate,browser_snapshot. */
+    /**
+     * Comma-separated allowlist. Default: browser_navigate,browser_snapshot.
+     * browser_take_screenshot is allowed only when explicitly configured.
+     */
     PLAYWRIGHT_MCP_ENABLED_TOOLS?: string;
     /** Operator assertion that the external MCP URL is not unauthenticated public access. */
     PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED?: string;

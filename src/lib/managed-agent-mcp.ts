@@ -10,7 +10,10 @@ export const DEFAULT_PLAYWRIGHT_MCP_ENABLED_TOOLS = [
   'browser_snapshot',
 ] as const;
 
-const SAFE_PLAYWRIGHT_MCP_TOOLS = new Set<string>(DEFAULT_PLAYWRIGHT_MCP_ENABLED_TOOLS);
+const SAFE_PLAYWRIGHT_MCP_TOOLS = new Set<string>([
+  ...DEFAULT_PLAYWRIGHT_MCP_ENABLED_TOOLS,
+  'browser_take_screenshot',
+]);
 
 export interface PlaywrightMcpConfig {
   status:
