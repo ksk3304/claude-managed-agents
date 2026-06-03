@@ -189,6 +189,7 @@ export interface SendAndStreamResult {
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
 const DEFAULT_TIMEOUT_RECOVERY_POLL_MS = 0;
 const TIMEOUT_RECOVERY_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_REQUIRES_ACTION_RESUME_POLL_MS = 0;
 
 /**
  * Inject `userMessage` into the session, drain the event stream
@@ -564,6 +565,9 @@ export async function sendAndStreamWithToolDispatch(
     : '';
   const currentUserMessageText = userMessageContentText(userMessageEvents[0]!.content);
   let recoveredFromStreamTimeout = false;
+  let sentCustomToolResult = false;
+  let recoveredToolUseCount: number | undefined;
+  let recoveredToolUseNames: string[] | undefined;
 
   const sendPendingCustomToolTimeoutResults = async (): Promise<boolean> => {
     const unresolved = new Map([
@@ -797,6 +801,7 @@ export async function sendAndStreamWithToolDispatch(
               events: resultEvents,
               betas: [ANTHROPIC_BETA],
             } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+            sentCustomToolResult = true;
           } catch (err) {
             console.error(
               `[session] events.send for tool_result failed sessionId=${input.sessionId}: ${
@@ -877,13 +882,40 @@ export async function sendAndStreamWithToolDispatch(
     if (timeoutId !== undefined) clearTimeout(timeoutId);
   }
 
+  const hasFinalStopReason =
+    stopReason === 'end_turn' ||
+    stopReason === 'stop_sequence' ||
+    stopReason === 'max_tokens' ||
+    stopReason === 'stream_terminated';
+  if (
+    !timedOut &&
+    (stopReason === 'requires_action' ||
+      (sentCustomToolResult && !hasFinalStopReason && assistantText.trim().length === 0))
+  ) {
+    const resumed = await resumeTurnFromSessionEvents(client, {
+      sessionId: input.sessionId,
+      toolDispatcher: input.toolDispatcher,
+      userMessageText: currentUserMessageText,
+      userMessageMatch: 'exact',
+      pollMs: input.timeoutRecoveryMs ?? DEFAULT_REQUIRES_ACTION_RESUME_POLL_MS,
+      maxToolCalls,
+    });
+    if (resumed) {
+      assistantText = resumed.assistantText;
+      terminalEventType = resumed.terminalEventType;
+      stopReason = resumed.stopReason;
+      recoveredToolUseCount = resumed.toolUseCount;
+      recoveredToolUseNames = resumed.toolUseNames;
+    }
+  }
+
   return {
     assistantText,
     emailSendMarkers: parseEmailSendMarkers(assistantText),
     terminalEventType,
     stopReason,
-    toolUseCount: builtinToolCalls + toolCalls,
-    toolUseNames,
+    toolUseCount: Math.max(builtinToolCalls + toolCalls, recoveredToolUseCount ?? 0),
+    toolUseNames: recoveredToolUseNames ?? toolUseNames,
     ...(recoveredFromStreamTimeout ? { recoveredFromStreamTimeout } : {}),
   };
 }

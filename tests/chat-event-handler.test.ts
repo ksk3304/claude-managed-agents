@@ -3008,8 +3008,106 @@ describe('handleChatEvent', () => {
     expect(result.kind).toBe('committed');
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toContain('Chat に表示できる本文が空でした');
+    expect(chatApiMock.patches[0]!.text).toBe('処理完了しました。');
     expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('requires_action stream end: resumes from session events before final Chat reply', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'xlsx skill で A1 に値を入れた Excel を作って Drive URL だけ返答して',
+      placeholderName: 'spaces/AAA/messages/ingress_requires_action',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const listedEvents: Array<Record<string, unknown>> = [];
+    const capturedTools: Array<{ name: string; input: unknown }> = [];
+    (globalThis as unknown as {
+      __makotoToolDispatch?: (
+        name: string,
+        input: unknown,
+      ) => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async (name, input) => {
+      capturedTools.push({ name, input });
+      return {
+        ok: false,
+        payload: {
+          error: 'schema',
+          message: 'xlsx artifacts are uploaded from session outputs by the bridge',
+        },
+      };
+    };
+
+    installFakeAnthropic({
+      sessionId: 'sesn_requires_action_resume',
+      events: [
+        {
+          type: 'agent.custom_tool_use',
+          id: 'tu_drive_xlsx',
+          name: 'drive_create_file',
+          input: {
+            name: 'issue259-auto-recovery-ok.xlsx',
+            content: '',
+            mime_type:
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          },
+        },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_drive_xlsx'] },
+        },
+      ],
+      listEvents: () => listedEvents,
+      sendImpl: async (_sessionId, payload) => {
+        const events = (payload as { events?: Array<Record<string, unknown>> }).events ?? [];
+        for (const ev of events) {
+          listedEvents.push(ev);
+          if (ev.type === 'user.message') {
+            listedEvents.push(
+              {
+                type: 'agent.custom_tool_use',
+                id: 'tu_drive_xlsx',
+                name: 'drive_create_file',
+                input: {
+                  name: 'issue259-auto-recovery-ok.xlsx',
+                  content: '',
+                  mime_type:
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                },
+              },
+              {
+                type: 'session.status_idle',
+                stop_reason: { type: 'requires_action', event_ids: ['tu_drive_xlsx'] },
+              },
+            );
+          }
+          if (ev.type === 'user.custom_tool_result') {
+            listedEvents.push(
+              {
+                type: 'agent.message',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Driveに保存しました\nissue259-auto-recovery-ok.xlsx: https://docs.google.com/spreadsheets/d/drive-file/edit',
+                  },
+                ],
+              },
+              { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+            );
+          }
+        }
+      },
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(capturedTools).toHaveLength(1);
+    expect(capturedTools[0]!.name).toBe('drive_create_file');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('https://docs.google.com/spreadsheets/d/drive-file/edit');
+    expect(chatApiMock.patches[0]!.text).not.toContain('Chat に表示できる本文が空でした');
   });
 
   it('drive_stage_file custom tool receives resolved session id before streaming dispatch', async () => {
