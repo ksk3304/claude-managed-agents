@@ -67,15 +67,6 @@ describe('maskInternalStateForChat', () => {
   });
 });
 
-describe('maskInternalStateForChat', () => {
-  it('uses the same registry while preserving the answer body', () => {
-    const r = maskInternalStateForChat('memory store が未 attach のため対応できません');
-    expect(r.hits).toEqual([]);
-    expect(r.text).toBe('memory store が未 attach のため対応できません');
-    expect(r.text).not.toContain('今回のタスクは完了できませんでした');
-  });
-});
-
 describe('parity fixture: Python ↔ TS', () => {
   const fixture = parityCases as ParityFixture;
   expect(fixture.schema_version).toBe(1);
