@@ -98,6 +98,8 @@ declare namespace Cloudflare {
     MAKOTO_DEBUG_TOKEN?: string;
     /** Temporary smoke token for issue-specific live verification. */
     MAKOTO_ISSUE250_SMOKE_TOKEN?: string;
+    /** Opt-in kill switch for Issue #245 heartbeat cron. Default unset/off. */
+    HEARTBEAT_ENABLED?: string;
 
     /**
      * Optional default user_slug for the Chat reactive path. When set,
@@ -127,6 +129,20 @@ declare namespace Cloudflare {
     COST_GUARD_SESSION_STEP_USD?: string;
     COST_GUARD_USD_TO_JPY?: string;
     COST_GUARD_SESSION_PRICING_MODEL?: string;
+
+    /**
+     * Optional URL-based Playwright MCP endpoint. Must point at `/mcp`.
+     * Production attach requires HTTPS and
+     * PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED=1. Local loopback smoke tests
+     * also require PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL=1.
+     */
+    PLAYWRIGHT_MCP_URL?: string;
+    /** Comma-separated allowlist. Default: browser_navigate,browser_snapshot. */
+    PLAYWRIGHT_MCP_ENABLED_TOOLS?: string;
+    /** Operator assertion that the external MCP URL is not unauthenticated public access. */
+    PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED?: string;
+    /** Local smoke-only opt-in for http://127.0.0.1:8931/mcp or localhost. */
+    PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL?: string;
 
     /**
      * KV namespace for the MAKOTO bridge: sender→user_slug→agent_id

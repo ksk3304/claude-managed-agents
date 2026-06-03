@@ -390,6 +390,7 @@ function buildEnv(opts: BuildEnvOpts = {}): Env {
 }
 
 function buildQueueMsg(overrides: {
+  eventKey?: string;
   spaceType?: string;
   spaceName?: string;
   threadName?: string | null;
@@ -409,7 +410,7 @@ function buildQueueMsg(overrides: {
 }): ChatQueueMessage {
   const spaceName = overrides.spaceName ?? 'spaces/AAA';
   return {
-    eventKey: 'chat:msgname:spaces/AAA/messages/M1',
+    eventKey: overrides.eventKey ?? 'chat:msgname:spaces/AAA/messages/M1',
     receivedAtMs: Date.now(),
     claim: { owner: 'w1-uuid', version: 1 },
     ...(overrides.placeholderName ? { placeholderName: overrides.placeholderName } : {}),
@@ -1568,6 +1569,67 @@ describe('handleChatEvent', () => {
       // placeholder POST 1 件 (= "...MAKOTOくんが入力中") + 最終 reply は PATCH。
       expect(chatApiMock.posts.filter((p) => p.spaceName === 'spaces/AAA')).toHaveLength(1);
       expect(chatApiMock.patches).toHaveLength(1);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('heartbeat event: external action markers are stripped without dispatch', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        GCP_SCHEDULER_PROJECT: 'test-project',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+      },
+    });
+    const msg = buildQueueMsg({
+      eventKey: 'scheduled:heartbeat_tick:news_check_seto:987654',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_heartbeat_action_markers',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '報告があります。\n' +
+            'EMAIL_SEND:{"to":"a@example.com","subject":"s","body":"b"}\n' +
+            'CHAT_POST:{"space":"spaces/OTHER","text":"別投稿"}\n' +
+            'SCHEDULE_ACTION:{"action":"list"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amCalls: unknown[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (_url, init) => {
+      amCalls.push(init);
+      return new Response(JSON.stringify({ message_id: 'should-not-send' }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(amCalls).toHaveLength(0);
+      expect(schedulerMock.capturedCalls).toHaveLength(0);
+      expect(chatApiMock.posts.filter((p) => p.spaceName === 'spaces/OTHER')).toHaveLength(0);
+      expect(chatApiMock.posts.filter((p) => p.spaceName === 'spaces/AAA')).toHaveLength(1);
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('報告があります。');
+      expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
+      expect(chatApiMock.patches[0]!.text).not.toContain('CHAT_POST');
+      expect(chatApiMock.patches[0]!.text).not.toContain('SCHEDULE_ACTION');
+
+      const gated = runtimeEvents(env)
+        .filter((row) => row.event_type === 'external_tool_gated')
+        .map((row) => JSON.parse(String(row.detail_json)) as { tool_family: string });
+      expect(gated.map((row) => row.tool_family).sort()).toEqual([
+        'CHAT_POST',
+        'EMAIL_SEND',
+        'SCHEDULE_ACTION',
+      ]);
     } finally {
       globalThis.fetch = origFetch;
     }

@@ -198,5 +198,7 @@ declare namespace Cloudflare {
     CMA_AUDIT_TTL_DAYS?: string;
     /** Optional max chars per string in Cloudflare payload audit records. */
     CMA_AUDIT_MAX_TEXT_CHARS?: string;
+    /** Opt-in kill switch for Issue #245 heartbeat cron. Default unset/off. */
+    HEARTBEAT_ENABLED?: string;
   }
 }

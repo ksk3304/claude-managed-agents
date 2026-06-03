@@ -2,6 +2,7 @@ import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { BUILT_IN_DOCUMENT_SKILL_IDS } from './attached-skills';
+import { buildPlaywrightMcpConfig } from './managed-agent-mcp';
 import { buildMakotoSystemPrompt } from './persona-builder';
 
 export type MakotoToolName =
@@ -224,6 +225,7 @@ export async function buildMakotoIntrospection(
       'Memory attachments are resolved by Cloudflare-side routing before creating or reusing a session.',
       'External write/send/delete operations are guarded by custom tool or marker contracts.',
       'MCP is not an active Google Workspace path; current Workspace access is Worker-side REST tooling.',
+      'Playwright MCP is feature-flagged and only attaches when URL and safety gates pass.',
     ],
     identity_model: {
       template: 'generic_agent',
@@ -281,10 +283,28 @@ export async function buildMakotoIntrospection(
   }
 
   if (detail === 'mcp' || detail === 'all') {
+    const playwrightMcp = buildPlaywrightMcpConfig(env);
     base.mcp = {
-      active_connectors: [],
-      status: 'not_active_for_workspace',
+      active_connectors: playwrightMcp.attach
+        ? [
+            {
+              name: 'playwright',
+              status: 'configured',
+              enabled_tools: playwrightMcp.enabledTools,
+              url_redacted: true,
+              local_insecure_allowed: playwrightMcp.localInsecureAllowed,
+            },
+          ]
+        : [],
+      status: playwrightMcp.attach ? 'configured_for_browser_automation' : 'not_active_for_workspace',
       current_workspace_path: 'Worker-side REST custom tools with per-user OAuth.',
+      playwright: {
+        status: playwrightMcp.status,
+        attach: playwrightMcp.attach,
+        enabled_tools: playwrightMcp.enabledTools,
+        url_redacted: true,
+        reason: playwrightMcp.reason,
+      },
       reserved_future_path: 'Anthropic Vault/MCP may be revisited later, but is not current production capability.',
     };
   }

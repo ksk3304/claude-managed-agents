@@ -22,6 +22,14 @@ BACKUP_BUCKET_NAME=<bucket-name-matching-r2_buckets[].bucket_name>
 # Optional - Browser Run REST tools (screenshot, fetch_to_markdown, browse, web_fetch).
 # CLOUDFLARE_API_TOKEN=<api-token-with-Account.Browser-Rendering:Edit>
 
+# Optional - Playwright MCP attach for the existing MAKOTO employee agent.
+# Production requires HTTPS and a confirmed auth/network boundary. Local smoke
+# can use `npx @playwright/mcp@latest --port 8931`.
+# PLAYWRIGHT_MCP_URL=http://127.0.0.1:8931/mcp
+# PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL=1
+# PLAYWRIGHT_MCP_ENABLED_TOOLS=browser_navigate,browser_snapshot
+# PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED=0
+
 # Optional — agent inbox sender. Defaults to <sessionId>@<EMAIL_DOMAIN>.
 # EMAIL_FROM=agent@agents.example.com
 

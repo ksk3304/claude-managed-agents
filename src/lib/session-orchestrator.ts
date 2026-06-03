@@ -32,6 +32,11 @@ import {
 import { MAKOTO_AGENT_TOOLS } from './makoto-capability-registry';
 import { ensureManagedAgentTools } from './managed-agent-tools';
 import {
+  buildPlaywrightMcpConfig,
+  ensureManagedAgentMcp,
+  playwrightMcpHash,
+} from './managed-agent-mcp';
+import {
   routeMemoryAttachmentsForSession,
   type UserMappingValue,
 } from './memory-attach';
@@ -97,8 +102,9 @@ export function chatThreadSessionKey(
 export function buildChatCapabilitySessionKeyFromHashes(
   desiredAgentToolsHash: string,
   attachedSkillsHash: string,
+  mcpHash = 'none',
 ): string {
-  return `tools-${desiredAgentToolsHash}:skills-${attachedSkillsHash}`;
+  return `tools-${desiredAgentToolsHash}:skills-${attachedSkillsHash}:mcp-${mcpHash}`;
 }
 
 export async function buildChatCapabilitySessionKey(
@@ -107,9 +113,14 @@ export async function buildChatCapabilitySessionKey(
 ): Promise<string> {
   const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
   const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
+  const desiredMcpHash = await playwrightMcpHash(buildPlaywrightMcpConfig(env));
   const memoryResourcesHash = await toolsHash(resources.map((resource) => ({ ...resource })));
   return (
-    buildChatCapabilitySessionKeyFromHashes(desiredAgentToolsHash, attachedSkillsHash) +
+    buildChatCapabilitySessionKeyFromHashes(
+      desiredAgentToolsHash,
+      attachedSkillsHash,
+      desiredMcpHash,
+    ) +
     `:memory-${memoryResourcesHash}`
   );
 }
@@ -183,6 +194,11 @@ export interface OrchestrateChatTurnInput {
   onSessionIdResolved?: (sessionId: string) => void;
   /** Session watchdog override (test / incident-debug 用)。 */
   sessionWatchdogSec?: number;
+  /**
+   * Called after sessions.create / KV lookup resolves the active CMA
+   * session id and before any stream/tool dispatch begins.
+   */
+  onSessionIdResolved?: (sessionId: string) => void | Promise<void>;
   /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
@@ -401,6 +417,42 @@ export async function orchestrateChatTurn(
     );
   }
 
+  // ---- Playwright MCP ensure ----
+  // URL-based MCP attach is fail-closed: unset / invalid / unauthenticated
+  // configs do not alter the existing employee agent.
+  const playwrightMcpConfig = buildPlaywrightMcpConfig(input.env);
+  const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
+  if (playwrightMcpConfig.attach) {
+    try {
+      const ensuredMcp = await ensureManagedAgentMcp(
+        client,
+        input.userMapping.agent_id,
+        playwrightMcpConfig,
+        {
+          kv,
+          desiredMcpHash,
+        },
+      );
+      if (ensuredMcp.reason !== 'ensured_cache_hit') {
+        console.log(
+          `[chat-event] playwright mcp ensure agent=${input.userMapping.agent_id} ` +
+            `reason=${ensuredMcp.reason} updated=${ensuredMcp.updated} ` +
+            `servers=${ensuredMcp.finalMcpServers.length} tools=${ensuredMcp.finalTools.length}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[chat-event] playwright mcp ensure failed agent=${input.userMapping.agent_id}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  } else if (playwrightMcpConfig.status !== 'not_configured') {
+    console.warn(
+      `[chat-event] playwright mcp disabled status=${playwrightMcpConfig.status} ` +
+        `reason=${playwrightMcpConfig.reason}`,
+    );
+  }
+
   // ---- Memory Store router ----
   // sessions.create の resources[] は caller 側が決める。1 session 最大
   // 8 Memory Store に収めるため、Cloudflare 側で選定してから session key
@@ -418,10 +470,11 @@ export async function orchestrateChatTurn(
   // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
   // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
   // 古い CMA session を継続してしまうため、scope key への fallback はしない。
-  // capability hash を suffix に含め、tools / document skills 付与前の session を再利用しない。
+  // capability hash を suffix に含め、tools / document skills / MCP 付与前の session を再利用しない。
   const capabilitySessionKey = buildChatCapabilitySessionKeyFromHashes(
     desiredAgentToolsHash,
     attachedSkillsHash,
+    desiredMcpHash,
   ) + `:memory-${memoryResourcesHash}`;
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
@@ -533,6 +586,7 @@ export async function orchestrateChatTurn(
       },
     });
   }
+  await input.onSessionIdResolved?.(sessionId);
 
   // ---- user message envelope ----
   // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
