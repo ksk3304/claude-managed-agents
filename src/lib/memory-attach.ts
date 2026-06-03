@@ -10,10 +10,9 @@
  * `chat_pending_user_mapping:*`; those are intentionally not full
  * `user_mapping:*` registrations.
  *
- * Mail path is always `space_type='DM'` and
- * `filtered_personal_store_count=0` (mail is inherently per-recipient
- * — no shared-space filtering needed; see Python comment at
- * cma_session_resolver.py:186-199).
+ * Chat / mail space labels are transport context only. Memory routing is
+ * owner-agent unified: DM and shared-space turns for the same owner agent
+ * attach to the same candidate stores.
  *
  * Issue: ksk3304/makoto-prime#186 (Phase 6 step 5 — 層 3)
  * Spec: plan-draft.md §5 Memory Store + A8 / A9
@@ -39,7 +38,7 @@ export interface UserMappingValue {
   user_slug: string;
   /** Anthropic agent id this user is bound to (1 user = 1 agent). */
   agent_id: string;
-  /** Memory store ids that must not be attached in shared spaces. */
+  /** Legacy field. Unified owner-agent memory no longer filters these by Chat space. */
   personal_memory_store_ids?: string[];
   /**
    * Memory Stores to attach for this user's sessions. Each entry
@@ -48,7 +47,7 @@ export interface UserMappingValue {
   memory_attachments: MemoryAttachment[];
   /** Optional per-user system-prompt addendum. */
   system_prompt_addendum?: string;
-  /** Observability count added by `filterPersonalMemoryForSpace`. */
+  /** Legacy observability count. Unified owner-agent memory keeps this at 0. */
   filtered_personal_store_count?: number;
   /** False for auto-created chat-only pending mappings. Missing means trusted legacy mapping. */
   actor_trusted?: boolean;
@@ -294,23 +293,144 @@ export function filterPersonalMemoryForSpace(
   mapping: UserMappingValue,
   spaceType: string,
 ): UserMappingValue {
-  const personalIds = new Set(mapping.personal_memory_store_ids ?? []);
-  if (!isSharedSpace(spaceType) || personalIds.size === 0) {
-    return {
-      ...mapping,
-      memory_attachments: [...mapping.memory_attachments],
-      filtered_personal_store_count: 0,
-    };
-  }
-  const memoryAttachments = mapping.memory_attachments.filter(
-    (a) => !personalIds.has(a.memory_store_id),
-  );
+  void spaceType;
   return {
     ...mapping,
-    memory_attachments: memoryAttachments,
-    filtered_personal_store_count:
-      mapping.memory_attachments.length - memoryAttachments.length,
+    memory_attachments: [...mapping.memory_attachments],
+    filtered_personal_store_count: 0,
   };
+}
+
+export const MAX_SESSION_MEMORY_STORES = 8;
+
+export interface MemoryRouterInput {
+  /** Transport context only. The owner-agent router does not split memory by space type. */
+  spaceType: string;
+  maxStores?: number;
+}
+
+export interface MemoryRouterResult {
+  strategy: 'plan_b_memory_store_router_v1';
+  max_stores: number;
+  selected: MemoryAttachment[];
+  dropped: MemoryAttachment[];
+  selected_store_names: string[];
+  dropped_store_names: string[];
+}
+
+/**
+ * CMA sessions.create の resources[] は caller が決める。LLM 自動選択ではない。
+ * Cloudflare 側で owner-agent + task の候補から 1 session 最大 8 Memory Store に絞る。
+ */
+export function routeMemoryAttachmentsForSession(
+  attachments: readonly MemoryAttachment[],
+  input: MemoryRouterInput,
+): MemoryRouterResult {
+  const maxStores = Math.max(0, input.maxStores ?? MAX_SESSION_MEMORY_STORES);
+  const unique = dedupeMemoryAttachments(attachments);
+  const ranked = unique
+    .map((attachment, index) => ({
+      attachment,
+      index,
+      rank: memoryAttachmentRank(attachment),
+    }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index);
+  const selected = ranked.slice(0, maxStores).map((x) => x.attachment);
+  const dropped = ranked.slice(maxStores).map((x) => x.attachment);
+  return {
+    strategy: 'plan_b_memory_store_router_v1',
+    max_stores: maxStores,
+    selected,
+    dropped,
+    selected_store_names: selected.map(memoryAttachmentLabel),
+    dropped_store_names: dropped.map(memoryAttachmentLabel),
+  };
+}
+
+function dedupeMemoryAttachments(
+  attachments: readonly MemoryAttachment[],
+): MemoryAttachment[] {
+  const seen = new Set<string>();
+  const out: MemoryAttachment[] = [];
+  for (const attachment of attachments) {
+    const id = attachment.memory_store_id.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(attachment);
+  }
+  return out;
+}
+
+function memoryAttachmentRank(attachment: MemoryAttachment): number {
+  const haystack = memoryAttachmentSearchText(attachment);
+
+  if (matchesAny(haystack, [
+    'corporate_wiki',
+    'corporate_brain',
+    'company_wiki',
+    'company_brain',
+    'llm_wiki',
+  ])) {
+    return 0;
+  }
+  if (matchesAny(haystack, ['company_core_memory', 'company_core'])) return 10;
+  if (matchesAgentNumberedStore(haystack, [
+    'identity_memory',
+    'profile_memory',
+    'self_memory',
+    'persona_memory',
+  ])) {
+    return 20;
+  }
+  if (matchesAny(haystack, [
+    'agent_identity_memory',
+    'agent_profile_memory',
+    'agent_self_memory',
+    'agent_learning_memory',
+    'makoto_kun_memory',
+    'makoto-kun-memory',
+    'persona_memory',
+  ])) {
+    return 20;
+  }
+  if (matchesAgentNumberedStore(haystack, ['support_memory'])) return 25;
+  if (matchesAny(haystack, ['agent_support_memory', 'support_memory'])) return 25;
+  if (matchesAgentNumberedStore(haystack, ['daily_report_store'])) return 30;
+  if (matchesAny(haystack, ['agent_daily_report_store', 'daily_report_store'])) return 30;
+  if (matchesAgentNumberedStore(haystack, ['session_log_store'])) return 40;
+  if (matchesAny(haystack, ['agent_session_log_store', 'session_log_store'])) return 40;
+  if (matchesAny(haystack, ['daily_report_dm_store'])) return 50;
+  if (matchesAny(haystack, ['session_log_dm_store'])) return 60;
+  if (matchesAny(haystack, ['daily_report_shared_store'])) return 120;
+  if (matchesAny(haystack, ['session_log_shared_store'])) return 130;
+  if (matchesAny(haystack, ['daily_report'])) return 100;
+  if (matchesAny(haystack, ['session_log'])) return 110;
+  return 200;
+}
+
+function memoryAttachmentSearchText(attachment: MemoryAttachment): string {
+  return [
+    attachment.store_name ?? '',
+    attachment.instructions ?? '',
+    attachment.memory_store_id,
+  ]
+    .join(' ')
+    .toLowerCase()
+    .replace(/[-\s]+/g, '_');
+}
+
+function matchesAny(haystack: string, needles: readonly string[]): boolean {
+  return needles.some((needle) => haystack.includes(needle));
+}
+
+function matchesAgentNumberedStore(haystack: string, suffixes: readonly string[]): boolean {
+  return suffixes.some((suffix) =>
+    new RegExp(`(?:^|_)agent_\\d{4}_${suffix}(?:_|$)`).test(haystack),
+  );
+}
+
+function memoryAttachmentLabel(attachment: MemoryAttachment): string {
+  return attachment.store_name || attachment.memory_store_id;
 }
 
 /**
@@ -418,10 +538,13 @@ export async function resolveSenderToResources(
 ): Promise<MailRouteResolution | null> {
   const mapping = await readUserMapping(kv, senderEmail);
   if (mapping === null) return null;
+  const routed = routeMemoryAttachmentsForSession(mapping.memory_attachments, {
+    spaceType: 'DM',
+  });
   const full: ResolvedSessionResources = {
     sender_email: normalizeSenderEmail(senderEmail),
     user_slug: mapping.user_slug,
-    memory_attachments: mapping.memory_attachments,
+    memory_attachments: routed.selected,
     system_prompt_addendum: mapping.system_prompt_addendum ?? '',
     is_default: false,
     space_type: 'DM',

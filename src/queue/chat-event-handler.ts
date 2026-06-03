@@ -52,6 +52,7 @@ import {
 import { SLASH_SKILLS_DATA } from '../data/skills-data';
 import {
   ChatApiError,
+  type ChatMessageResult,
   deleteChatMessage,
   postChatMessage,
   updateChatMessage,
@@ -152,13 +153,16 @@ import { TOOLS_SPEC } from '../data/tools-spec';
 import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
 import { recordRuntimeEvent, stableHash } from '../lib/observability';
-import { postChatPlaceholder } from '../lib/chat-placeholder';
+import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const MORNING_BRIEF_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
+const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
+const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
 
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
@@ -471,8 +475,12 @@ export async function handleChatEvent(
     );
   }
 
+  const isAutonomousEvent = eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX);
+
   // ---- 5a. slash 決定論短絡 (/costguard 専用早期 return + /help generic dispatcher) ----
-  const cgCommand = parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
+  const cgCommand = isAutonomousEvent
+    ? null
+    : parseCostGuardCommand(bodyText) ?? parseNaturalCostGuardCommand(bodyText);
   if (cgCommand) {
     const cgText = await handleCostGuardCommand(
       env,
@@ -501,7 +509,7 @@ export async function handleChatEvent(
     );
     return { kind: 'committed' };
   }
-  if (bodyText.startsWith('/')) {
+  if (!isAutonomousEvent && bodyText.startsWith('/')) {
     const slashSkillsData: SkillsData = loadSlashSkillsData(env);
     const slashHandlers: SlashSkillHandlers = {};
     const slashOutcome = await dispatchSlashCommand(bodyText, slashSkillsData, {
@@ -534,15 +542,17 @@ export async function handleChatEvent(
     }
   }
 
-  const naturalScheduleResult = await dispatchNaturalScheduleCommand(
-    env,
-    bodyText,
-    {
-      eventKey,
-      messageId: message.name,
-      threadName,
-    },
-  );
+  const naturalScheduleResult = isAutonomousEvent
+    ? null
+    : await dispatchNaturalScheduleCommand(
+      env,
+      bodyText,
+      {
+        eventKey,
+        messageId: message.name,
+        threadName,
+      },
+    );
   if (naturalScheduleResult !== null) {
     await safePost(env, spaceName, naturalScheduleResult, threadName, eventKey);
     await safeCommit(env, eventKey, claim);
@@ -841,8 +851,10 @@ export async function handleChatEvent(
   //     ここで /mail や /schedule の skill 自体を invoke することはしない
   //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
   //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
-  let intent = detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
-  if (intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
+  let intent = isAutonomousEvent
+    ? null
+    : detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
+  if (!isAutonomousEvent && intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
     intent = { command: '/mail', isActionSkill: true, source: 'mail_intent' };
     console.log(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
@@ -1193,16 +1205,18 @@ export async function handleChatEvent(
   // 書き換え (= safeUpdateOrPost) または DELETE cleanup に使う。POST 自体
   // が失敗した場合は placeholderName 空のまま継続 = 旧経路 (POST 新規) に
   // fallback する (= UX 縮退するが bot 全体は落とさない、failure isolation)。
-  const placeholderName =
-    ingressPlaceholderName ||
-    await postChatPlaceholder(env, {
-      spaceName,
-      threadName,
-      eventKey,
-      messageId: message.name,
-      claim,
-      source: 'chat-event-handler',
-    });
+  const postedPlaceholder = ingressPlaceholderName
+    ? null
+    : await postChatPlaceholderResult(env, {
+        spaceName,
+        threadName,
+        eventKey,
+        messageId: message.name,
+        claim,
+        source: 'chat-event-handler',
+      });
+  const placeholderName = ingressPlaceholderName || postedPlaceholder?.name || '';
+  const placeholderThreadName = postedPlaceholder?.threadName ?? null;
   // Per-event session id holder. tool dispatcher が agent.custom_tool_use
   // 受信時に参照する。orchestrator が sessions.create or KV lookup を解決した
   // 直後に書き込まれる前にも tool は来うる (= sessions.create 完了 → 最初の
@@ -1244,6 +1258,7 @@ export async function handleChatEvent(
                 userSlug: userMapping.user_slug,
                 boundMessageId: '',
                 callerSessionId: sessionIdRef.current,
+                anthropic: client,
               })
             : gateExternalToolCall(env, {
                 eventKey,
@@ -1258,11 +1273,27 @@ export async function handleChatEvent(
         forceFreshSession,
         timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
           ? MORNING_BRIEF_STREAM_TIMEOUT_MS
-          : undefined,
+          : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
       });
       sessionId = orchestrated.sessionId;
       sessionIdRef.current = sessionId;
       assistantText = orchestrated.assistantText;
+      if (orchestrated.stopReason === 'custom_tool_timeout') {
+        assistantText =
+          'ファイル作成中にツール実行がタイムアウトしました。作成完了を確認できていないため、担当者がログを確認します。';
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'custom_tool_timeout_visible_notice',
+          level: 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            tool_use_count: orchestrated.toolUseCount,
+            tool_use_names: orchestrated.toolUseNames,
+          },
+        });
+      }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
       // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
@@ -1397,20 +1428,35 @@ export async function handleChatEvent(
         }
       }
     } catch (err) {
-      // 失敗経路 → placeholder 残骸を cleanup (Python `_delete_chat_message`
-      // 等価)。404 は内部で正常扱い、その他失敗は WARN log で吸収して bot
-      // 全体は落とさない (= 上流 retry/skip 経路を優先)。
-      if (placeholderName) {
-        await safeDeletePlaceholder(env, placeholderName, eventKey);
-      }
       if (err instanceof OrchestratorFailure) {
         if (err.reason === 'sessions_create_failed' || err.reason === 'stream_failed') {
-          // transient → release & retry
           console.error(
             `[chat-event] orchestrator transient eventKey=${eventKey} reason=${err.reason}: ${err.message}`,
           );
-          await safeRelease(env, eventKey, claim);
-          return { kind: 'release_and_retry', reason: err.reason };
+          const notice = '一時的なエラーです。少し時間を置いて再送してください。';
+          await replyToCurrentSpace(env, placeholderName, spaceName, notice, threadName, eventKey);
+          await recordRuntimeEvent(env, {
+            eventKey,
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            eventType: 'orchestrator_transient_visible_notice',
+            level: 'warn',
+            source: 'chat-event-handler',
+            detail: { reason: err.reason, error: redactPiiInText(err.message).slice(0, 1000) },
+          });
+          await safeCommit(env, eventKey, claim, {
+            messageId: message.name,
+            userSlug: userMapping.user_slug,
+            reason: err.reason,
+            stage: 'orchestrator',
+            outcome: 'committed',
+            level: 'warn',
+            detail: { visible_notice: true },
+          });
+          return { kind: 'committed' };
+        }
+        if (placeholderName) {
+          await safeDeletePlaceholder(env, placeholderName, eventKey);
         }
         // no_anthropic_client = misconfigured deploy, skip + commit (Queue 暴走防止)
         console.error(`[chat-event] orchestrator fatal eventKey=${eventKey}: ${err.message}`);
@@ -1424,6 +1470,9 @@ export async function handleChatEvent(
           detail: { error: err.message },
         });
         return { kind: 'skipped', reason: err.reason };
+      }
+      if (placeholderName) {
+        await safeDeletePlaceholder(env, placeholderName, eventKey);
       }
       // Unknown throw — defensive: release & retry
       console.error(
@@ -1546,6 +1595,7 @@ export async function handleChatEvent(
     env,
     sessionId,
     sourceText: markerLeakScrubbed.text,
+    artifactHintText: bodyText,
     minCreatedAtMs: sessionOutputMinCreatedAtMs,
     eventKey,
     resolveDriveDeps: async () => {
@@ -1609,86 +1659,120 @@ export async function handleChatEvent(
       `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting visible notice`,
     );
   }
-    // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
-    // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
-    // WARN log + safePost に fallback (= bot 全体は落とさない、Python
-    // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
-    // は従来通り新規 POST。
-    //
-    // 3-stage precheck wrap (Python `cma_lib.py:send_chat_reply` 等価)。
-    // 同一 (eventKey, kind='chat_reply', target=`${spaceName}:${threadName}`)
-    // 既送信なら ALREADY → 二重 reply を構造的に防ぐ (life #1266 系再発防止)。
-    const chatReplyOutcome = await executeWithCommit({
-      env,
-      parentEventKey: eventKey,
-      parentOwner: claim.owner,
-      kind: 'chat_reply',
-      target: `${spaceName}:${threadName ?? ''}`,
-      sendFn: async () => {
+  const autonomousLongReply = buildAutonomousLongReplyDelivery(eventKey, chatReplyText);
+  // placeholder POST 済なら PATCH 書き換え (Python `_placeholder_reply`
+  // = `_update_chat_message` 経路、l.3926-3942 等価)。PATCH 失敗時は
+  // WARN log + safePost に fallback (= bot 全体は落とさない、Python
+  // l.3940-3942 等価)。placeholder 無し (POST 自体が失敗していたケース)
+  // は従来通り新規 POST。
+  //
+  // 3-stage precheck wrap (Python `cma_lib.py:send_chat_reply` 等価)。
+  // 同一 (eventKey, kind='chat_reply', target=`${spaceName}:${threadName}`)
+  // 既送信なら ALREADY → 二重 reply を構造的に防ぐ (life #1266 系再発防止)。
+  const chatReplyOutcome = await executeWithCommit({
+    env,
+    parentEventKey: eventKey,
+    parentOwner: claim.owner,
+    kind: 'chat_reply',
+    target: `${spaceName}:${threadName ?? ''}`,
+    sendFn: async () => {
+      if (autonomousLongReply) {
+        let replyThreadName = threadName || placeholderThreadName;
         if (placeholderName) {
-          await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
+          await safeUpdateOrPost(
+            env,
+            placeholderName,
+            spaceName,
+            autonomousLongReply.title,
+            replyThreadName,
+            eventKey,
+          );
         } else {
-          await safePost(env, spaceName, chatReplyText, threadName, eventKey);
+          const titlePost = await safePost(
+            env,
+            spaceName,
+            autonomousLongReply.title,
+            threadName,
+            eventKey,
+          );
+          replyThreadName = replyThreadName || titlePost?.threadName || null;
         }
-        // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
-        return undefined as unknown as void;
-      },
-      options: parentHeartbeat ? { heartbeat: parentHeartbeat } : {},
+        await safePost(
+          env,
+          spaceName,
+          autonomousLongReply.body,
+          replyThreadName,
+          eventKey,
+        );
+      } else if (placeholderName) {
+        await safeUpdateOrPost(env, placeholderName, spaceName, chatReplyText, threadName, eventKey);
+      } else {
+        await safePost(env, spaceName, chatReplyText, threadName, eventKey);
+      }
+      // sendFn の戻り値は使わないが outcome.result 用 sentinel に void を入れる。
+      return undefined as unknown as void;
+    },
+    options: parentHeartbeat ? { heartbeat: parentHeartbeat } : {},
+  });
+  if (chatReplyOutcome.outcome === 'already') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      source: 'chat-event-handler',
+      detail: { outcome: 'already' },
     });
-    if (chatReplyOutcome.outcome === 'already') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        source: 'chat-event-handler',
-        detail: { outcome: 'already' },
-      });
-      console.log(
-        `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
-      );
-    } else if (chatReplyOutcome.outcome === 'lease_alive') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { outcome: 'lease_alive' },
-      });
-      console.warn(
-        `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
-      );
-      await safeRelease(env, eventKey, claim);
-      return { kind: 'release_and_retry', reason: 'chat_reply_lease_alive' };
-    } else if (chatReplyOutcome.outcome === 'lease_lost') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { outcome: 'lease_lost' },
-      });
-      console.warn(
-        `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
-      );
-    } else if (chatReplyOutcome.outcome === 'sent') {
-      await recordRuntimeEvent(env, {
-        eventKey,
-        sessionId,
-        messageId: message.name,
-        eventType: 'final_chat_reply_result',
-        source: 'chat-event-handler',
-        detail: {
-          outcome: 'sent',
-          mode: placeholderName ? 'patch_or_post_fallback' : 'post',
-          final_text_chars: chatReplyText.length,
-        },
-      });
-    }
+    console.log(
+      `[chat-event] chat_reply already sent eventKey=${eventKey} space=${spaceName} — skipping duplicate`,
+    );
+  } else if (chatReplyOutcome.outcome === 'lease_alive') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { outcome: 'lease_alive' },
+    });
+    console.warn(
+      `[chat-event] chat_reply in-flight by another worker eventKey=${eventKey} space=${spaceName}`,
+    );
+    await safeRelease(env, eventKey, claim);
+    return { kind: 'release_and_retry', reason: 'chat_reply_lease_alive' };
+  } else if (chatReplyOutcome.outcome === 'lease_lost') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { outcome: 'lease_lost' },
+    });
+    console.warn(
+      `[chat-event] chat_reply lease lost eventKey=${eventKey} space=${spaceName}`,
+    );
+  } else if (chatReplyOutcome.outcome === 'sent') {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      eventType: 'final_chat_reply_result',
+      source: 'chat-event-handler',
+      detail: {
+        outcome: 'sent',
+        mode: autonomousLongReply
+          ? 'autonomous_long_reply_split'
+          : placeholderName
+            ? 'patch_or_post_fallback'
+            : 'post',
+        final_text_chars: chatReplyText.length,
+        autonomous_split: Boolean(autonomousLongReply),
+      },
+    });
+  }
 
   // ---- 8. session-log memory append ----
   await safeAppendSessionLog(env, {
@@ -2521,6 +2605,16 @@ function mapToPythonCapStopReason(
   }
 }
 
+function parseReactiveStreamTimeoutMs(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n < 10 || n > 600_000) {
+    console.warn(`[chat-event] invalid CMA_REACTIVE_STREAM_TIMEOUT_MS=${raw}; using default`);
+    return undefined;
+  }
+  return n;
+}
+
 /**
  * intent-detector 結果から bodyText 先頭に注入する 1 行 hint を組み立てる
  * (Issue #186 既知 #4)。
@@ -2537,6 +2631,61 @@ export function buildIntentPrefix(intent: ActionSkillIntent | null): string {
   return '';
 }
 
+interface AutonomousLongReplyDelivery {
+  title: string;
+  body: string;
+}
+
+function buildAutonomousLongReplyDelivery(
+  eventKey: string,
+  text: string,
+): AutonomousLongReplyDelivery | null {
+  const body = (text || '').trim();
+  if (!eventKey.startsWith(AUTONOMOUS_EVENT_KEY_PREFIX)) return null;
+  if (Array.from(body).length < AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS) return null;
+  const title = buildAutonomousReplyTitle(body, eventKey);
+  return { title, body };
+}
+
+function buildAutonomousReplyTitle(text: string, eventKey: string): string {
+  const firstLine =
+    text
+      .split(/\r?\n/)
+      .map((line) => normalizeAutonomousTitleLine(line))
+      .find((line) => line.length > 0) || defaultAutonomousReplyTitle(eventKey);
+  const maxBodyChars = Math.max(
+    8,
+    AUTONOMOUS_REPLY_TITLE_MAX_CHARS - defaultAutonomousReplyPrefix(eventKey).length,
+  );
+  return `${defaultAutonomousReplyPrefix(eventKey)}${truncateDisplayChars(firstLine, maxBodyChars)}`;
+}
+
+function normalizeAutonomousTitleLine(line: string): string {
+  return line
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^[-*]\s*/, '')
+    .replace(/^===.*===$/, '')
+    .trim();
+}
+
+function defaultAutonomousReplyPrefix(eventKey: string): string {
+  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+    ? '朝ブリーフ: '
+    : '定期実行: ';
+}
+
+function defaultAutonomousReplyTitle(eventKey: string): string {
+  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+    ? '朝ブリーフをまとめました'
+    : '結果をまとめました';
+}
+
+function truncateDisplayChars(text: string, maxChars: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, Math.max(1, maxChars - 1)).join('')}…`;
+}
+
 // ---------------------------------------------------------------------------
 // helper: safe wrappers (never throw)
 // ---------------------------------------------------------------------------
@@ -2547,19 +2696,19 @@ async function safePost(
   text: string,
   threadName: string | null,
   eventKey: string,
-): Promise<void> {
+): Promise<ChatMessageResult | null> {
   const saKey = env.CHAT_SA_KEY_JSON;
   if (!saKey) {
     console.warn(
       `[chat-event] safePost skipped eventKey=${eventKey} CHAT_SA_KEY_JSON missing`,
     );
-    return;
+    return null;
   }
   if (!spaceName || !text) {
     console.warn(
       `[chat-event] safePost skipped eventKey=${eventKey} empty space or text`,
     );
-    return;
+    return null;
   }
   try {
     // Python `_reply_to_chat:l.1247-1249` と等価: thread 指定時は
@@ -2567,7 +2716,7 @@ async function safePost(
     // 付ける。これがないと Chat REST API のデフォルト動作で「新規 thread
     // として post」される (= 2026-05-26 reactive bot 実機検証で表示崩れ
     // 確認、Python と等価合わせ)。
-    await postChatMessage(
+    const result = await postChatMessage(
       { saKeyJson: saKey },
       spaceName,
       text,
@@ -2584,6 +2733,7 @@ async function safePost(
       operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
       enabledEnv: env.COST_GUARD_ENABLED,
     });
+    return result;
   } catch (err) {
     const reason =
       err instanceof ChatApiError
@@ -2594,6 +2744,7 @@ async function safePost(
     console.warn(
       `[chat-event] safePost fail eventKey=${eventKey} space=${spaceName}: ${reason}`,
     );
+    return null;
   }
 }
 

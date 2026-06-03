@@ -7,13 +7,15 @@
  * Issue #126 same-message reject).
  */
 
-import { describe, it, expect } from 'vitest';
+import type Anthropic from '@anthropic-ai/sdk';
+import { describe, it, expect, vi } from 'vitest';
 import {
   driveCreateFile,
   driveDelete,
   driveGetFileMetadata,
   driveReadExport,
   driveSearch,
+  driveStageFile,
   driveUploadBinaryFile,
   type DriveToolDeps,
 } from '../src/tools/drive';
@@ -125,6 +127,22 @@ describe('driveCreateFile', () => {
       driveCreateFile({ name: 'x', content: big }, baseDeps(fetcher)),
     ).rejects.toThrow();
   });
+
+  it('rejects binary Office/PDF artifacts because content is text-only', async () => {
+    const fetcher = makeFetchMock(async () => {
+      throw new Error('drive_create_file should reject before fetch');
+    });
+    await expect(
+      driveCreateFile(
+        {
+          name: 'issue247-drive-e2e.xlsx',
+          content: 'not a real xlsx package',
+          mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+        baseDeps(fetcher),
+      ),
+    ).rejects.toThrow(/binary artifact/);
+  });
 });
 
 describe('driveUploadBinaryFile', () => {
@@ -150,6 +168,96 @@ describe('driveUploadBinaryFile', () => {
     );
     expect(r.id).toBe('bin-id');
     expect(r.webViewLink).toBe('https://drive.test/bin-id');
+  });
+});
+
+describe('driveStageFile', () => {
+  it('downloads an Office binary and mounts it into the active session', async () => {
+    let count = 0;
+    const fetcher = makeFetchMock(async (url) => {
+      count++;
+      if (count === 1) {
+        expect(url).toContain('fields=id%2Cname%2CmimeType%2Csize');
+        return jsonResponse(200, {
+          id: 'drive-id',
+          name: 'template.xlsx',
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          size: '2',
+        });
+      }
+      expect(url).toContain('alt=media');
+      return new Response(new Uint8Array([0x50, 0x4b]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+      });
+    });
+    const upload = vi.fn(async () => ({
+      id: 'file_abc',
+      type: 'file',
+      filename: 'template.xlsx',
+      mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      size_bytes: 2,
+      created_at: '2026-06-02T00:00:00Z',
+    }));
+    const add = vi.fn(async () => ({
+      id: 'sesrsc_abc',
+      type: 'file',
+      file_id: 'file_abc',
+      mount_path: '/mnt/session/uploads/template.xlsx',
+      created_at: '2026-06-02T00:00:00Z',
+      updated_at: '2026-06-02T00:00:00Z',
+    }));
+    const anthropic = {
+      beta: {
+        files: { upload },
+        sessions: { resources: { add } },
+      },
+    } as unknown as Anthropic;
+
+    const r = await driveStageFile(
+      { file_id: 'drive-id' },
+      {
+        ...baseDeps(fetcher),
+        anthropic,
+        sessionId: 'sesn_abc',
+      },
+    );
+
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith('sesn_abc', {
+      type: 'file',
+      file_id: 'file_abc',
+      mount_path: '/mnt/session/uploads/template.xlsx',
+    });
+    expect(r).toMatchObject({
+      drive_file_id: 'drive-id',
+      name: 'template.xlsx',
+      anthropic_file_id: 'file_abc',
+      session_resource_id: 'sesrsc_abc',
+      mount_path: '/mnt/session/uploads/template.xlsx',
+    });
+  });
+
+  it('rejects Google-native files because they are not Office binaries', async () => {
+    const fetcher = makeFetchMock(async () =>
+      jsonResponse(200, {
+        id: 'sheet-id',
+        name: 'native',
+        mimeType: 'application/vnd.google-apps.spreadsheet',
+      }),
+    );
+    await expect(
+      driveStageFile(
+        { file_id: 'sheet-id' },
+        {
+          ...baseDeps(fetcher),
+          anthropic: { beta: { files: {}, sessions: { resources: {} } } } as unknown as Anthropic,
+          sessionId: 'sesn_abc',
+        },
+      ),
+    ).rejects.toThrow(/Google-native/);
   });
 });
 

@@ -93,7 +93,14 @@ vi.mock('../src/lib/chat-api', async (importOriginal) => {
     ) => {
       if (chatApiMock.postThrow) throw chatApiMock.postThrow;
       chatApiMock.posts.push({ spaceName, text, opts });
-      return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}` };
+      const threadName =
+        typeof opts === 'object' &&
+        opts !== null &&
+        'threadName' in opts &&
+        typeof (opts as { threadName?: unknown }).threadName === 'string'
+          ? (opts as { threadName: string }).threadName
+          : `${spaceName}/threads/t_${chatApiMock.posts.length}`;
+      return { name: `${spaceName}/messages/m_${chatApiMock.posts.length}`, threadName };
     },
     updateChatMessage: async (
       _deps: unknown,
@@ -117,7 +124,13 @@ vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async () => ({ ok: false, payload: { error: 'mocked' } }),
+    dispatchMakotoTool: async (name: string, input: unknown) => {
+      const override = (globalThis as unknown as {
+        __makotoToolDispatch?: (name: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>;
+      }).__makotoToolDispatch;
+      if (override) return override(name, input);
+      return { ok: false, payload: { error: 'mocked' } };
+    },
   };
 });
 
@@ -488,6 +501,7 @@ beforeEach(() => {
   schedulerMock.capturedCalls.length = 0;
   schedulerMock.shouldThrow = false;
   schedulerMock.jobs = [];
+  delete (globalThis as unknown as { __makotoToolDispatch?: unknown }).__makotoToolDispatch;
   installFakeAnthropic(null);
 });
 
@@ -1183,6 +1197,98 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('uploads session output xlsx when only the user prompt names the file', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+        OAUTH_CLIENT_ID: 'cid',
+        OAUTH_CLIENT_SECRET: 'csec',
+        MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      },
+    });
+    await putRefreshToken(env.MAKOTO_KV, TEST_VAULT_KEY_B64, 'alice', 'refresh-token');
+    const msg = buildQueueMsg({
+      text:
+        'xlsx skill を使って A1 に「issue-247 drive ok」と入った最小の Excel を作ってください。ファイル名は issue247-drive-e2e.xlsx。',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_output_xlsx_hint',
+      events: [
+        {
+          type: 'agent.message.text',
+          text: 'できました。',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const uploadCalls: Array<{ auth: string | null; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      if (url === 'https://api.anthropic.com/v1/files?scope_id=sesn_output_xlsx_hint&limit=20') {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: 'file_xlsx_hint_1',
+                filename: 'issue247-drive-e2e.xlsx',
+                mime_type:
+                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                size_bytes: 4830,
+                downloadable: true,
+                created_at: new Date().toISOString(),
+                scope: { type: 'session', id: 'sesn_output_xlsx_hint' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(JSON.stringify({ access_token: 'drive-access', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === 'https://api.anthropic.com/v1/files/file_xlsx_hint_1/content') {
+        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), { status: 200 });
+      }
+      if (url.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+        const body = init.body as Blob;
+        uploadCalls.push({
+          auth: (init.headers as Headers).get('Authorization'),
+          body: await body.text(),
+        });
+        return new Response(
+          JSON.stringify({
+            id: 'drive-file-hint-1',
+            name: 'issue247-drive-e2e.xlsx',
+            webViewLink: 'https://docs.google.com/spreadsheets/d/drive-file-hint-1/edit',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(uploadCalls).toHaveLength(1);
+      expect(uploadCalls[0]!.auth).toBe('Bearer drive-access');
+      expect(uploadCalls[0]!.body).toContain('issue247-drive-e2e.xlsx');
+      const finalReply = chatApiMock.patches.at(-1)?.text ?? chatApiMock.posts.at(-1)?.text ?? '';
+      expect(finalReply).toContain('*Driveに保存しました*');
+      expect(finalReply).toContain('https://docs.google.com/spreadsheets/d/drive-file-hint-1/edit');
+      expect(finalReply).toContain('issue247-drive-e2e.xlsx');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 2b: shared thread history uses User OAuth token instead of service account', async () => {
     const env = buildEnv({
       envOverrides: {
@@ -1815,7 +1921,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
-  it('Case 12: LLM stream throw → release_and_retry', async () => {
+  it('Case 12: LLM stream throw → visible notice + commit', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1828,21 +1934,24 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('release_and_retry');
-    if (result.kind === 'release_and_retry') {
-      expect(result.reason).toBe('stream_failed');
-    }
-    // claim was released (= lease_expires_at_ms = 0)
+    expect(result.kind).toBe('committed');
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
-    expect(Number(row?.lease_expires_at_ms)).toBe(0);
-    // placeholder POST は走った (= ack 表示) が、stream throw 後に DELETE で
-    // 残骸 cleanup される (Python `_delete_chat_message` 等価)。
+    expect(row?.committed_at_ms).toBeTruthy();
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
-    expect(chatApiMock.deletes).toHaveLength(1);
-    expect(chatApiMock.patches).toHaveLength(0); // 最終 reply は無い
+    expect(chatApiMock.deletes).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
+    })._tables.cma_worker_runtime_events;
+    expect(runtimeEvents.map((row) => row.event_type)).toContain('orchestrator_transient_visible_notice');
+    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    expect(noticeEvent?.detail_json).toContain('stream_failed');
+    expect(noticeEvent?.detail_json).toContain('stream connection reset');
   });
 
   it('Case 13: session-log attachment 不在 → skip + event committed', async () => {
@@ -2471,7 +2580,49 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
-  it('placeholder cleanup: sessions.create throw → placeholder DELETE が呼ばれる', async () => {
+  it('custom tool timeout: PATCHes visible notice instead of leaving placeholder text', async () => {
+    const env = buildEnv({
+      envOverrides: { CMA_REACTIVE_STREAM_TIMEOUT_MS: '10' },
+    });
+    const msg = buildQueueMsg({
+      text: '原稿を書いてDrive保存して',
+      placeholderName: 'spaces/AAA/messages/ingress_timeout',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    (globalThis as unknown as {
+      __makotoToolDispatch?: () => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async () => new Promise(() => undefined);
+
+    installFakeAnthropic({
+      sessionId: 'sesn_custom_tool_timeout',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'まず原稿を書いてDriveに上げます。' }],
+        },
+        { type: 'agent.custom_tool_use', id: 'tu_drive', name: 'drive_create_file', input: {} },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_drive'] },
+        },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_timeout');
+    expect(chatApiMock.patches[0]!.text).toContain(
+      'ファイル作成中にツール実行がタイムアウトしました',
+    );
+    expect(chatApiMock.patches[0]!.text).not.toContain('Driveに上げます');
+    expect(chatApiMock.deletes).toHaveLength(0);
+  });
+
+  it('sessions.create throw → visible notice without deleting placeholder', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -2486,17 +2637,24 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('release_and_retry');
-    if (result.kind === 'release_and_retry') {
-      expect(result.reason).toBe('sessions_create_failed');
-    }
-    // placeholder POST 1 件 + DELETE 1 件 (= 残骸 cleanup)
+    expect(result.kind).toBe('committed');
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
-    expect(chatApiMock.deletes).toHaveLength(1);
-    expect(chatApiMock.deletes[0]).toBe('spaces/AAA/messages/m_1');
-    // PATCH は呼ばれない (= 最終応答は無い)
-    expect(chatApiMock.patches).toHaveLength(0);
+    expect(chatApiMock.deletes).toHaveLength(0);
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
+    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
+    })._tables.cma_worker_runtime_events;
+    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    expect(noticeEvent?.detail_json).toContain('sessions_create_failed');
+    expect(noticeEvent?.detail_json).toContain('sessions.create upstream 503');
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const row = dedupe.get(msg.eventKey);
+    expect(row?.committed_at_ms).toBeTruthy();
   });
 
   it('placeholder PATCH 失敗: WARN log + safePost (新規 POST) に fallback、bot 全体は落とさない', async () => {
@@ -2726,6 +2884,110 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches).toHaveLength(1);
     expect(chatApiMock.patches[0]!.text).toContain('通常完了テキスト');
     expect(chatApiMock.patches[0]!.text).not.toContain('RECOVERY_ERRONEOUSLY_RAN');
+  });
+
+  it('autonomous scheduled long reply: first message is short title and full body is thread reply', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-06-02:test';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '直近3日分の朝ブリーフです\n' +
+      Array.from({ length: 24 }, (_, i) => `- 重要項目${i + 1}: 対応内容を整理しました。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_split',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: `===BRIEF_FINAL===\n${longBody}` }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(chatApiMock.posts).toHaveLength(2);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toBe('朝ブリーフ: 直近3日分の朝ブリーフです');
+    expect(chatApiMock.patches[0]!.text.length).toBeLessThan(40);
+
+    expect(chatApiMock.posts[1]!.text).toBe(longBody);
+    expect((chatApiMock.posts[1]!.opts as { threadName?: string }).threadName).toBe(
+      'spaces/AAA/threads/t_1',
+    );
+  });
+
+  it('autonomous scheduled prompt bypasses reactive schedule-command short circuit', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'スケジュール一覧も確認して、瀬戸さん向けの朝ブリーフを長文でまとめてください。',
+    });
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-06-02:schedule-word';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '朝ブリーフです\n' +
+      Array.from({ length: 24 }, (_, i) => `- 確認項目${i + 1}: スケジュール語を含む自律起動です。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_schedule_word',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: `===BRIEF_FINAL===\n${longBody}` }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(schedulerMock.capturedCalls).toHaveLength(0);
+    expect(runtimeEvents(env).some((row) => row.event_type === 'natural_schedule_command_result')).toBe(false);
+    expect(chatApiMock.patches[0]!.text).toBe('朝ブリーフ: 朝ブリーフです');
+    expect(chatApiMock.posts[1]!.text).toBe(longBody);
+  });
+
+  it('reactive long reply: human-triggered long body stays in the first message', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const longBody =
+      '通常返信の長文です\n' +
+      Array.from({ length: 24 }, (_, i) => `- 項目${i + 1}: 人間が依頼した通常返信です。`).join('\n');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_reactive_long_reply',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: longBody }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
+    expect(chatApiMock.patches[0]!.text).toBe(longBody);
   });
 
   it('morning brief: final reply lease_alive は parent を commit せず retry に戻す', async () => {

@@ -137,6 +137,37 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(second.events[0]!.is_error).toBe(true);
   });
 
+  it('sends error user.custom_tool_result when custom tool dispatch times out', async () => {
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    const client = makeFakeClient({
+      events: [
+        { type: 'agent.custom_tool_use', id: 'tu_timeout', name: 'drive_create_file', input: {} },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_timeout'] },
+        },
+      ],
+      onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+    });
+    const dispatcher: ToolDispatcher = async () =>
+      new Promise<Awaited<ReturnType<ToolDispatcher>>>(() => undefined);
+
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 's',
+      userMessage: 'x',
+      toolDispatcher: dispatcher,
+      timeoutMs: 10,
+    });
+
+    expect(r.stopReason).toBe('custom_tool_timeout');
+    expect(r.terminalEventType).toBe('error.custom_tool_timeout');
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.events[0]!.type).toBe('user.custom_tool_result');
+    expect(sent[1]!.events[0]!.custom_tool_use_id).toBe('tu_timeout');
+    expect(sent[1]!.events[0]!.is_error).toBe(true);
+    expect(JSON.stringify(sent[1]!.events[0])).toContain('custom_tool_timeout');
+  });
+
   it('continues past one tool call to terminal', async () => {
     const client = makeFakeClient({
       events: [

@@ -114,4 +114,61 @@ describe('orchestrateChatTurn', () => {
       environment_id: 'env_employee',
     });
   });
+
+  it('routes Memory Store resources before sessions.create', async () => {
+    const calls: string[] = [];
+    const kv = makeKv();
+    const createArgs: unknown[] = [];
+    const client = makeClient(calls);
+    const originalCreate = client.beta.sessions.create;
+    client.beta.sessions.create = (async (args: unknown) => {
+      createArgs.push(args);
+      return originalCreate.call(client.beta.sessions, args as never);
+    }) as typeof client.beta.sessions.create;
+
+    await orchestrateChatTurn({
+      env: {
+        ENVIRONMENT_ID: 'env_employee',
+        MAKOTO_KV: kv,
+      } as Env,
+      client,
+      senderEmail: 'alice@example.com',
+      spaceName: 'spaces/AAA',
+      spaceType: 'DM',
+      threadName: 'spaces/AAA/threads/T2',
+      bodyText: '昨日の議事録を踏まえて整理して',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [
+          { memory_store_id: 'mem_extra_1', access: 'read_only', store_name: 'random_1' },
+          { memory_store_id: 'mem_wiki', access: 'read_write', store_name: 'corporate_wiki_memory' },
+          { memory_store_id: 'mem_company', access: 'read_only', store_name: 'company_core_memory' },
+          { memory_store_id: 'mem_makoto', access: 'read_write', store_name: 'makoto_kun_memory' },
+          { memory_store_id: 'mem_dm_report', access: 'read_write', store_name: 'daily_report_dm_store' },
+          { memory_store_id: 'mem_dm_log', access: 'read_write', store_name: 'session_log_dm_store' },
+          { memory_store_id: 'mem_shared_report', access: 'read_write', store_name: 'daily_report_shared_store' },
+          { memory_store_id: 'mem_shared_log', access: 'read_write', store_name: 'session_log_shared_store' },
+          { memory_store_id: 'mem_extra_2', access: 'read_only', store_name: 'random_2' },
+          { memory_store_id: 'mem_extra_3', access: 'read_only', store_name: 'random_3' },
+        ],
+      },
+      personaSpec: 'persona',
+      toolsSpec: '## メール送信能力\nmail',
+      toolDispatcher: async () => ({ ok: true, payload: null }),
+    });
+
+    const resources = (createArgs[0] as { resources: Array<{ memory_store_id: string }> })
+      .resources;
+    expect(resources.map((r) => r.memory_store_id)).toEqual([
+      'mem_wiki',
+      'mem_company',
+      'mem_makoto',
+      'mem_dm_report',
+      'mem_dm_log',
+      'mem_shared_report',
+      'mem_shared_log',
+      'mem_extra_1',
+    ]);
+  });
 });

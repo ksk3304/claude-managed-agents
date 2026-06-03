@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -12,6 +12,30 @@ function resolveWranglerBin() {
   const local = resolve(repoRoot, "node_modules", ".bin", "wrangler");
   if (existsSync(local)) return local;
   return "wrangler";
+}
+
+function readHeadCommit() {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+export function hasDeployMessageArg(args) {
+  return args.some((arg) => arg === "--message" || arg.startsWith("--message="));
+}
+
+export function buildDefaultDeployMessage(env = process.env) {
+  const explicit = (env.CF_DEPLOY_MESSAGE || "").trim();
+  if (explicit) return explicit;
+
+  const head = readHeadCommit();
+  return head ? `cf-repo=${head}` : "cf-repo=unknown";
 }
 
 export function isWorkersAuthFailure(output) {
@@ -57,7 +81,10 @@ export function buildDeployFailureMessage(output, env = process.env) {
 
 export function runDeploy(args = process.argv.slice(2), env = process.env) {
   const wrangler = resolveWranglerBin();
-  const result = spawnSync(wrangler, ["deploy", ...args], {
+  const deployArgs = hasDeployMessageArg(args)
+    ? args
+    : [...args, "--message", buildDefaultDeployMessage(env)];
+  const result = spawnSync(wrangler, ["deploy", ...deployArgs], {
     cwd: repoRoot,
     env,
     encoding: "utf8",
