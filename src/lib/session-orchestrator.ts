@@ -75,7 +75,7 @@ export const KV_CHAT_THREAD_SESSION_PREFIX = 'chat_thread_session';
 const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 
 /** Session stream wall-time cap. Workers Queue consumer = 15 min budget. */
-const SESSION_STREAM_TIMEOUT_MS = 110_000;
+const SESSION_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
 /**
