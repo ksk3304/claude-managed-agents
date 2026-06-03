@@ -38,6 +38,7 @@ interface MakotoTables {
   cma_worker_runtime_events: FakeRow[];
   cma_session_binds: FakeRow[];
   cma_session_payload_audit: FakeRow[];
+  heartbeat_tasks: Map<string, FakeRow>;
 }
 
 export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
@@ -53,6 +54,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
     cma_worker_runtime_events: [],
     cma_session_binds: [],
     cma_session_payload_audit: [],
+    heartbeat_tasks: new Map(),
   };
 
   function exec(
@@ -177,6 +179,42 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         }
       }
       return { results: [], meta: { changes } };
+    }
+
+    // ----- heartbeat_tasks -----
+    if (
+      /^SELECT task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at FROM heartbeat_tasks WHERE enabled = 1 AND kind = 'patrol' AND \(last_run_at IS NULL OR \?1 - last_run_at >= interval_min \* 60000\) ORDER BY COALESCE\(last_run_at, 0\), task_id LIMIT \?2$/i.test(
+        trimmed,
+      )
+    ) {
+      const [nowMs, limit] = params as [number, number];
+      const results = [...tables.heartbeat_tasks.values()]
+        .filter((row) => Number(row.enabled) === 1)
+        .filter((row) => row.kind === 'patrol')
+        .filter((row) => {
+          if (row.last_run_at === null || row.last_run_at === undefined) return true;
+          return Number(nowMs) - Number(row.last_run_at) >= Number(row.interval_min) * 60_000;
+        })
+        .sort((a, b) => {
+          const aLast = a.last_run_at === null || a.last_run_at === undefined ? 0 : Number(a.last_run_at);
+          const bLast = b.last_run_at === null || b.last_run_at === undefined ? 0 : Number(b.last_run_at);
+          if (aLast !== bLast) return aLast - bLast;
+          return String(a.task_id).localeCompare(String(b.task_id));
+        })
+        .slice(0, Number(limit));
+      return { results };
+    }
+    if (
+      /^UPDATE heartbeat_tasks SET last_run_at = \?2, updated_at = \?2 WHERE task_id = \?1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [taskId, nowMs] = params as [string, number];
+      const row = tables.heartbeat_tasks.get(taskId);
+      if (!row) return { results: [], meta: { changes: 0 } };
+      row.last_run_at = nowMs;
+      row.updated_at = nowMs;
+      return { results: [], meta: { changes: 1 } };
     }
 
     // ----- Issue #206 observability -----

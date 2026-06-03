@@ -36,6 +36,10 @@ import {
   enqueueMorningBriefSeto,
   MORNING_BRIEF_SETO_CRON,
 } from "./scheduled/morning-brief";
+import {
+  HEARTBEAT_CRON,
+  runHeartbeatTick,
+} from "./scheduled/heartbeat";
 import { buildAnthropicClient } from "./lib/session";
 import { newClaimOwner, releaseClaim, tryClaim } from "./lib/dedupe";
 import {
@@ -113,6 +117,8 @@ export default {
   //     セッションログを Memory Store に集約・要約・書き込み)
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
+  //   - `*/30 * * * *` → heartbeat_tasks due rows を Google Chat Queue
+  //     経路へ enqueue (`HEARTBEAT_ENABLED` opt-in)
   async scheduled(
     controller: ScheduledController,
     env: Env,
@@ -124,6 +130,10 @@ export default {
     }
     if (controller.cron === MORNING_BRIEF_SETO_CRON) {
       ctx.waitUntil(enqueueMorningBriefSeto(env));
+      return;
+    }
+    if (controller.cron === HEARTBEAT_CRON) {
+      ctx.waitUntil(runHeartbeatTick(env));
       return;
     }
     // default = prune cron (`0 4 * * *`). 旧 path を保持.
