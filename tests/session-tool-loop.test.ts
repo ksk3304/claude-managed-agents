@@ -29,19 +29,31 @@ interface FakeEvent {
 
 interface FakeClientOptions {
   events: FakeEvent[];
+  listEvents?: FakeEvent[];
   /** Capture each events.send payload here. */
   onSend?: (payload: unknown) => void;
   sendImpl?: (sessionId: string, payload: unknown) => Promise<void>;
+  streamImpl?: () => AsyncIterable<FakeEvent>;
 }
 
 function makeFakeClient(opts: FakeClientOptions): Anthropic {
   async function* stream(): AsyncIterable<FakeEvent> {
+    if (opts.streamImpl) {
+      yield* opts.streamImpl();
+      return;
+    }
     for (const ev of opts.events) yield ev;
+  }
+  async function* list(): AsyncIterable<FakeEvent> {
+    for (const ev of opts.listEvents ?? []) yield ev;
   }
   return {
     beta: {
       sessions: {
         events: {
+          list(_sessionId: string, _params: unknown): AsyncIterable<FakeEvent> {
+            return list();
+          },
           async send(_sessionId: string, payload: unknown): Promise<void> {
             opts.onSend?.(payload);
             if (opts.sendImpl) {
@@ -141,7 +153,7 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(second.events[0]!.is_error).toBe(true);
   });
 
-  it('interrupts a blocked pending custom tool action before retrying the same user message', async () => {
+  it('interrupts a blocked pending custom tool action without replaying the same user message', async () => {
     const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
     let userMessageAttempts = 0;
     const client = makeFakeClient({
@@ -167,17 +179,52 @@ describe('sendAndStreamWithToolDispatch', () => {
     });
     const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
 
-    const result = await sendAndStreamWithToolDispatch(client, {
+    await expect(
+      sendAndStreamWithToolDispatch(client, {
       sessionId: 'sesn_blocked',
       userMessage: '議事録作って',
       toolDispatcher: dispatcher,
-    });
+      }),
+    ).rejects.toThrow('waiting on responses to events');
 
-    expect(result.assistantText).toBe('議事録を作りました。');
-    expect(sent).toHaveLength(3);
+    expect(sent).toHaveLength(2);
     expect(sent[0]!.events[0]!.type).toBe('user.message');
     expect(sent[1]!.events[0]!.type).toBe('user.interrupt');
-    expect(sent[2]!.events[0]!.type).toBe('user.message');
+    expect(userMessageAttempts).toBe(1);
+  });
+
+  it('recovers final assistant text from session history after stream timeout', async () => {
+    async function* stuckStream(): AsyncIterable<FakeEvent> {
+      await new Promise(() => undefined);
+    }
+    const client = makeFakeClient({
+      events: [],
+      streamImpl: stuckStream,
+      listEvents: [
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: '遅れても最後まで返して' }],
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '最終回答です。' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+
+    const result = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_late_final',
+      userMessage: '遅れても最後まで返して',
+      toolDispatcher: dispatcher,
+      timeoutMs: 1,
+      timeoutRecoveryMs: 1,
+    });
+
+    expect(result.assistantText).toBe('最終回答です。');
+    expect(result.stopReason).toBe('end_turn');
+    expect(result.recoveredFromStreamTimeout).toBe(true);
   });
 
   it('sends error user.custom_tool_result when custom tool dispatch times out', async () => {

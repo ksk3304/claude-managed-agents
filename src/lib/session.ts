@@ -182,9 +182,13 @@ export interface SendAndStreamResult {
   toolUseCount: number;
   /** Tool names observed in tool-use events, de-duplicated in encounter order. */
   toolUseNames: string[];
+  /** True when live stream timed out but final text was recovered via events.list. */
+  recoveredFromStreamTimeout?: boolean;
 }
 
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_RECOVERY_POLL_MS = 0;
+const TIMEOUT_RECOVERY_POLL_INTERVAL_MS = 2_000;
 
 /**
  * Inject `userMessage` into the session, drain the event stream
@@ -354,13 +358,10 @@ async function sendUserMessageEvents(
   } catch (err) {
     if (!isWaitingOnToolResultError(err)) throw err;
     console.warn(
-      `[session] user.message blocked by pending tool action sessionId=${sessionId}; sending interrupt before retry`,
+      `[session] user.message blocked by pending tool action sessionId=${sessionId}; sending interrupt without replaying user.message`,
     );
     await unblockPendingAction();
-    await client.beta.sessions.events.send(sessionId, {
-      events: userMessageEvents,
-      betas: [ANTHROPIC_BETA],
-    } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+    throw err;
   }
 }
 
@@ -416,6 +417,11 @@ export interface SendAndStreamWithToolDispatchInput {
   payloadAudit?: PayloadAuditConfig;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /**
+   * After the live stream timeout fires, poll session history for a final
+   * assistant answer before surfacing `stream_failed`. Zero disables this.
+   */
+  timeoutRecoveryMs?: number;
   /**
    * Soft cap on the number of `agent.custom_tool_use` events the loop
    * will service before returning. Defaults to 32. Mirrors Python's
@@ -556,6 +562,8 @@ export async function sendAndStreamWithToolDispatch(
   const sentUserMessageText = input.startAfterUserMessageEcho
     ? userMessageContentText(userMessageEvents[0]!.content)
     : '';
+  const currentUserMessageText = userMessageContentText(userMessageEvents[0]!.content);
+  let recoveredFromStreamTimeout = false;
 
   const sendPendingCustomToolTimeoutResults = async (): Promise<boolean> => {
     const unresolved = new Map([
@@ -839,14 +847,27 @@ export async function sendAndStreamWithToolDispatch(
   const timeoutPromise = new Promise<void>((resolve, reject) => {
     timeoutId = setTimeout(() => {
       timedOut = true;
-      void sendPendingCustomToolTimeoutResults().then((handled) => {
+      void sendPendingCustomToolTimeoutResults().then(async (handled) => {
+        const recovered = await recoverCompletedTurnAfterStreamTimeout(client, {
+          sessionId: input.sessionId,
+          userMessageText: currentUserMessageText,
+          pollMs: input.timeoutRecoveryMs ?? DEFAULT_TIMEOUT_RECOVERY_POLL_MS,
+        });
+        if (recovered) {
+          assistantText = recovered.assistantText;
+          terminalEventType = recovered.terminalEventType;
+          stopReason = recovered.stopReason;
+          recoveredFromStreamTimeout = true;
+          resolve();
+          return;
+        }
         if (handled) {
           resolve();
-        } else {
-          reject(
-            new Error(`sendAndStreamWithToolDispatch timeout after ${timeoutMs}ms`),
-          );
+          return;
         }
+        reject(
+          new Error(`sendAndStreamWithToolDispatch timeout after ${timeoutMs}ms`),
+        );
       });
     }, timeoutMs);
   });
@@ -863,7 +884,119 @@ export async function sendAndStreamWithToolDispatch(
     stopReason,
     toolUseCount: builtinToolCalls + toolCalls,
     toolUseNames,
+    ...(recoveredFromStreamTimeout ? { recoveredFromStreamTimeout } : {}),
   };
+}
+
+interface TimeoutRecoveryInput {
+  sessionId: string;
+  userMessageText: string;
+  pollMs: number;
+}
+
+interface TimeoutRecoveryResult {
+  assistantText: string;
+  terminalEventType: string;
+  stopReason: string;
+}
+
+async function recoverCompletedTurnAfterStreamTimeout(
+  client: Anthropic,
+  input: TimeoutRecoveryInput,
+): Promise<TimeoutRecoveryResult | null> {
+  const pollMs = Math.max(0, input.pollMs);
+  if (pollMs <= 0) return null;
+  const deadline = Date.now() + pollMs;
+  let lastError: string | null = null;
+  do {
+    try {
+      const recovered = await readCompletedTurnFromSessionEvents(
+        client,
+        input.sessionId,
+        input.userMessageText,
+      );
+      if (recovered) {
+        console.warn(
+          `[session] recovered final assistant text after stream timeout sessionId=${input.sessionId} chars=${recovered.assistantText.length}`,
+        );
+        return recovered;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(TIMEOUT_RECOVERY_POLL_INTERVAL_MS);
+  } while (Date.now() < deadline);
+  if (lastError) {
+    console.warn(
+      `[session] timeout recovery poll failed sessionId=${input.sessionId}: ${lastError}`,
+    );
+  }
+  return null;
+}
+
+async function readCompletedTurnFromSessionEvents(
+  client: Anthropic,
+  sessionId: string,
+  userMessageText: string,
+): Promise<TimeoutRecoveryResult | null> {
+  const eventsApi = client.beta.sessions.events as unknown as {
+    list?: (
+      sessionId: string,
+      params?: Record<string, unknown>,
+    ) => AsyncIterable<Record<string, unknown>>;
+  };
+  if (typeof eventsApi.list !== 'function') return null;
+
+  const events: Record<string, unknown>[] = [];
+  for await (const ev of eventsApi.list(sessionId, {
+    limit: 1000,
+    betas: [ANTHROPIC_BETA],
+  })) {
+    events.push(ev);
+  }
+
+  let turnStart = -1;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]!;
+    if (typeof ev.type !== 'string' || ev.type !== 'user.message') continue;
+    if (userMessageContentText((ev as { content?: unknown }).content) === userMessageText) {
+      turnStart = i;
+      break;
+    }
+  }
+  if (turnStart < 0) return null;
+
+  let assistantText = '';
+  let terminalEventType = '';
+  let stopReason = '';
+  for (const ev of events.slice(turnStart + 1)) {
+    const text = textFromSessionEvent(ev);
+    if (text) assistantText += text;
+    const evType = typeof ev.type === 'string' ? ev.type : '';
+    if (evType !== 'session.status_idle') continue;
+    const reason = stopReasonFromSessionEvent(ev);
+    if (reason === 'end_turn' || reason === 'stop_sequence' || reason === 'max_tokens') {
+      terminalEventType = evType;
+      stopReason = reason;
+      break;
+    }
+  }
+  if (!assistantText || !terminalEventType || !stopReason) return null;
+  return { assistantText, terminalEventType, stopReason };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stopReasonFromSessionEvent(ev: Record<string, unknown>): string {
+  const sr = ev.stop_reason;
+  if (typeof sr === 'string') return sr;
+  if (sr && typeof sr === 'object') {
+    return pickString(sr as Record<string, unknown>, 'type') ?? '';
+  }
+  return '';
 }
 
 /**
