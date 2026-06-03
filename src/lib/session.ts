@@ -900,6 +900,25 @@ export interface TimeoutRecoveryResult {
   stopReason: string;
 }
 
+export interface ResumeTurnFromSessionEventsInput {
+  sessionId: string;
+  toolDispatcher: ToolDispatcher;
+  userMessageText?: string;
+  userMessageMatch?: 'exact' | 'contains';
+  pollMs?: number;
+  pollIntervalMs?: number;
+  maxToolCalls?: number;
+}
+
+interface SessionTurnAnalysis {
+  assistantText: string;
+  terminalEventType?: string;
+  stopReason?: string;
+  toolUseCount: number;
+  toolUseNames: string[];
+  pendingCustomToolUses: Array<{ id: string; name: string; input: unknown }>;
+}
+
 async function recoverCompletedTurnAfterStreamTimeout(
   client: Anthropic,
   input: TimeoutRecoveryInput,
@@ -992,6 +1011,235 @@ export async function readCompletedTurnFromSessionEvents(
   }
   if (!assistantText || !terminalEventType || !stopReason) return null;
   return { assistantText, terminalEventType, stopReason };
+}
+
+export async function resumeTurnFromSessionEvents(
+  client: Anthropic,
+  input: ResumeTurnFromSessionEventsInput,
+): Promise<SendAndStreamResult | null> {
+  const pollMs = Math.max(0, input.pollMs ?? 0);
+  const pollIntervalMs = Math.max(250, input.pollIntervalMs ?? TIMEOUT_RECOVERY_POLL_INTERVAL_MS);
+  const maxToolCalls = input.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
+  const deadline = Date.now() + pollMs;
+  const dispatchedIds = new Set<string>();
+  let dispatchedCount = 0;
+  let lastError: string | null = null;
+
+  do {
+    let events: Record<string, unknown>[];
+    try {
+      events = await listSessionEvents(client, input.sessionId);
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      events = [];
+    }
+
+    const analysis = analyzeLatestTurnFromSessionEvents(events, {
+      userMessageText: input.userMessageText,
+      userMessageMatch: input.userMessageMatch ?? 'exact',
+    });
+    if (analysis) {
+      if (
+        analysis.terminalEventType &&
+        (analysis.stopReason === 'end_turn' ||
+          analysis.stopReason === 'stop_sequence' ||
+          analysis.stopReason === 'max_tokens' ||
+          (!analysis.stopReason &&
+            analysis.pendingCustomToolUses.length === 0 &&
+            analysis.assistantText.length > 0))
+      ) {
+        return {
+          assistantText: analysis.assistantText,
+          emailSendMarkers: parseEmailSendMarkers(analysis.assistantText),
+          terminalEventType: analysis.terminalEventType,
+          stopReason: analysis.stopReason,
+          toolUseCount: analysis.toolUseCount,
+          toolUseNames: analysis.toolUseNames,
+        };
+      }
+
+      const pending = analysis.pendingCustomToolUses.filter(
+        (toolUse) => !dispatchedIds.has(toolUse.id),
+      );
+      if (pending.length > 0) {
+        const resultEvents: Record<string, unknown>[] = [];
+        for (const toolUse of pending) {
+          dispatchedIds.add(toolUse.id);
+          dispatchedCount += 1;
+          let result: ToolDispatchResult;
+          if (dispatchedCount > maxToolCalls) {
+            result = {
+              ok: false,
+              payload: {
+                error: 'custom_tool_call_cap',
+                message: `custom tool iteration cap reached (max=${maxToolCalls})`,
+              },
+            };
+          } else {
+            try {
+              result = await input.toolDispatcher(toolUse.name, toolUse.input);
+            } catch (err) {
+              result = {
+                ok: false,
+                payload: {
+                  error: 'dispatcher_threw',
+                  tool: toolUse.name,
+                  message: err instanceof Error ? err.message : String(err),
+                },
+              };
+            }
+          }
+          const resultEvent: Record<string, unknown> = {
+            type: 'user.custom_tool_result',
+            custom_tool_use_id: toolUse.id,
+            content: [{ type: 'text', text: safeJsonStringify(result.payload) }],
+          };
+          if (!result.ok) resultEvent.is_error = true;
+          resultEvents.push(resultEvent);
+        }
+        try {
+          await client.beta.sessions.events.send(input.sessionId, {
+            events: resultEvents,
+            betas: [ANTHROPIC_BETA],
+          } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+        continue;
+      }
+    }
+
+    if (Date.now() >= deadline) break;
+    await sleep(pollIntervalMs);
+  } while (Date.now() < deadline);
+
+  if (lastError) {
+    console.warn(
+      `[session] resumeTurnFromSessionEvents failed sessionId=${input.sessionId}: ${lastError}`,
+    );
+  }
+  return null;
+}
+
+async function listSessionEvents(
+  client: Anthropic,
+  sessionId: string,
+): Promise<Record<string, unknown>[]> {
+  const eventsApi = client.beta.sessions.events as unknown as {
+    list?: (
+      sessionId: string,
+      params?: Record<string, unknown>,
+    ) => AsyncIterable<Record<string, unknown>>;
+  };
+  if (typeof eventsApi.list !== 'function') return [];
+
+  const events: Record<string, unknown>[] = [];
+  for await (const ev of eventsApi.list(sessionId, {
+    limit: 1000,
+    betas: [ANTHROPIC_BETA],
+  })) {
+    events.push(ev);
+  }
+  return events;
+}
+
+function analyzeLatestTurnFromSessionEvents(
+  events: Record<string, unknown>[],
+  input: {
+    userMessageText?: string;
+    userMessageMatch: 'exact' | 'contains';
+  },
+): SessionTurnAnalysis | null {
+  let turnStart = -1;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]!;
+    if (typeof ev.type !== 'string' || ev.type !== 'user.message') continue;
+    const contentText = userMessageContentText((ev as { content?: unknown }).content);
+    const matched =
+      input.userMessageText === undefined
+        ? true
+        : input.userMessageMatch === 'contains'
+          ? contentText.includes(input.userMessageText)
+          : contentText === input.userMessageText;
+    if (matched) {
+      turnStart = i;
+      break;
+    }
+  }
+  if (turnStart < 0) return null;
+
+  let assistantText = '';
+  let terminalEventType: string | undefined;
+  let stopReason: string | undefined;
+  let latestRequiredIds: string[] = [];
+  const customToolUses = new Map<string, { id: string; name: string; input: unknown }>();
+  const answeredCustomToolUseIds = new Set<string>();
+  let toolUseCount = 0;
+  const toolUseNames: string[] = [];
+
+  for (const ev of events.slice(turnStart + 1)) {
+    const evType = typeof ev.type === 'string' ? ev.type : '';
+    const text = textFromSessionEvent(ev);
+    if (text) assistantText += text;
+
+    if (isToolUseEventType(evType)) {
+      toolUseCount += 1;
+      const name = toolNameFromSessionEvent(ev);
+      if (name && !toolUseNames.includes(name)) toolUseNames.push(name);
+    }
+
+    if (evType === 'agent.custom_tool_use') {
+      const id = pickString(ev, 'id') ?? '';
+      if (id) {
+        customToolUses.set(id, {
+          id,
+          name: pickString(ev, 'name') ?? 'unknown',
+          input: (ev as { input?: unknown }).input,
+        });
+      }
+      continue;
+    }
+
+    if (evType === 'user.custom_tool_result') {
+      const id = pickString(ev, 'custom_tool_use_id') ?? '';
+      if (id) answeredCustomToolUseIds.add(id);
+      continue;
+    }
+
+    if (evType === 'session.status_idle') {
+      terminalEventType = evType;
+      stopReason = stopReasonFromSessionEvent(ev);
+      latestRequiredIds =
+        stopReason === 'requires_action'
+          ? extractRequiresActionEventIds((ev as { stop_reason?: Record<string, unknown> }).stop_reason ?? {})
+          : [];
+      continue;
+    }
+
+    if (evType === 'session.status_terminated') {
+      terminalEventType = evType;
+      stopReason = 'stream_terminated';
+    }
+  }
+
+  const pendingCustomToolUses =
+    stopReason === 'requires_action'
+      ? latestRequiredIds
+          .filter((id) => !answeredCustomToolUseIds.has(id))
+          .map((id) => customToolUses.get(id))
+          .filter((toolUse): toolUse is { id: string; name: string; input: unknown } =>
+            Boolean(toolUse),
+          )
+      : [];
+
+  return {
+    assistantText,
+    ...(terminalEventType !== undefined ? { terminalEventType } : {}),
+    ...(stopReason !== undefined ? { stopReason } : {}),
+    toolUseCount,
+    toolUseNames,
+    pendingCustomToolUses,
+  };
 }
 
 function sleep(ms: number): Promise<void> {
