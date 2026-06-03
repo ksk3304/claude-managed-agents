@@ -15,6 +15,7 @@ export type MakotoToolName =
   | 'sheets_update'
   | 'sheets_append'
   | 'calendar_list_events'
+  | 'chat_list_space_members'
   | 'agentmail_read'
   | 'makoto_introspect';
 
@@ -106,6 +107,12 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
     description: 'List Google Calendar events for a requested time range.',
     status: 'cloudflare_code_live_unverified',
     requires_workspace_oauth: true,
+  },
+  {
+    name: 'chat_list_space_members',
+    description: 'List Google Chat space members when roster context is needed.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
   },
   {
     name: 'agentmail_read',
@@ -214,6 +221,7 @@ export async function buildMakotoIntrospection(
       'Google Chat and AgentMail entrypoints drive Anthropic Managed Agent sessions on Cloudflare Workers.',
       'The agent uses per-user Google Workspace OAuth only through Worker-side tools; credentials are not exposed to the agent.',
       'Memory attachments are resolved by Cloudflare-side routing before creating or reusing a session.',
+      'Google Chat space roster is not injected every turn; the agent can call chat_list_space_members when needed.',
       'External write/send/delete operations are guarded by custom tool or marker contracts.',
       'MCP is not an active Google Workspace path; current Workspace access is Worker-side REST tooling.',
     ],
@@ -249,6 +257,7 @@ export async function buildMakotoIntrospection(
       'Do not claim active MCP connectors for Google Workspace; they are not the current implementation path.',
       'Do not claim Cloud Run is the primary runtime for Cloudflare版.',
       'Do not claim the LLM automatically chooses which Memory Stores to mount; the Worker router chooses resources[].',
+      'Do not claim Google Chat roster is always preloaded; use chat_list_space_members if roster context is needed.',
       'Do not claim env-specific Workspace operations are available for a user before OAuth/bootstrap/live verification.',
       'Do not expose secret names, token state, raw payload audit, session ids, or internal stack traces to normal Chat users.',
     ],
@@ -317,7 +326,7 @@ export async function buildMakotoIntrospection(
       logic: [
         'Cloudflare session resolver and Memory Store router selecting sessions.create resources[].',
         'Permission gates for Workspace/AgentMail/Chat writes and per-user OAuth subject resolution.',
-        'Routing prompt / envelope logic that keeps lightweight turns from unnecessary tool, bash, Drive, or memory deep dives.',
+        'Thin Chat boundary: route sender/session/resources, execute requested tools, and avoid speculative prompt/context injection.',
       ],
     };
   }
@@ -451,6 +460,16 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
           calendar_id: stringProp('Optional calendar id. Default primary.'),
         },
         ['time_min', 'time_max'],
+      );
+    case 'chat_list_space_members':
+      return objectSchema(
+        {
+          space_name: stringProp(
+            'Optional Google Chat space resource name. Defaults to the current inbound space.',
+          ),
+          limit: numberProp('Optional member cap. 1-100, default 50.'),
+        },
+        [],
       );
     case 'agentmail_read':
       return objectSchema(

@@ -72,11 +72,6 @@ import {
   type ChatHistoryDeps,
 } from '../lib/chat-history';
 import { getChatReadonlyAccessToken } from '../lib/chat-oauth';
-import {
-  fetchSpaceMemberRoster,
-  buildSpaceContextBlock,
-  type RosterFetchResult,
-} from '../lib/space-roster';
 import { applyChatPostGateToText } from '../lib/speaker-gate';
 import { isMailSendApprovalText, isMailSendApprovalTurn } from '../lib/mail-confirmation';
 import { createCloudSchedulerManager } from '../lib/cloud-scheduler-client';
@@ -746,97 +741,11 @@ export async function handleChatEvent(
     }
   }
 
-  // ---- 5c. Space context + roster prepend (Issue #186 C 業務影響大) ----
-  // shared space + chat-api key 有り時、「ここは何の space で、誰がいる、
-  // どの thread か」を内部メモブロックとして envelope の speaker 層に渡す。
-  // DM は skip (= 1 対 1 文脈)。Python `cma_gchat_bot.py:_build_space_context_block`
-  // (l.3667) + `_build_space_roster_block` (l.3321) を 1 ブロックに連結
-  // (Python wire-up l.4241-4253 / l.4269-4272 と同形)。
-  // History block と並ぶときの順序: [context+roster] → [history] → [user text]
-  // (= Python `prompt = f"{space_context_block}\n\n{prompt}"` で context が
-  // history より前に来る、l.4271-4272)。
-  // fetch / build failure は WARN + skip で従来挙動を破壊しない (failure
-  // isolation、placeholder POST と同思想)。
-  //
-  // Issue #186 既知 #6: roster fetch が `kind: 'failure'` を返した場合も
-  // CHAT_POST gate のシグナルとして hasUnresolvedSpeakers を立てる。bot
-  // が space member を一切識別できない状態で別 space に CHAT_POST するのは
-  // 履歴 latch と同じ権限事故源 (= unknown member 混在 thread からの横展開)
-  // のため、保守的に gate 側へ倒す (= 「分からない時は止める」)。
-  let speakerContextBlock = '';
-  if (!isDm && env.CHAT_SA_KEY_JSON) {
-    try {
-      const rosterResult: RosterFetchResult = await fetchSpaceMemberRoster(
-        { saKeyJson: env.CHAT_SA_KEY_JSON },
-        spaceName,
-      );
-      const contextBlock = buildSpaceContextBlock(
-        space as { name?: string; displayName?: string; type?: string },
-        { name: sender.name, displayName: (sender as { displayName?: string }).displayName },
-        { threadName, roster: rosterResult },
-      );
-      if (contextBlock) {
-        speakerContextBlock = contextBlock;
-        if (rosterResult.kind === 'roster') {
-          await recordRuntimeEvent(env, {
-            eventKey,
-            messageId: message.name,
-            eventType: 'space_roster_fetch',
-            source: 'chat-event-handler',
-            detail: {
-              ok: true,
-              member_count: rosterResult.members.size,
-              context_chars: contextBlock.length,
-            },
-          });
-          console.log(
-            `[chat-event] space_context+roster injected eventKey=${eventKey} ` +
-              `space=${spaceName} member_count=${rosterResult.members.size}`,
-          );
-        } else {
-          await recordRuntimeEvent(env, {
-            eventKey,
-            messageId: message.name,
-            eventType: 'space_roster_fetch',
-            level: 'warn',
-            source: 'chat-event-handler',
-            detail: {
-              ok: false,
-              reason: rosterResult.reason,
-              context_chars: contextBlock.length,
-            },
-          });
-          console.warn(
-            `[chat-event] space_context injected without roster eventKey=${eventKey} ` +
-              `space=${spaceName} roster_failure=${rosterResult.reason}`,
-          );
-          // Issue #186 既知 #6: roster 取得失敗 = bot が member を識別不能
-          // → CHAT_POST gate を発動 (保守的 fail-safe)。
-          if (!hasUnresolvedSpeakers) {
-            hasUnresolvedSpeakers = true;
-            console.warn(
-              `[chat-event] unresolved_speakers from roster failure eventKey=${eventKey} ` +
-                `space=${spaceName} reason=${rosterResult.reason} — CHAT_POST will be gated`,
-            );
-          }
-        }
-      }
-    } catch (err) {
-      // 想定外 throw (= egress-guard reject 等)。bot 全体は落とさず警告だけ
-      // (= 従来 bodyText で orchestrate 継続、failure isolation)。
-      console.warn(
-        `[chat-event] space_context build fail eventKey=${eventKey} space=${spaceName}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      await recordRuntimeEvent(env, {
-        eventKey,
-        messageId: message.name,
-        eventType: 'space_roster_fetch',
-        level: 'warn',
-        source: 'chat-event-handler',
-        detail: { ok: false, error: err instanceof Error ? err.message : String(err) },
-      });
-    }
-  }
+  // ---- 5c. Google Chat roster/context is now on-demand (#246) ----
+  // Worker no longer prefetches roster or prepends a space-context block
+  // every turn. The CMA agent can call `chat_list_space_members` when it
+  // actually needs roster context; Worker stays a thin control/execution
+  // boundary instead of injecting speculative prompt context.
   // ---- 5d. intent detection (Issue #186 既知 #4 intent-detector 統合) ----
   // Cloud Run `cma_gchat_bot.py:_handle_event:l.4001-4031` 等価で、bodyText を
   // intent-detector に通して以下を決定:
@@ -1241,7 +1150,6 @@ export async function handleChatEvent(
         toolsSpec: TOOLS_SPEC,
         extraContentBlocks,
         ...(historyBlock ? { historyBlock } : {}),
-        ...(speakerContextBlock ? { speakerContextBlock } : {}),
         ...(intent
           ? {
               intent: {
@@ -1258,6 +1166,8 @@ export async function handleChatEvent(
                 userSlug: userMapping.user_slug,
                 boundMessageId: '',
                 callerSessionId: sessionIdRef.current,
+                currentSpaceName: spaceName,
+                currentThreadName: threadName ?? undefined,
               })
             : gateExternalToolCall(env, {
                 eventKey,
