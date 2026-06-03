@@ -1299,6 +1299,23 @@ export async function handleChatEvent(
         await safeRelease(env, eventKey, claim);
         return { kind: 'release_and_retry', reason: 'custom_tool_timeout' };
       }
+      if (orchestrated.stopReason === 'requires_action') {
+        await recordRuntimeEvent(env, {
+          eventKey,
+          sessionId,
+          messageId: message.name,
+          eventType: 'custom_tool_requires_action_retry_no_notice',
+          level: 'warn',
+          source: 'chat-event-handler',
+          detail: {
+            tool_use_count: orchestrated.toolUseCount,
+            tool_use_names: orchestrated.toolUseNames,
+            placeholder_name_present: Boolean(placeholderName),
+          },
+        });
+        await safeRelease(env, eventKey, claim);
+        return { kind: 'release_and_retry', reason: 'custom_tool_requires_action' };
+      }
 
       // ---- 6b. cap-recovery (#186 既知 #3 配線) ----
       // Cloud Run の `cma_gchat_bot.py:_handle_event:l.4446-4494` 等価。
@@ -1717,10 +1734,10 @@ export async function handleChatEvent(
   const chatReplyText =
     finalText.trim().length > 0
       ? finalText
-      : 'CMA は処理を完了しましたが、Chat に表示できる本文が空でした。副作用マーカーだけが出力された可能性があります。';
+      : '処理完了しました。';
   if (finalText.trim().length === 0) {
     console.warn(
-      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting visible notice`,
+      `[chat-event] empty clean text after marker strip eventKey=${eventKey} session=${sessionId}; posting minimal completion`,
     );
   }
   const autonomousLongReply = buildAutonomousLongReplyDelivery(eventKey, chatReplyText);
