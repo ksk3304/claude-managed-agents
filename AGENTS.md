@@ -43,6 +43,7 @@ production team would use:
 - Preserve neighboring behavior with regression tests. A chat handler change must cover normal reply, `EMAIL_SEND`, `CHAT_POST`, schedule action, unknown sender/default fallback, and any touched queue/cron path.
 - Separate code deploy from state changes. Do not combine Worker code deploy with D1 migrations, KV writes/deletes, secrets changes, binding changes, or rollback unless each state change is listed and approved separately.
 - Before deploy, show `git log <base>..HEAD`, changed files, test results, deploy command, expected side effects, and rollback target/version.
+- Before deploy, prove the candidate contains the current serving `cf-repo` and every active must-preserve commit. If the proof fails or the candidate would drop another Issue's production fix, stop for explicit user approval.
 - After deploy, read back the active Worker version and relevant logs/events. Do not claim "no side effects" until production readback or smoke coverage supports it; say what remains unverified.
 
 ## Node.js Compatibility
