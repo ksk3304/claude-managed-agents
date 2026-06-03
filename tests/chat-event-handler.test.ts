@@ -124,11 +124,15 @@ vi.mock('../src/dispatch/makoto-tool-dispatcher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/dispatch/makoto-tool-dispatcher')>();
   return {
     ...actual,
-    dispatchMakotoTool: async (name: string, input: unknown) => {
+    dispatchMakotoTool: async (name: string, input: unknown, ctx: unknown) => {
       const override = (globalThis as unknown as {
-        __makotoToolDispatch?: (name: string, input: unknown) => Promise<{ ok: boolean; payload: unknown }>;
+        __makotoToolDispatch?: (
+          name: string,
+          input: unknown,
+          ctx: unknown,
+        ) => Promise<{ ok: boolean; payload: unknown }>;
       }).__makotoToolDispatch;
-      if (override) return override(name, input);
+      if (override) return override(name, input, ctx);
       return { ok: false, payload: { error: 'mocked' } };
     },
   };
@@ -1662,7 +1666,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).not.toContain('memory store');
   });
 
-  it('Case 9b: action marker leakage without a parsed marker is replaced with a user-facing failure', async () => {
+  it('Case 9b: action marker leakage without a parsed marker redacts internal terms without failure text', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1682,11 +1686,11 @@ describe('handleChatEvent', () => {
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
     expect(result.kind).toBe('committed');
     expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toBe(
-      '送信処理の状態を確認できませんでした。担当者がログを確認します。',
-    );
+    expect(chatApiMock.patches[0]!.text).toContain('前のメッセージ');
+    expect(chatApiMock.patches[0]!.text).toContain('内部用マーカー');
     expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND');
     expect(chatApiMock.patches[0]!.text).not.toContain('bot');
+    expect(chatApiMock.patches[0]!.text).not.toContain('担当者がログ');
   });
 
   it('Case 9c: architecture explanation may mention marker names without being replaced', async () => {
@@ -1983,7 +1987,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
-  it('Case 12: LLM stream throw → visible notice + commit', async () => {
+  it('Case 12: LLM stream throw → release_and_retry without visible notice', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -1996,22 +2000,26 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('committed');
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('stream_failed');
+    }
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
-    expect(row?.committed_at_ms).toBeTruthy();
+    expect(row?.claim_state).toBe('NEW');
+    expect(Number(row?.lease_expires_at_ms)).toBe(0);
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.deletes).toHaveLength(0);
-    expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
-    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
+    expect(chatApiMock.patches).toHaveLength(0);
     const runtimeEvents = (env.DB as unknown as {
       _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
     })._tables.cma_worker_runtime_events;
-    expect(runtimeEvents.map((row) => row.event_type)).toContain('orchestrator_transient_visible_notice');
-    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    expect(runtimeEvents.map((row) => row.event_type)).toContain('orchestrator_transient_retry_no_notice');
+    const noticeEvent = runtimeEvents.find(
+      (row) => row.event_type === 'orchestrator_transient_retry_no_notice',
+    );
     expect(noticeEvent?.detail_json).toContain('stream_failed');
     expect(noticeEvent?.detail_json).toContain('stream connection reset');
   });
@@ -2642,7 +2650,62 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.deletes).toHaveLength(0);
   });
 
-  it('custom tool timeout: PATCHes visible notice instead of leaving placeholder text', async () => {
+  it('drive_stage_file custom tool receives resolved session id before streaming dispatch', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: 'Drive上のExcelテンプレートを使ってB2を更新して',
+      placeholderName: 'spaces/AAA/messages/ingress_stage',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const capturedCalls: Array<{ name: string; input: unknown; ctx: Record<string, unknown> }> = [];
+    (globalThis as unknown as {
+      __makotoToolDispatch?: (
+        name: string,
+        input: unknown,
+        ctx: unknown,
+      ) => Promise<{ ok: boolean; payload: unknown }>;
+    }).__makotoToolDispatch = async (name, input, ctx) => {
+      capturedCalls.push({ name, input, ctx: ctx as Record<string, unknown> });
+      return {
+        ok: true,
+        payload: { mount_path: '/mnt/session/uploads/template.xlsx' },
+      };
+    };
+
+    installFakeAnthropic({
+      sessionId: 'sesn_stage_before_stream',
+      events: [
+        {
+          type: 'agent.custom_tool_use',
+          id: 'tu_stage',
+          name: 'drive_stage_file',
+          input: { file_id: '1WaqevWkTHVDbDizf7YhS7Y7Q7ENt1FjJ', name: 'template.xlsx' },
+        },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_stage'] },
+        },
+        {
+          type: 'agent.message.text',
+          text: 'https://drive.google.com/file/d/mock-drive-file/view',
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(capturedCalls).toHaveLength(1);
+    expect(capturedCalls[0]!.name).toBe('drive_stage_file');
+    expect(capturedCalls[0]!.ctx.callerSessionId).toBe('sesn_stage_before_stream');
+    expect(chatApiMock.patches).toHaveLength(1);
+    expect(chatApiMock.patches[0]!.text).toContain('https://drive.google.com/file/d/mock-drive-file/view');
+  });
+
+  it('custom tool timeout: retries without visible failure text', async () => {
     const env = buildEnv({
       envOverrides: { CMA_REACTIVE_STREAM_TIMEOUT_MS: '10' },
     });
@@ -2673,18 +2736,28 @@ describe('handleChatEvent', () => {
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
 
-    expect(result.kind).toBe('committed');
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('custom_tool_timeout');
+    }
     expect(chatApiMock.posts).toHaveLength(0);
-    expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/ingress_timeout');
-    expect(chatApiMock.patches[0]!.text).toContain(
-      'ファイル作成中にツール実行がタイムアウトしました',
-    );
-    expect(chatApiMock.patches[0]!.text).not.toContain('Driveに上げます');
+    expect(chatApiMock.patches).toHaveLength(0);
     expect(chatApiMock.deletes).toHaveLength(0);
+    const runtimeEvents = (env.DB as unknown as {
+      _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
+    })._tables.cma_worker_runtime_events;
+    const noticeEvent = runtimeEvents.find(
+      (row) => row.event_type === 'custom_tool_timeout_retry_no_notice',
+    );
+    expect(noticeEvent?.detail_json).toContain('drive_create_file');
+    const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
+      ._tables.dedupe;
+    const row = dedupe.get(msg.eventKey);
+    expect(row?.claim_state).toBe('NEW');
+    expect(Number(row?.lease_expires_at_ms)).toBe(0);
   });
 
-  it('sessions.create throw → visible notice without deleting placeholder', async () => {
+  it('sessions.create throw → release_and_retry without visible notice', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({});
     await preClaim(env, msg.eventKey, msg.claim.owner);
@@ -2699,24 +2772,27 @@ describe('handleChatEvent', () => {
     });
 
     const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('committed');
+    expect(result.kind).toBe('release_and_retry');
+    if (result.kind === 'release_and_retry') {
+      expect(result.reason).toBe('sessions_create_failed');
+    }
     expect(chatApiMock.posts).toHaveLength(1);
     expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
     expect(chatApiMock.deletes).toHaveLength(0);
-    expect(chatApiMock.patches).toHaveLength(1);
-    expect(chatApiMock.patches[0]!.messageName).toBe('spaces/AAA/messages/m_1');
-    expect(chatApiMock.patches[0]!.text).toBe('一時的なエラーです。少し時間を置いて再送してください。');
-    expect(chatApiMock.patches[0]!.text).not.toContain('削除表示');
+    expect(chatApiMock.patches).toHaveLength(0);
     const runtimeEvents = (env.DB as unknown as {
       _tables: { cma_worker_runtime_events: Array<{ event_type?: string; detail_json?: string }> };
     })._tables.cma_worker_runtime_events;
-    const noticeEvent = runtimeEvents.find((row) => row.event_type === 'orchestrator_transient_visible_notice');
+    const noticeEvent = runtimeEvents.find(
+      (row) => row.event_type === 'orchestrator_transient_retry_no_notice',
+    );
     expect(noticeEvent?.detail_json).toContain('sessions_create_failed');
     expect(noticeEvent?.detail_json).toContain('sessions.create upstream 503');
     const dedupe = (env.DB as unknown as { _tables: { dedupe: Map<string, Record<string, unknown>> } })
       ._tables.dedupe;
     const row = dedupe.get(msg.eventKey);
-    expect(row?.committed_at_ms).toBeTruthy();
+    expect(row?.claim_state).toBe('NEW');
+    expect(Number(row?.lease_expires_at_ms)).toBe(0);
   });
 
   it('placeholder PATCH 失敗: WARN log + safePost (新規 POST) に fallback、bot 全体は落とさない', async () => {

@@ -339,6 +339,40 @@ function userMessageContentText(content: unknown): string {
   return parts.join('');
 }
 
+async function sendUserMessageEvents(
+  client: Anthropic,
+  sessionId: string,
+  userMessageEvents: Array<Record<string, unknown>>,
+  unblockPendingAction: () => Promise<void>,
+): Promise<void> {
+  try {
+    await client.beta.sessions.events.send(sessionId, {
+      events: userMessageEvents,
+      betas: [ANTHROPIC_BETA],
+    } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+    return;
+  } catch (err) {
+    if (!isWaitingOnToolResultError(err)) throw err;
+    console.warn(
+      `[session] user.message blocked by pending tool action sessionId=${sessionId}; sending interrupt before retry`,
+    );
+    await unblockPendingAction();
+    await client.beta.sessions.events.send(sessionId, {
+      events: userMessageEvents,
+      betas: [ANTHROPIC_BETA],
+    } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+  }
+}
+
+function isWaitingOnToolResultError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes('waiting on responses to events') &&
+    message.includes('user.custom_tool_result') &&
+    message.includes('user.interrupt')
+  );
+}
+
 // ============================================================================
 // sendAndStreamWithToolDispatch — agent.custom_tool_use event loop
 // ============================================================================
@@ -459,6 +493,28 @@ export async function sendAndStreamWithToolDispatch(
   const sessionWatchdogSec =
     input.sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC;
 
+  /**
+   * Fire `user.interrupt` so the agent stops generating. Mirrors the
+   * Python `_stream_until_settled` interrupt paths
+   * (`cma_lib.py:2717-2725` / `2744-2749` / `2891-2897`). Swallow any
+   * send error — by the time we're interrupting we've already decided
+   * to abandon the turn; logging is enough.
+   */
+  const sendInterrupt = async (reason: string): Promise<void> => {
+    try {
+      await client.beta.sessions.events.send(input.sessionId, {
+        events: [{ type: 'user.interrupt' }],
+        betas: [ANTHROPIC_BETA],
+      } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+    } catch (err) {
+      console.warn(
+        `[session] user.interrupt send failed (reason=${reason}) sessionId=${input.sessionId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
   // Push the inbound user.message first. Identical wrapping to
   // `sendAndStream`: wrap a string into a single text block, otherwise
   // pass the typed content array straight through (= image / document
@@ -470,10 +526,9 @@ export async function sendAndStreamWithToolDispatch(
     },
   ];
   await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
-  await client.beta.sessions.events.send(input.sessionId, {
-    events: userMessageEvents,
-    betas: [ANTHROPIC_BETA],
-  } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
+  await sendUserMessageEvents(client, input.sessionId, userMessageEvents, async () => {
+    await sendInterrupt('pending_custom_tool_before_user_message');
+  });
 
   const stream = await client.beta.sessions.events.stream(input.sessionId, {
     betas: [ANTHROPIC_BETA],
@@ -501,28 +556,6 @@ export async function sendAndStreamWithToolDispatch(
   const sentUserMessageText = input.startAfterUserMessageEcho
     ? userMessageContentText(userMessageEvents[0]!.content)
     : '';
-
-  /**
-   * Fire `user.interrupt` so the agent stops generating. Mirrors the
-   * Python `_stream_until_settled` interrupt paths
-   * (`cma_lib.py:2717-2725` / `2744-2749` / `2891-2897`). Swallow any
-   * send error — by the time we're interrupting we've already decided
-   * to abandon the turn; logging is enough.
-   */
-  const sendInterrupt = async (reason: string): Promise<void> => {
-    try {
-      await client.beta.sessions.events.send(input.sessionId, {
-        events: [{ type: 'user.interrupt' }],
-        betas: [ANTHROPIC_BETA],
-      } as unknown as Parameters<typeof client.beta.sessions.events.send>[1]);
-    } catch (err) {
-      console.warn(
-        `[session] user.interrupt send failed (reason=${reason}) sessionId=${input.sessionId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  };
 
   const sendPendingCustomToolTimeoutResults = async (): Promise<boolean> => {
     const unresolved = new Map([

@@ -31,6 +31,7 @@ interface FakeClientOptions {
   events: FakeEvent[];
   /** Capture each events.send payload here. */
   onSend?: (payload: unknown) => void;
+  sendImpl?: (sessionId: string, payload: unknown) => Promise<void>;
 }
 
 function makeFakeClient(opts: FakeClientOptions): Anthropic {
@@ -43,6 +44,9 @@ function makeFakeClient(opts: FakeClientOptions): Anthropic {
         events: {
           async send(_sessionId: string, payload: unknown): Promise<void> {
             opts.onSend?.(payload);
+            if (opts.sendImpl) {
+              await opts.sendImpl(_sessionId, payload);
+            }
           },
           async stream(_sessionId: string, _opts: unknown): Promise<AsyncIterable<FakeEvent>> {
             return stream();
@@ -135,6 +139,45 @@ describe('sendAndStreamWithToolDispatch', () => {
     });
     const second = sent[1] as { events: Array<Record<string, unknown>> };
     expect(second.events[0]!.is_error).toBe(true);
+  });
+
+  it('interrupts a blocked pending custom tool action before retrying the same user message', async () => {
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    let userMessageAttempts = 0;
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '議事録を作りました。' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+      onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+      sendImpl: async (_sessionId, payload) => {
+        const firstEvent = (payload as { events: Array<Record<string, unknown>> }).events[0];
+        if (firstEvent?.type === 'user.message') {
+          userMessageAttempts += 1;
+          if (userMessageAttempts === 1) {
+            throw new Error(
+              '400 {"type":"error","error":{"type":"invalid_request_error","message":"Invalid user.message event at events[0]: waiting on responses to events [sevt_123]; only `user.tool_confirmation`, `user.custom_tool_result`, `user.tool_result`, or `user.interrupt` may be sent"}}',
+            );
+          }
+        }
+      },
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+
+    const result = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_blocked',
+      userMessage: '議事録作って',
+      toolDispatcher: dispatcher,
+    });
+
+    expect(result.assistantText).toBe('議事録を作りました。');
+    expect(sent).toHaveLength(3);
+    expect(sent[0]!.events[0]!.type).toBe('user.message');
+    expect(sent[1]!.events[0]!.type).toBe('user.interrupt');
+    expect(sent[2]!.events[0]!.type).toBe('user.message');
   });
 
   it('sends error user.custom_tool_result when custom tool dispatch times out', async () => {
