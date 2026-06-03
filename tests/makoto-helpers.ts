@@ -257,6 +257,47 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
       row.user_visible_status = statusText;
       return { results: [], meta: { changes: 1 } };
     }
+    if (
+      /^INSERT OR REPLACE INTO heartbeat_tasks \(task_id, owner_user_id, target_space_name, kind, prompt, interval_min, active_hours, target_scope, enabled, last_run_at, status, stage, waiting_for, next_check_at, last_progress_at, attempt_count, stop_reason, thread_ref, user_visible_status, created_at, updated_at\) VALUES \(\?1, \?2, \?3, 'async_wait', \?4, \?5, NULL, 'dm', 1, NULL, 'waiting', 'mail_reply_wait', 'mail_reply', \?6, \?7, 0, NULL, \?8, \?9, \?7, \?7\)$/i.test(
+        trimmed,
+      )
+    ) {
+      const [
+        taskId,
+        ownerUserId,
+        targetSpaceName,
+        prompt,
+        intervalMin,
+        nextCheckAt,
+        nowMs,
+        threadRef,
+        visibleStatus,
+      ] = params as [string, string, string, string, number, number, number, string, string];
+      tables.heartbeat_tasks.set(taskId, {
+        task_id: taskId,
+        owner_user_id: ownerUserId,
+        target_space_name: targetSpaceName,
+        kind: 'async_wait',
+        prompt,
+        interval_min: intervalMin,
+        active_hours: null,
+        target_scope: 'dm',
+        enabled: 1,
+        last_run_at: null,
+        status: 'waiting',
+        stage: 'mail_reply_wait',
+        waiting_for: 'mail_reply',
+        next_check_at: nextCheckAt,
+        last_progress_at: nowMs,
+        attempt_count: 0,
+        stop_reason: null,
+        thread_ref: threadRef,
+        user_visible_status: visibleStatus,
+        created_at: nowMs,
+        updated_at: nowMs,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
 
     // ----- Issue #206 observability -----
     if (/^INSERT INTO cma_chat_webhook_payloads/i.test(trimmed)) {

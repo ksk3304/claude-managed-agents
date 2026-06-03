@@ -1427,6 +1427,18 @@ export async function handleChatEvent(
     claim,
     { actorTrusted, messageId: message.name, userSlug: userMapping.user_slug },
   );
+  const asyncWaitRegistration = heartbeatEvent
+    ? { text: '' }
+    : await maybeRegisterMailReplyAsyncWait(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        senderEmail,
+        spaceName,
+        spaceType,
+        bodyText,
+        emailDispatchSummaries,
+      });
 
   // 7b. CHAT_POST markers (= 別 space 投稿)。本文中の全 marker を strip
   //     しつつ posting する。`parseChatPostMarker` は first-match のみ返す
@@ -1600,7 +1612,13 @@ export async function handleChatEvent(
   // notice をそのまま投稿本文に concat していたのと等価)。本文空 + notice
   // のみのケースも次の `finalText.trim().length > 0` 判定で投稿される。
   const emailDispatchText = formatEmailDispatchSummaries(emailDispatchSummaries);
-  const finalTextParts = [visibleText, emailDispatchText, attachmentNotice, sessionCostPrompt]
+  const finalTextParts = [
+    visibleText,
+    emailDispatchText,
+    asyncWaitRegistration.text,
+    attachmentNotice,
+    sessionCostPrompt,
+  ]
     .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
   const finalText = finalTextParts.join('\n\n').trim();
   const chatReplyText =
@@ -2032,6 +2050,132 @@ interface EmailDispatchSummary {
   to: string;
   subject: string;
   reason?: string;
+}
+
+interface MailReplyAsyncWaitInput {
+  eventKey: string;
+  messageId: string;
+  userSlug: string;
+  senderEmail: string;
+  spaceName: string;
+  spaceType: string;
+  bodyText: string;
+  emailDispatchSummaries: EmailDispatchSummary[];
+}
+
+async function maybeRegisterMailReplyAsyncWait(
+  env: Env,
+  input: MailReplyAsyncWaitInput,
+): Promise<{ text: string }> {
+  const sent = input.emailDispatchSummaries.filter((summary) => summary.status === 'sent');
+  if (sent.length === 0) return { text: '' };
+  if (input.spaceType !== 'DM') return { text: '' };
+  if (!isMailReplyWaitRequest(input.bodyText)) return { text: '' };
+
+  const expectedFrom = uniqueStrings(sent.map((summary) => normalizeEmailAddress(summary.to)));
+  if (expectedFrom.length === 0) return { text: '' };
+
+  const subjects = uniqueStrings(sent.map((summary) => summary.subject.trim()).filter(Boolean));
+  const nowMs = Date.now();
+  const taskId = `async_mail_wait_${stableHash(input.eventKey) ?? String(nowMs)}`;
+  const subjectContains = subjects.length === 1 ? subjects[0]!.slice(0, 160) : undefined;
+  const threadRef = {
+    expected_from: expectedFrom,
+    since_ms: nowMs - 60_000,
+    ...(subjectContains ? { subject_contains: subjectContains } : {}),
+  };
+  const prompt = buildMailReplyAsyncWaitPrompt(input.bodyText, sent);
+  try {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO heartbeat_tasks
+        (task_id, owner_user_id, target_space_name, kind, prompt, interval_min,
+         active_hours, target_scope, enabled, last_run_at, status, stage,
+         waiting_for, next_check_at, last_progress_at, attempt_count, stop_reason,
+         thread_ref, user_visible_status, created_at, updated_at)
+       VALUES
+        (?1, ?2, ?3, 'async_wait', ?4, ?5,
+         NULL, 'dm', 1, NULL, 'waiting', 'mail_reply_wait',
+         'mail_reply', ?6, ?7, 0, NULL,
+         ?8, ?9, ?7, ?7)`,
+    )
+      .bind(
+        taskId,
+        input.senderEmail,
+        input.spaceName,
+        prompt,
+        1,
+        nowMs + 60_000,
+        nowMs,
+        JSON.stringify(threadRef),
+        `waiting for mail replies (0/${expectedFrom.length})`,
+      )
+      .run();
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      userSlug: input.userSlug,
+      eventType: 'heartbeat_async_wait_registered',
+      source: 'chat-event-handler',
+      detail: {
+        task_id: taskId,
+        expected_count: expectedFrom.length,
+        subject_contains: subjectContains ?? null,
+      },
+    });
+    return {
+      text:
+        `⏳ 返信待ちを登録しました\n` +
+        `対象: ${expectedFrom.length}件\n` +
+        `返信が揃ったら、このDMに集計して再開します。`,
+    };
+  } catch (error) {
+    await recordRuntimeEvent(env, {
+      eventKey: input.eventKey,
+      messageId: input.messageId,
+      userSlug: input.userSlug,
+      eventType: 'heartbeat_async_wait_register_failed',
+      level: 'error',
+      source: 'chat-event-handler',
+      detail: { error: error instanceof Error ? error.message : String(error) },
+    });
+    return { text: '⚠️ メール送信は完了しましたが、返信待ち登録に失敗しました。' };
+  }
+}
+
+function isMailReplyWaitRequest(text: string): boolean {
+  const normalized = text.replace(/\s+/g, '');
+  return (
+    /(返信|返事|回答).*(待|揃|そろ|集計|まとめ|再開)/.test(normalized) ||
+    /(待|揃|そろ).*(返信|返事|回答)/.test(normalized) ||
+    /(返信|返事|回答)(が|を)?(届いた|来た|きた|返ってきた|揃った|そろった)ら/.test(normalized)
+  );
+}
+
+function buildMailReplyAsyncWaitPrompt(
+  originalRequest: string,
+  sent: EmailDispatchSummary[],
+): string {
+  const sentLines = sent.map((summary) => `- ${summary.to} / ${summary.subject}`).join('\n');
+  return [
+    'メール返信待ちの非同期継続です。',
+    '以下の送信先からの返信が揃ったら、返信内容を短く集計し、次アクション案を本人DMに出してください。',
+    '',
+    '元の依頼:',
+    originalRequest.trim().slice(0, 2000),
+    '',
+    '送信済みメール:',
+    sentLines,
+  ].join('\n');
+}
+
+function normalizeEmailAddress(value: string): string {
+  const match = value.match(/<([^>]+)>/);
+  const raw = (match?.[1] ?? value).trim().toLowerCase();
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw) ? raw : '';
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function formatEmailDispatchSummaries(summaries: EmailDispatchSummary[]): string {
