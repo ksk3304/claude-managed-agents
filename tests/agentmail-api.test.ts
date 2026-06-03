@@ -146,6 +146,27 @@ describe('AgentMailClient.getMessage', () => {
 });
 
 describe('AgentMailClient.listMessages', () => {
+  it('includes spam by default for polling-style readers', async () => {
+    const fetchMock = makeFetchMock(async (url, init) => {
+      expect(init.method).toBe('GET');
+      const parsed = new URL(url);
+      expect(parsed.searchParams.get('include_spam')).toBe('true');
+      return jsonResponse(200, { messages: [] });
+    });
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+    await client.listMessages(INBOX, { limit: 10 });
+  });
+
+  it('allows callers to opt out of spam-inclusive listing', async () => {
+    const fetchMock = makeFetchMock(async (url) => {
+      const parsed = new URL(url);
+      expect(parsed.searchParams.get('include_spam')).toBeNull();
+      return jsonResponse(200, { messages: [] });
+    });
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+    await client.listMessages(INBOX, { limit: 10, includeSpam: false });
+  });
+
   it('uses current AgentMail pagination and safety query params', async () => {
     const fetchMock = makeFetchMock(async (url, init) => {
       expect(init.method).toBe('GET');
