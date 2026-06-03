@@ -852,6 +852,58 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('Case 1-async-wait: mail send + reply-wait request registers heartbeat async_wait task', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text:
+        'alice@example.com と bob@example.com に確認メールを送って、返信が揃ったら集計して再開してください。',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_async_wait_register',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送信します。\n' +
+            'EMAIL_SEND:{"to":"alice@example.com","subject":"#245 async wait","body":"返信してください"}\n' +
+            'EMAIL_SEND:{"to":"bob@example.com","subject":"#245 async wait","body":"返信してください"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () =>
+      new Response(JSON.stringify({ message_id: `msg_out_${Math.random()}` }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      const tasks = (env.DB as unknown as { _tables: { heartbeat_tasks: Map<string, Record<string, unknown>> } })
+        ._tables.heartbeat_tasks;
+      expect(tasks.size).toBe(1);
+      const task = Array.from(tasks.values())[0]!;
+      expect(task.kind).toBe('async_wait');
+      expect(task.status).toBe('waiting');
+      expect(task.waiting_for).toBe('mail_reply');
+      expect(task.target_space_name).toBe('spaces/AAA');
+      expect(JSON.parse(String(task.thread_ref))).toMatchObject({
+        expected_from: ['alice@example.com', 'bob@example.com'],
+        subject_contains: '#245 async wait',
+      });
+      expect(chatApiMock.patches.at(-1)?.text).toContain('⏳ 返信待ちを登録しました');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 1-mail-intent: short content mail request injects scoped mail instructions', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
