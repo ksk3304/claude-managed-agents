@@ -61,6 +61,22 @@ describe('handleAgentMailMessage', () => {
     expect(row.committed_at_ms).not.toBeNull();
   });
 
+  it('dispatches spam receive events like normal inbound replies', async () => {
+    const db = makeMakotoDb();
+    const env = envWith(db);
+    let seenType = '';
+    const body = makeBody();
+    body.event.event_type = 'message.received.spam';
+    const dispatcher: AgentMailDispatcher = async (context) => {
+      seenType = (context.event as unknown as { event_type?: string }).event_type ?? '';
+      return { kind: 'committed' };
+    };
+    await handleAgentMailMessage(env, ctx, body, dispatcher);
+    expect(seenType).toBe('message.received.spam');
+    const key = eventKeyForRfc822('<inbound@example.com>');
+    expect(db._tables.dedupe.get(key)!.committed_at_ms).not.toBeNull();
+  });
+
   it('skipped outcome also commits (so the queue stops redelivering)', async () => {
     const db = makeMakotoDb();
     const env = envWith(db);

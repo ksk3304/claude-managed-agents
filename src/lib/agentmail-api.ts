@@ -146,8 +146,10 @@ export class AgentMailClient {
 
   /**
    * `GET /inboxes/{inboxId}/messages?limit=…` — listing (paginated).
-   * Not used on the hot inbound path; provided so the cron handler
-   * can reconcile lost-webhook drift later.
+   * Not used on the hot inbound path; provided so cron / heartbeat
+   * handlers can reconcile lost-webhook drift later. Spam is included
+   * by default so polling-style readers do not silently miss replies
+   * that AgentMail classified as spam.
    */
   async listMessages(
     inboxId: string,
@@ -170,7 +172,7 @@ export class AgentMailClient {
     }
     if (options.before) params.set('before', options.before);
     if (options.after) params.set('after', options.after);
-    if (options.includeSpam) params.set('include_spam', 'true');
+    if (options.includeSpam ?? true) params.set('include_spam', 'true');
     if (options.includeBlocked) params.set('include_blocked', 'true');
     if (options.includeUnauthenticated) params.set('include_unauthenticated', 'true');
     const path = `/inboxes/${encodeURIComponent(inboxId)}/messages${

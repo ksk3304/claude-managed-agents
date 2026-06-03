@@ -104,7 +104,7 @@ async function searchMessages(
   const before = optionalString(input.before, 'before');
   const labels = optionalStringArray(input.labels, 'labels');
   const pageToken = optionalString(input.page_token, 'page_token');
-  const includeSpam = optionalBoolean(input.include_spam, 'include_spam');
+  const includeSpam = optionalBoolean(input.include_spam, 'include_spam', true);
   const includeBlocked = optionalBoolean(input.include_blocked, 'include_blocked');
   const includeUnauthenticated = optionalBoolean(
     input.include_unauthenticated,
@@ -257,8 +257,8 @@ function optionalStringArray(value: unknown, fieldName: string): string[] {
   return value.map((v) => v.trim()).filter((v) => v.length > 0);
 }
 
-function optionalBoolean(value: unknown, fieldName: string): boolean {
-  if (value === undefined || value === null) return false;
+function optionalBoolean(value: unknown, fieldName: string, defaultValue = false): boolean {
+  if (value === undefined || value === null) return defaultValue;
   if (typeof value !== 'boolean') {
     throw new ToolSchemaError(`${TOOL_NAME}: ${fieldName} must be boolean`);
   }
