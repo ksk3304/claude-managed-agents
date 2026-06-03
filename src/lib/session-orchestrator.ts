@@ -78,6 +78,11 @@ const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 
+function isWaitingOnResponsesError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /waiting on responses to events/i.test(message);
+}
+
 /**
  * Google Chat reactive turn の KV key を組み立てる純関数。
  * sender_email + space + thread の三つ組で per-user per-thread に振り分ける
@@ -664,9 +669,10 @@ export async function orchestrateChatTurn(
   const sessionWatchdogSec =
     input.sessionWatchdogSec ??
     resolveReactiveSessionWatchdogSec(input.env.CMA_REACTIVE_SESSION_WATCHDOG_SEC);
-  try {
-    streamResult = await sendAndStreamWithToolDispatch(client, {
-      sessionId,
+
+  const sendAndStreamForSession = async (activeSessionId: string) =>
+    sendAndStreamWithToolDispatch(client, {
+      sessionId: activeSessionId,
       userMessage,
       toolDispatcher: input.toolDispatcher,
       timeoutMs: input.timeoutMs ?? SESSION_STREAM_TIMEOUT_MS,
@@ -686,6 +692,9 @@ export async function orchestrateChatTurn(
         },
       },
     });
+
+  try {
+    streamResult = await sendAndStreamForSession(sessionId);
     if (input.eventKey) {
       await recordRuntimeEvent(input.env, {
         eventKey: input.eventKey,
@@ -704,23 +713,142 @@ export async function orchestrateChatTurn(
       });
     }
   } catch (err) {
-    if (input.eventKey) {
-      await recordRuntimeEvent(input.env, {
-        eventKey: input.eventKey,
-        sessionId,
-        messageId: input.messageId ?? null,
-        userSlug: input.userMapping.user_slug,
-        eventType: 'cma_events_send_failed',
-        level: 'error',
-        source: 'session-orchestrator',
-        detail: { error: err instanceof Error ? err.message : String(err) },
-      });
+    const canReplacePoisonedThreadSession =
+      sessionKey !== null && !isNewSession && isWaitingOnResponsesError(err);
+    if (canReplacePoisonedThreadSession) {
+      if (input.eventKey) {
+        await recordRuntimeEvent(input.env, {
+          eventKey: input.eventKey,
+          sessionId,
+          messageId: input.messageId ?? null,
+          userSlug: input.userMapping.user_slug,
+          eventType: 'cma_events_send_waiting_response_recovery',
+          level: 'warn',
+          source: 'session-orchestrator',
+          detail: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+
+      const previousSessionId = sessionId;
+      try {
+        sessionId = await createSessionWithResources(client, {
+          agentId: input.userMapping.agent_id,
+          environmentId: input.env.ENVIRONMENT_ID,
+          resources,
+        });
+        isNewSession = true;
+      } catch (createErr) {
+        throw new OrchestratorFailure(
+          'sessions_create_failed',
+          `replacement sessions.create failed for agent=${input.userMapping.agent_id}: ${
+            createErr instanceof Error ? createErr.message : String(createErr)
+          }`,
+          createErr,
+        );
+      }
+
+      try {
+        await kv.put(sessionKey, sessionId, {
+          expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
+        });
+      } catch (putErr) {
+        console.warn(
+          `[chat-event] replacement KV put failed key=${sessionKey}: ${
+            putErr instanceof Error ? putErr.message : String(putErr)
+          }`,
+        );
+      }
+
+      if (input.eventKey) {
+        await recordSessionBind(input.env, {
+          senderEmail: input.senderEmail,
+          spaceName: input.spaceName,
+          threadName: input.threadName,
+          sessionId,
+          eventKey: input.eventKey,
+          messageId: input.messageId ?? null,
+          userSlug: input.userMapping.user_slug,
+          isNewSession: true,
+        });
+        await recordRuntimeEvent(input.env, {
+          eventKey: input.eventKey,
+          sessionId,
+          messageId: input.messageId ?? null,
+          userSlug: input.userMapping.user_slug,
+          eventType: 'cma_session_replaced_waiting_response',
+          level: 'warn',
+          source: 'session-orchestrator',
+          detail: {
+            previous_session_id: previousSessionId,
+            session_key_kind: 'chat_thread',
+          },
+        });
+      }
+      await input.onSessionIdResolved?.(sessionId);
+
+      try {
+        streamResult = await sendAndStreamForSession(sessionId);
+        if (input.eventKey) {
+          await recordRuntimeEvent(input.env, {
+            eventKey: input.eventKey,
+            sessionId,
+            messageId: input.messageId ?? null,
+            userSlug: input.userMapping.user_slug,
+            eventType: 'cma_events_send_completed',
+            source: 'session-orchestrator',
+            detail: {
+              assistant_chars: streamResult.assistantText.length,
+              terminal_event_type: streamResult.terminalEventType ?? null,
+              stop_reason: streamResult.stopReason ?? null,
+              session_watchdog_sec:
+                sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
+              recovered_from_waiting_response: true,
+            },
+          });
+        }
+      } catch (retryErr) {
+        if (input.eventKey) {
+          await recordRuntimeEvent(input.env, {
+            eventKey: input.eventKey,
+            sessionId,
+            messageId: input.messageId ?? null,
+            userSlug: input.userMapping.user_slug,
+            eventType: 'cma_events_send_failed',
+            level: 'error',
+            source: 'session-orchestrator',
+            detail: {
+              error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+              recovered_from_waiting_response: true,
+            },
+          });
+        }
+        throw new OrchestratorFailure(
+          'stream_failed',
+          `sendAndStreamWithToolDispatch failed replacement session=${sessionId}: ${
+            retryErr instanceof Error ? retryErr.message : String(retryErr)
+          }`,
+          retryErr,
+        );
+      }
+    } else {
+      if (input.eventKey) {
+        await recordRuntimeEvent(input.env, {
+          eventKey: input.eventKey,
+          sessionId,
+          messageId: input.messageId ?? null,
+          userSlug: input.userMapping.user_slug,
+          eventType: 'cma_events_send_failed',
+          level: 'error',
+          source: 'session-orchestrator',
+          detail: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+      throw new OrchestratorFailure(
+        'stream_failed',
+        `sendAndStreamWithToolDispatch failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
     }
-    throw new OrchestratorFailure(
-      'stream_failed',
-      `sendAndStreamWithToolDispatch failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
   }
 
   const result: OrchestrateChatTurnResult = {
