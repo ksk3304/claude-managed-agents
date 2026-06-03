@@ -193,6 +193,11 @@ export interface OrchestrateChatTurnInput {
   /** Session watchdog override (test / incident-debug 用)。 */
   sessionWatchdogSec?: number;
   /**
+   * Called after sessions.create / KV lookup resolves the active CMA
+   * session id and before any stream/tool dispatch begins.
+   */
+  onSessionIdResolved?: (sessionId: string) => void | Promise<void>;
+  /**
    * Python `history_md` (cma_gchat_bot.py l.4194) と byte 等価の thread
    * history block。非空時のみ envelope の body 直前に `\n\n## 今回のメンション\n`
    * を挟んで連結される。caller (chat-event-handler) が `formatThreadHistory`
@@ -577,6 +582,7 @@ export async function orchestrateChatTurn(
       },
     });
   }
+  await input.onSessionIdResolved?.(sessionId);
 
   // ---- user message envelope ----
   // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
