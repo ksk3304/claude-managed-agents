@@ -139,9 +139,11 @@ declare namespace Cloudflare {
     PLAYWRIGHT_MCP_URL?: string;
     /**
      * Comma-separated allowlist. Default: browser_navigate,browser_snapshot.
-     * browser_take_screenshot is allowed only when explicitly configured.
+     * browser_take_screenshot/browser_type/browser_click are allowed only when explicitly configured.
      */
     PLAYWRIGHT_MCP_ENABLED_TOOLS?: string;
+    /** Optional Anthropic Vault id containing a credential for PLAYWRIGHT_MCP_URL. */
+    PLAYWRIGHT_MCP_VAULT_ID?: string;
     /** Operator assertion that the external MCP URL is not unauthenticated public access. */
     PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED?: string;
     /** Local smoke-only opt-in for http://127.0.0.1:8931/mcp or localhost. */

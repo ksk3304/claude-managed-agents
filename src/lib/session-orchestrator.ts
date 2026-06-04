@@ -79,6 +79,15 @@ const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 const SESSION_TIMEOUT_RECOVERY_POLL_MS = 180_000;
 
+function parseCsvEnv(value: string | undefined): string[] {
+  const unique = new Set<string>();
+  for (const item of (value ?? '').split(',')) {
+    const trimmed = item.trim();
+    if (trimmed) unique.add(trimmed);
+  }
+  return [...unique];
+}
+
 function isWaitingOnResponsesError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /waiting on responses to events/i.test(message);
@@ -119,7 +128,14 @@ export async function buildChatCapabilitySessionKey(
 ): Promise<string> {
   const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
   const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
-  const desiredMcpHash = await playwrightMcpHash(buildPlaywrightMcpConfig(env));
+  const playwrightMcpConfig = buildPlaywrightMcpConfig(env);
+  const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
+  const playwrightMcpVaultIds = playwrightMcpConfig.attach
+    ? parseCsvEnv(env.PLAYWRIGHT_MCP_VAULT_ID)
+    : [];
+  const playwrightMcpVaultHash = await toolsHash(
+    playwrightMcpVaultIds.map((vaultId) => ({ vaultId })),
+  );
   const memoryResourcesHash = await toolsHash(resources.map((resource) => ({ ...resource })));
   return (
     buildChatCapabilitySessionKeyFromHashes(
@@ -127,6 +143,7 @@ export async function buildChatCapabilitySessionKey(
       attachedSkillsHash,
       desiredMcpHash,
     ) +
+    `:mcp-vault-${playwrightMcpVaultHash}` +
     `:memory-${memoryResourcesHash}`
   );
 }
@@ -428,6 +445,12 @@ export async function orchestrateChatTurn(
   // configs do not alter the existing employee agent.
   const playwrightMcpConfig = buildPlaywrightMcpConfig(input.env);
   const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
+  const playwrightMcpVaultIds = playwrightMcpConfig.attach
+    ? parseCsvEnv(input.env.PLAYWRIGHT_MCP_VAULT_ID)
+    : [];
+  const playwrightMcpVaultHash = await toolsHash(
+    playwrightMcpVaultIds.map((vaultId) => ({ vaultId })),
+  );
   if (playwrightMcpConfig.attach) {
     try {
       const ensuredMcp = await ensureManagedAgentMcp(
@@ -481,7 +504,7 @@ export async function orchestrateChatTurn(
     desiredAgentToolsHash,
     attachedSkillsHash,
     desiredMcpHash,
-  ) + `:memory-${memoryResourcesHash}`;
+  ) + `:mcp-vault-${playwrightMcpVaultHash}:memory-${memoryResourcesHash}`;
   const forceFreshSession = input.forceFreshSession === true;
   const sessionKey = forceFreshSession
     ? null
@@ -521,6 +544,7 @@ export async function orchestrateChatTurn(
         agentId,
         environmentId,
         resources,
+        vaultIds: playwrightMcpVaultIds,
       });
     } catch (err) {
       throw new OrchestratorFailure(

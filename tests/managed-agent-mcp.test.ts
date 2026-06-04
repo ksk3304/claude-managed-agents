@@ -95,7 +95,12 @@ describe('Playwright MCP config', () => {
       PLAYWRIGHT_MCP_ENABLED_TOOLS:
         'browser_navigate,browser_click,browser_type,browser_snapshot,browser_evaluate',
     } as Env);
-    expect(config.enabledTools).toEqual(['browser_navigate', 'browser_snapshot']);
+    expect(config.enabledTools).toEqual([
+      'browser_navigate',
+      'browser_click',
+      'browser_type',
+      'browser_snapshot',
+    ]);
   });
 
   it('allows screenshots only when explicitly configured', () => {

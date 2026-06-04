@@ -49,6 +49,8 @@ export interface CreateSessionInput {
   environmentId: string;
   /** Memory Stores to attach. Empty array is permitted (rare). */
   resources: MemoryStoreResourceParam[];
+  /** Vault ids to pass through to sessions.create for MCP credentials. */
+  vaultIds?: string[];
   /**
    * Per-user system-prompt addendum. Surfaced as an `instructions`
    * resource if present — the SDK's `sessions.create` accepts a
@@ -77,6 +79,7 @@ export async function createSessionWithResources(
     agent: input.agentId,
     environment_id: input.environmentId,
     resources: input.resources,
+    ...(input.vaultIds && input.vaultIds.length > 0 ? { vault_ids: input.vaultIds } : {}),
     betas: [ANTHROPIC_BETA],
   } as Parameters<typeof client.beta.sessions.create>[0]);
   if (typeof created.id !== 'string' || created.id.length === 0) {

@@ -1,0 +1,27 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "makoto-playwright-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+  },
+  "browser": {
+    "binding": "BROWSER",
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "PlaywrightMCP",
+        "name": "PLAYWRIGHT_MCP",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["PlaywrightMCP"],
+      "tag": "v1",
+    },
+  ],
+}
