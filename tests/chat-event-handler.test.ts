@@ -2348,6 +2348,72 @@ describe('handleChatEvent', () => {
     expect(sends).toEqual(['sesn_existing']);
   });
 
+  it('Case 10a: capability suffix drift後も同一 Chat thread の既存 session を継続', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'DM',
+      spaceName: 'spaces/AAA',
+      text: '明日の輪島の天気教えて',
+      threadName: 'spaces/AAA/threads/TDRIFT',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const legacyKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TDRIFT',
+      'tools-old:skills-old:mcp-old:mcp-vault-old:memory-old',
+    );
+    const baseKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TDRIFT',
+    );
+    const currentKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TDRIFT',
+      await buildChatCapabilitySessionKey(env),
+    );
+    expect(legacyKey).not.toBeNull();
+    expect(baseKey).not.toBeNull();
+    expect(currentKey).not.toBeNull();
+    await env.MAKOTO_KV.put(legacyKey!, 'sesn_legacy_thread');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_be_used',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '輪島の天気です。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(0);
+    expect(sends).toEqual(['sesn_legacy_thread']);
+    expect(await env.MAKOTO_KV.get(baseKey!)).toBe('sesn_legacy_thread');
+    expect(await env.MAKOTO_KV.get(currentKey!)).toBe('sesn_legacy_thread');
+
+    const sessionEvent = runtimeEvents(env).find(
+      (row) => row.event_type === 'cma_session_continued',
+    );
+    const detail = JSON.parse(String(sessionEvent?.detail_json));
+    expect(detail.kv_lookup_result).toBe('legacy_capability_hit');
+    expect(detail.kv_migrated_to_base).toBe(true);
+    expect(detail.capability_suffix_hash).toMatch(/^[a-f0-9]{12}$/);
+    expect(detail.kv_base_key_hash).toMatch(/^[a-f0-9]{12}$/);
+    expect(detail.kv_current_capability_key_hash).toMatch(/^[a-f0-9]{12}$/);
+    expect(detail.kv_matched_key_hash).toMatch(/^[a-f0-9]{12}$/);
+    expect(detail.kv_base_put).toBe('ok');
+    expect(detail.kv_current_capability_put).toBe('ok');
+  });
+
   it('Case 10b: broad scope KV hit は無視し、新しい Chat thread は新規 session', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
