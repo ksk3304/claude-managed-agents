@@ -65,7 +65,7 @@ describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
       (candidate) => candidate.type === 'custom' && candidate.name === 'chat_list_space_members',
     ) as Record<string, unknown> | undefined;
     expect(tool).toBeDefined();
-    expect(tool!.description).toContain('Google Chat space members');
+    expect(tool!.description).toContain('displayName/user_id pairs');
     expect(tool!.input_schema).toMatchObject({
       type: 'object',
       properties: {

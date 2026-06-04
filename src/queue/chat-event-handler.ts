@@ -124,9 +124,6 @@ import {
 } from '../lib/session-log';
 import {
   buildSpaceContextBlock,
-  buildSpaceRosterBlock,
-  fetchSpaceMemberRoster,
-  type RosterFetchResult,
 } from '../lib/space-roster';
 import { dispatchSlashCommand } from '../lib/slash-skill';
 import type { SlashSkillHandlers } from '../lib/slash-skill';
@@ -170,8 +167,6 @@ const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
 const CHAT_DM_SPACE_KV_PREFIX = 'chat_dm_space:';
-const CHAT_SPEAKER_CONTEXT_PREFETCH_ENV = 'CHAT_SPEAKER_CONTEXT_PREFETCH_ENABLED';
-
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
  * false` skill 集合を TS 側で持つ subset (Issue #186 既知 #4 intent-detector
@@ -862,76 +857,24 @@ export async function handleChatEvent(
     }
   }
 
-  // ---- 5c. Google Chat speaker context / roster prefetch (#286) ----
-  // Shared-space turns need deterministic speaker identity before the
-  // agent reasons about "who asked?". CMA cannot call Google APIs itself;
-  // the Worker resolves Chat payload/API data here and injects it as
-  // untrusted context. External-tool trust still comes only from
-  // user_mapping / actor gate, not from roster identity.
+  // ---- 5c. Google Chat speaker context (#286) ----
+  // Always pass the current webhook speaker identity into shared-space
+  // turns. Do not fetch the roster here: when the agent cannot identify
+  // someone, it must call the Worker-side `chat_list_space_members`
+  // custom tool so the API lookup is CMA-triggered and auditable.
   let speakerContextBlock = '';
   let rosterBlock = '';
-  const speakerContextPrefetchEnabled =
-    env.CHAT_SPEAKER_CONTEXT_PREFETCH_ENABLED !== '0';
-  if (!isAutonomousEvent && isSharedSpace(spaceType) && speakerContextPrefetchEnabled) {
-    let rosterResult: RosterFetchResult | null = null;
-    let rosterReason = 'not_configured';
-    let rosterMemberCount = 0;
-    let senderInRoster = false;
-    let senderDisplayNameSource:
-      | 'payload'
-      | 'roster'
-      | 'missing' = senderDisplayName ? 'payload' : 'missing';
-
-    if (env.CHAT_SA_KEY_JSON) {
-      try {
-        rosterResult = await fetchSpaceMemberRoster(
-          { saKeyJson: env.CHAT_SA_KEY_JSON },
-          spaceName,
-        );
-        if (rosterResult.kind === 'roster') {
-          rosterReason = 'ok';
-          rosterMemberCount = rosterResult.members.size;
-          senderInRoster = sender.name ? rosterResult.members.has(sender.name) : false;
-        } else {
-          rosterReason = `fetch_failed:${rosterResult.reason}`;
-        }
-      } catch (err) {
-        rosterResult = { kind: 'failure', reason: 'network' };
-        rosterReason = 'fetch_failed:exception';
-        console.warn(
-          `[chat-event] speaker roster prefetch failed eventKey=${eventKey}: ` +
-            `${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    const rosterDisplayName =
-      rosterResult?.kind === 'roster' && sender.name
-        ? (rosterResult.members.get(sender.name) ?? '')
-        : '';
-    const resolvedSenderDisplayName = senderDisplayName || rosterDisplayName;
-    if (!senderDisplayName && rosterDisplayName) {
-      senderDisplayNameSource = 'roster';
-    }
-
+  if (!isAutonomousEvent && isSharedSpace(spaceType)) {
+    const senderDisplayNameSource = senderDisplayName ? 'payload' : 'missing';
     speakerContextBlock = buildSpaceContextBlock(
       space,
       {
         name: sender.name,
-        displayName: resolvedSenderDisplayName,
+        displayName: senderDisplayName,
         type: senderType,
       },
       { threadName },
     );
-
-    if (rosterResult) {
-      const rosterSurface = buildSpaceRosterBlock(rosterResult, { isDm: false });
-      rosterBlock = rosterSurface.block;
-      rosterMemberCount = rosterSurface.memberCount;
-      if (rosterResult.kind === 'roster') {
-        rosterReason = rosterSurface.reason;
-      }
-    }
 
     await recordRuntimeEvent(env, {
       eventKey,
@@ -942,26 +885,13 @@ export async function handleChatEvent(
         enabled: true,
         shared_space: true,
         chat_api_configured: Boolean(env.CHAT_SA_KEY_JSON),
+        chat_api_prefetch: false,
+        resolution_mode: 'cma_tool_on_demand',
         sender_user_id_present: Boolean(sender.name),
         sender_user_id_hash: stableHash(sender.name),
         sender_display_name_source: senderDisplayNameSource,
-        sender_in_roster: senderInRoster,
-        roster_reason: rosterReason,
-        roster_member_count: rosterMemberCount,
         speaker_context_chars: speakerContextBlock.length,
-        roster_chars: rosterBlock.length,
-      },
-    });
-  } else if (!isAutonomousEvent && isSharedSpace(spaceType)) {
-    await recordRuntimeEvent(env, {
-      eventKey,
-      messageId: message.name,
-      eventType: 'chat_speaker_context_built',
-      source: 'chat-event-handler',
-      detail: {
-        enabled: false,
-        shared_space: true,
-        reason: `${CHAT_SPEAKER_CONTEXT_PREFETCH_ENV}=0`,
+        roster_chars: 0,
       },
     });
   }

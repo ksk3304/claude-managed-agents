@@ -359,6 +359,7 @@ async function listChatSpaceMembers(
     })
     .slice(0, limit)
     .map(([userName, displayName]) => ({
+      user_id: userName,
       user_name: userName,
       display_name: displayName ? sanitizeRosterDisplayName(displayName) : '',
     }));

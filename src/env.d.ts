@@ -122,11 +122,6 @@ declare namespace Cloudflare {
      * behaviour.
      */
     CHAT_AUTO_PENDING_USER_MAPPING_ENABLED?: string;
-    /**
-     * Shared-space speaker context kill switch. Default unset/on:
-     * inject sender displayName/user_id and roster context. "0" disables.
-     */
-    CHAT_SPEAKER_CONTEXT_PREFETCH_ENABLED?: string;
     /** Operator Google Chat space for Cost Guard warning notifications. */
     COST_GUARD_OPERATOR_SPACE?: string;
     COST_GUARD_ENABLED?: string;
