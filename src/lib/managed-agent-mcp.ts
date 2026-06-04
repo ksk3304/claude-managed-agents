@@ -191,7 +191,8 @@ function isLocalOrPrivateHost(hostname: string): boolean {
 }
 
 function hasMcpPath(url: URL): boolean {
-  return url.pathname.replace(/\/+$/, '') === '/mcp';
+  const path = url.pathname.replace(/\/+$/, '');
+  return path === '/mcp' || path === '/sse';
 }
 
 function parseEnabledTools(env: Env | undefined): string[] {
@@ -240,7 +241,7 @@ export function buildPlaywrightMcpConfig(env: Env | undefined): PlaywrightMcpCon
     return {
       status: 'invalid_url',
       attach: false,
-      reason: 'PLAYWRIGHT_MCP_URL must point at /mcp',
+      reason: 'PLAYWRIGHT_MCP_URL must point at /mcp or /sse',
       enabledTools: [],
       localInsecureAllowed,
     };

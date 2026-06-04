@@ -120,6 +120,7 @@ type ChatThreadKvLookupResult =
   | 'no_thread_key'
   | 'base_hit'
   | 'current_capability_hit'
+  | 'current_capability_only_miss'
   | 'legacy_capability_hit'
   | 'miss'
   | 'kv_get_failed'
@@ -178,10 +179,26 @@ async function resolveChatThreadSessionFromKv(
   kv: KVNamespace,
   baseKey: string | null,
   currentKey: string | null,
+  opts: { currentCapabilityOnly?: boolean } = {},
 ): Promise<ChatThreadSessionLookup> {
   if (baseKey === null) return emptyChatThreadSessionLookup('no_thread_key', baseKey, currentKey);
 
   try {
+    if (opts.currentCapabilityOnly) {
+      if (!currentKey) {
+        return emptyChatThreadSessionLookup('current_capability_only_miss', baseKey, currentKey);
+      }
+      const currentSessionId = await kv.get(currentKey);
+      if (currentSessionId) {
+        return {
+          ...emptyChatThreadSessionLookup('current_capability_hit', baseKey, currentKey),
+          sessionId: currentSessionId,
+          matchedKey: currentKey,
+        };
+      }
+      return emptyChatThreadSessionLookup('current_capability_only_miss', baseKey, currentKey);
+    }
+
     const baseSessionId = await kv.get(baseKey);
     if (baseSessionId) {
       return {
@@ -659,7 +676,9 @@ export async function orchestrateChatTurn(
         );
   const sessionLookup = forceFreshSession
     ? emptyChatThreadSessionLookup('force_fresh', baseSessionKey, currentCapabilitySessionKey)
-    : await resolveChatThreadSessionFromKv(kv, baseSessionKey, currentCapabilitySessionKey);
+    : await resolveChatThreadSessionFromKv(kv, baseSessionKey, currentCapabilitySessionKey, {
+        currentCapabilityOnly: playwrightMcpConfig.attach,
+      });
   let sessionId: string | null = sessionLookup.sessionId;
 
   let isNewSession = false;
@@ -697,7 +716,7 @@ export async function orchestrateChatTurn(
         `memory_stores=${resources.length}/${routedMemory.max_stores}` +
         (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
-    if (baseSessionKey !== null) {
+    if (baseSessionKey !== null && !playwrightMcpConfig.attach) {
       sessionLookup.basePut = await putChatThreadSessionKey(kv, baseSessionKey, sessionId);
     }
     if (
@@ -915,6 +934,7 @@ export async function orchestrateChatTurn(
           agentId: input.userMapping.agent_id,
           environmentId: input.env.ENVIRONMENT_ID,
           resources,
+          vaultIds: playwrightMcpVaultIds,
         });
         isNewSession = true;
       } catch (createErr) {

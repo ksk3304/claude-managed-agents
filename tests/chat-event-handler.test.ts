@@ -2414,6 +2414,78 @@ describe('handleChatEvent', () => {
     expect(detail.kv_current_capability_put).toBe('ok');
   });
 
+  it('Case 10a2: Playwright MCP 有効時は legacy/base session を継続しない', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        PLAYWRIGHT_MCP_URL: 'https://playwright.example.com/mcp',
+        PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED: '1',
+        PLAYWRIGHT_MCP_VAULT_ID: 'vlt_playwright',
+        PLAYWRIGHT_MCP_ENABLED_TOOLS:
+          'browser_navigate,browser_snapshot,browser_take_screenshot,browser_type,browser_click',
+      },
+    });
+    const msg = buildQueueMsg({
+      spaceType: 'DM',
+      spaceName: 'spaces/AAA',
+      text: 'Playwright MCP で問い合わせフォームを開いて',
+      threadName: 'spaces/AAA/threads/TMCP',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const legacyKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TMCP',
+      'tools-old:skills-old:mcp-old:mcp-vault-old:memory-old',
+    );
+    const baseKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TMCP',
+    );
+    const currentKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TMCP',
+      await buildChatCapabilitySessionKey(env),
+    );
+    expect(legacyKey).not.toBeNull();
+    expect(baseKey).not.toBeNull();
+    expect(currentKey).not.toBeNull();
+    await env.MAKOTO_KV.put(legacyKey!, 'sesn_legacy_temp_mcp');
+    await env.MAKOTO_KV.put(baseKey!, 'sesn_base_old_mcp');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_new_mcp',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      events: [
+        { type: 'agent.message.text', text: '新しいMCPセッションで実行します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({ vault_ids: ['vlt_playwright'] });
+    expect(sends).toEqual(['sesn_new_mcp']);
+    expect(await env.MAKOTO_KV.get(baseKey!)).toBe('sesn_base_old_mcp');
+    expect(await env.MAKOTO_KV.get(currentKey!)).toBe('sesn_new_mcp');
+
+    const sessionEvent = runtimeEvents(env).find(
+      (row) => row.event_type === 'cma_session_created',
+    );
+    const detail = JSON.parse(String(sessionEvent?.detail_json));
+    expect(detail.kv_lookup_result).toBe('current_capability_only_miss');
+    expect(detail.kv_migrated_to_base).toBe(false);
+    expect(detail.kv_base_put).toBe('skipped');
+    expect(detail.kv_current_capability_put).toBe('ok');
+  });
+
   it('Case 10b: broad scope KV hit は無視し、新しい Chat thread は新規 session', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
