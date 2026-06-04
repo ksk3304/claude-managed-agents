@@ -66,6 +66,7 @@ import {
   recordRuntimeEvent,
   recordSessionBind,
   sessionKeyHash,
+  stableHash,
 } from './observability';
 
 /** Historical broad scope prefix. Do not use for Google Chat reactive session lookup. */
@@ -78,6 +79,15 @@ const KV_CHAT_THREAD_SESSION_TTL_SEC = 24 * 60 * 60;
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 const SESSION_TIMEOUT_RECOVERY_POLL_MS = 180_000;
+
+function parseCsvEnv(value: string | undefined): string[] {
+  const unique = new Set<string>();
+  for (const item of (value ?? '').split(',')) {
+    const trimmed = item.trim();
+    if (trimmed) unique.add(trimmed);
+  }
+  return [...unique];
+}
 
 function isWaitingOnResponsesError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
@@ -105,6 +115,145 @@ export function chatThreadSessionKey(
   return `${KV_CHAT_THREAD_SESSION_PREFIX}:${email}:${space}:${thread}${suffix}`;
 }
 
+type ChatThreadKvLookupResult =
+  | 'force_fresh'
+  | 'no_thread_key'
+  | 'base_hit'
+  | 'current_capability_hit'
+  | 'legacy_capability_hit'
+  | 'miss'
+  | 'kv_get_failed'
+  | 'kv_list_failed';
+
+interface ChatThreadSessionLookup {
+  sessionId: string | null;
+  result: ChatThreadKvLookupResult;
+  baseKey: string | null;
+  currentKey: string | null;
+  matchedKey: string | null;
+  listedLegacyKeys: number;
+  migratedToBase: boolean;
+  basePut: 'skipped' | 'ok' | 'failed';
+  currentPut: 'skipped' | 'ok' | 'failed';
+}
+
+function emptyChatThreadSessionLookup(
+  result: ChatThreadKvLookupResult,
+  baseKey: string | null,
+  currentKey: string | null,
+): ChatThreadSessionLookup {
+  return {
+    sessionId: null,
+    result,
+    baseKey,
+    currentKey,
+    matchedKey: null,
+    listedLegacyKeys: 0,
+    migratedToBase: false,
+    basePut: 'skipped',
+    currentPut: 'skipped',
+  };
+}
+
+async function putChatThreadSessionKey(
+  kv: KVNamespace,
+  key: string | null,
+  sessionId: string,
+): Promise<'skipped' | 'ok' | 'failed'> {
+  if (key === null) return 'skipped';
+  try {
+    await kv.put(key, sessionId, {
+      expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
+    });
+    return 'ok';
+  } catch (err) {
+    console.warn(
+      `[chat-event] KV put failed key=${key}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return 'failed';
+  }
+}
+
+async function resolveChatThreadSessionFromKv(
+  kv: KVNamespace,
+  baseKey: string | null,
+  currentKey: string | null,
+): Promise<ChatThreadSessionLookup> {
+  if (baseKey === null) return emptyChatThreadSessionLookup('no_thread_key', baseKey, currentKey);
+
+  try {
+    const baseSessionId = await kv.get(baseKey);
+    if (baseSessionId) {
+      return {
+        ...emptyChatThreadSessionLookup('base_hit', baseKey, currentKey),
+        sessionId: baseSessionId,
+        matchedKey: baseKey,
+      };
+    }
+
+    if (currentKey && currentKey !== baseKey) {
+      const currentSessionId = await kv.get(currentKey);
+      if (currentSessionId) {
+        const lookup = {
+          ...emptyChatThreadSessionLookup('current_capability_hit', baseKey, currentKey),
+          sessionId: currentSessionId,
+          matchedKey: currentKey,
+          migratedToBase: true,
+        };
+        lookup.basePut = await putChatThreadSessionKey(kv, baseKey, currentSessionId);
+        return lookup;
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[chat-event] KV get failed key=${currentKey ?? baseKey}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return emptyChatThreadSessionLookup('kv_get_failed', baseKey, currentKey);
+  }
+
+  try {
+    const legacyPrefix = `${baseKey}:`;
+    const legacyKeys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const listed = await kv.list({ prefix: legacyPrefix, limit: 20, cursor });
+      legacyKeys.push(...listed.keys.map((key) => key.name));
+      cursor = listed.list_complete ? undefined : listed.cursor;
+    } while (cursor && legacyKeys.length < 100);
+
+    for (const keyName of legacyKeys) {
+      if (keyName === currentKey) continue;
+      const legacySessionId = await kv.get(keyName);
+      if (!legacySessionId) continue;
+      const lookup = {
+        ...emptyChatThreadSessionLookup('legacy_capability_hit', baseKey, currentKey),
+        sessionId: legacySessionId,
+        matchedKey: keyName,
+        listedLegacyKeys: legacyKeys.length,
+        migratedToBase: true,
+      };
+      lookup.basePut = await putChatThreadSessionKey(kv, baseKey, legacySessionId);
+      if (currentKey && currentKey !== keyName) {
+        lookup.currentPut = await putChatThreadSessionKey(kv, currentKey, legacySessionId);
+      }
+      return lookup;
+    }
+    return {
+      ...emptyChatThreadSessionLookup('miss', baseKey, currentKey),
+      listedLegacyKeys: legacyKeys.length,
+    };
+  } catch (err) {
+    console.warn(
+      `[chat-event] KV list failed prefix=${baseKey}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return emptyChatThreadSessionLookup('kv_list_failed', baseKey, currentKey);
+  }
+}
+
 export function buildChatCapabilitySessionKeyFromHashes(
   desiredAgentToolsHash: string,
   attachedSkillsHash: string,
@@ -119,7 +268,14 @@ export async function buildChatCapabilitySessionKey(
 ): Promise<string> {
   const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
   const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
-  const desiredMcpHash = await playwrightMcpHash(buildPlaywrightMcpConfig(env));
+  const playwrightMcpConfig = buildPlaywrightMcpConfig(env);
+  const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
+  const playwrightMcpVaultIds = playwrightMcpConfig.attach
+    ? parseCsvEnv(env.PLAYWRIGHT_MCP_VAULT_ID)
+    : [];
+  const playwrightMcpVaultHash = await toolsHash(
+    playwrightMcpVaultIds.map((vaultId) => ({ vaultId })),
+  );
   const memoryResourcesHash = await toolsHash(resources.map((resource) => ({ ...resource })));
   return (
     buildChatCapabilitySessionKeyFromHashes(
@@ -127,6 +283,7 @@ export async function buildChatCapabilitySessionKey(
       attachedSkillsHash,
       desiredMcpHash,
     ) +
+    `:mcp-vault-${playwrightMcpVaultHash}` +
     `:memory-${memoryResourcesHash}`
   );
 }
@@ -428,6 +585,12 @@ export async function orchestrateChatTurn(
   // configs do not alter the existing employee agent.
   const playwrightMcpConfig = buildPlaywrightMcpConfig(input.env);
   const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
+  const playwrightMcpVaultIds = playwrightMcpConfig.attach
+    ? parseCsvEnv(input.env.PLAYWRIGHT_MCP_VAULT_ID)
+    : [];
+  const playwrightMcpVaultHash = await toolsHash(
+    playwrightMcpVaultIds.map((vaultId) => ({ vaultId })),
+  );
   if (playwrightMcpConfig.attach) {
     try {
       const ensuredMcp = await ensureManagedAgentMcp(
@@ -473,36 +636,31 @@ export async function orchestrateChatTurn(
   );
 
   // ---- thread session 解決 ----
-  // Cloud Run 旧実装と同じく、Google Chat は sender + space + thread 単位で
-  // CMA session を継続する。DM/space 全体へ広げると、新しい Chat thread が
-  // 古い CMA session を継続してしまうため、scope key への fallback はしない。
-  // capability hash を suffix に含め、tools / document skills / MCP 付与前の session を再利用しない。
+  // Google Chat は sender + space + thread の stable base key で CMA session を継続する。
+  // capability suffix は旧KV互換と観測用 metadata に留める。deploy / MCP設定差分だけで
+  // 同じ Chat thread が分裂しないよう、base miss 時だけ legacy suffix key へ fallback する。
   const capabilitySessionKey = buildChatCapabilitySessionKeyFromHashes(
     desiredAgentToolsHash,
     attachedSkillsHash,
     desiredMcpHash,
-  ) + `:memory-${memoryResourcesHash}`;
+  ) + `:mcp-vault-${playwrightMcpVaultHash}:memory-${memoryResourcesHash}`;
   const forceFreshSession = input.forceFreshSession === true;
-  const sessionKey = forceFreshSession
+  const baseSessionKey = forceFreshSession
     ? null
-    : chatThreadSessionKey(
-        input.senderEmail,
-        input.spaceName,
-        input.threadName,
-        capabilitySessionKey,
-      );
-  let sessionId: string | null = null;
-  if (sessionKey !== null) {
-    try {
-      sessionId = await kv.get(sessionKey);
-    } catch (err) {
-      console.warn(
-        `[chat-event] KV get failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      // KV 失敗は致命ではない — 新規 session で続行
-      sessionId = null;
-    }
-  }
+    : chatThreadSessionKey(input.senderEmail, input.spaceName, input.threadName);
+  const currentCapabilitySessionKey =
+    forceFreshSession || baseSessionKey === null
+      ? null
+      : chatThreadSessionKey(
+          input.senderEmail,
+          input.spaceName,
+          input.threadName,
+          capabilitySessionKey,
+        );
+  const sessionLookup = forceFreshSession
+    ? emptyChatThreadSessionLookup('force_fresh', baseSessionKey, currentCapabilitySessionKey)
+    : await resolveChatThreadSessionFromKv(kv, baseSessionKey, currentCapabilitySessionKey);
+  let sessionId: string | null = sessionLookup.sessionId;
 
   let isNewSession = false;
   if (sessionId === null) {
@@ -521,6 +679,7 @@ export async function orchestrateChatTurn(
         agentId,
         environmentId,
         resources,
+        vaultIds: playwrightMcpVaultIds,
       });
     } catch (err) {
       throw new OrchestratorFailure(
@@ -538,17 +697,18 @@ export async function orchestrateChatTurn(
         `memory_stores=${resources.length}/${routedMemory.max_stores}` +
         (input.forceFreshSession ? ' ephemeral=true' : ''),
     );
-    if (sessionKey !== null) {
-      try {
-        await kv.put(sessionKey, sessionId, {
-          expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
-        });
-      } catch (err) {
-        // KV put 失敗は次回が新規 session になるだけ — 致命ではない
-        console.warn(
-          `[chat-event] KV put failed key=${sessionKey}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+    if (baseSessionKey !== null) {
+      sessionLookup.basePut = await putChatThreadSessionKey(kv, baseSessionKey, sessionId);
+    }
+    if (
+      currentCapabilitySessionKey !== null &&
+      currentCapabilitySessionKey !== baseSessionKey
+    ) {
+      sessionLookup.currentPut = await putChatThreadSessionKey(
+        kv,
+        currentCapabilitySessionKey,
+        sessionId,
+      );
     }
   } else {
     console.log(
@@ -578,9 +738,18 @@ export async function orchestrateChatTurn(
       source: 'session-orchestrator',
       detail: {
         force_fresh_session: forceFreshSession,
-        session_key_kind: sessionKey === null ? 'none' : 'chat_thread',
+        session_key_kind: baseSessionKey === null ? 'none' : 'chat_thread',
         thread_name_present: Boolean(input.threadName),
-        has_thread_session_key: sessionKey !== null,
+        has_thread_session_key: baseSessionKey !== null,
+        kv_lookup_result: sessionLookup.result,
+        kv_base_key_hash: stableHash(baseSessionKey),
+        kv_current_capability_key_hash: stableHash(currentCapabilitySessionKey),
+        kv_matched_key_hash: stableHash(sessionLookup.matchedKey),
+        kv_listed_legacy_keys: sessionLookup.listedLegacyKeys,
+        kv_migrated_to_base: sessionLookup.migratedToBase,
+        kv_base_put: sessionLookup.basePut,
+        kv_current_capability_put: sessionLookup.currentPut,
+        capability_suffix_hash: stableHash(capabilitySessionKey),
         memory_router_strategy: routedMemory.strategy,
         memory_store_count: resources.length,
         memory_store_dropped_count: routedMemory.dropped.length,
@@ -725,7 +894,7 @@ export async function orchestrateChatTurn(
     }
   } catch (err) {
     const canReplacePoisonedThreadSession =
-      sessionKey !== null && !isNewSession && isWaitingOnResponsesError(err);
+      baseSessionKey !== null && !isNewSession && isWaitingOnResponsesError(err);
     if (canReplacePoisonedThreadSession) {
       if (input.eventKey) {
         await recordRuntimeEvent(input.env, {
@@ -758,15 +927,16 @@ export async function orchestrateChatTurn(
         );
       }
 
-      try {
-        await kv.put(sessionKey, sessionId, {
-          expirationTtl: KV_CHAT_THREAD_SESSION_TTL_SEC,
-        });
-      } catch (putErr) {
-        console.warn(
-          `[chat-event] replacement KV put failed key=${sessionKey}: ${
-            putErr instanceof Error ? putErr.message : String(putErr)
-          }`,
+      const replacementBasePut = await putChatThreadSessionKey(kv, baseSessionKey, sessionId);
+      let replacementCurrentPut: 'skipped' | 'ok' | 'failed' = 'skipped';
+      if (
+        currentCapabilitySessionKey !== null &&
+        currentCapabilitySessionKey !== baseSessionKey
+      ) {
+        replacementCurrentPut = await putChatThreadSessionKey(
+          kv,
+          currentCapabilitySessionKey,
+          sessionId,
         );
       }
 
@@ -792,6 +962,10 @@ export async function orchestrateChatTurn(
           detail: {
             previous_session_id: previousSessionId,
             session_key_kind: 'chat_thread',
+            kv_base_key_hash: stableHash(baseSessionKey),
+            kv_current_capability_key_hash: stableHash(currentCapabilitySessionKey),
+            kv_base_put: replacementBasePut,
+            kv_current_capability_put: replacementCurrentPut,
           },
         });
       }

@@ -355,9 +355,40 @@ Optional secrets:
 | `CLOUDFLARE_API_TOKEN` | Browser Rendering REST tools |
 | `ANTHROPIC_BASE_URL` | Override (defaults to `https://api.anthropic.com`) |
 | `PLAYWRIGHT_MCP_URL` | Optional URL-based Playwright MCP endpoint for the existing MAKOTO employee agent. Must point at `/mcp`. Production attach is disabled unless the URL is HTTPS and `PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED=1`. |
-| `PLAYWRIGHT_MCP_ENABLED_TOOLS` | Optional comma-separated Playwright MCP tool allowlist. Initial implementation only accepts `browser_navigate,browser_snapshot`. Mutation/execution tools such as click/type/evaluate are not enabled. |
+| `PLAYWRIGHT_MCP_ENABLED_TOOLS` | Optional comma-separated Playwright MCP tool allowlist. Defaults to `browser_navigate,browser_snapshot`. Explicit test sessions may also enable `browser_take_screenshot,browser_type,browser_click`; execution tools such as `browser_evaluate` remain blocked. |
 | `PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED` | Set to `1` only after confirming the external MCP endpoint is not unauthenticated public access. |
 | `PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL` | Local smoke-only opt-in for `http://127.0.0.1:8931/mcp` or localhost. Do not use for production. |
+
+### Playwright MCP Worker
+
+The production Playwright MCP endpoint is deployed as a separate Worker under
+`playwright-mcp-worker/`. This keeps browser automation isolated from the
+Google Chat / AgentMail control-plane Worker.
+
+```bash
+cd playwright-mcp-worker
+npm ci
+npx wrangler secret put MCP_BASIC_USER
+npx wrangler secret put MCP_BASIC_PASS
+npx wrangler secret put MCP_BEARER_TOKEN
+npm run deploy
+```
+
+After deployment, point the control-plane Worker at the stable endpoint:
+
+```bash
+printf '%s' 'https://makoto-playwright-mcp.<account-subdomain>.workers.dev/mcp' \
+  | npx wrangler secret put PLAYWRIGHT_MCP_URL --name claude-managed-agents-control-plane
+printf '%s' '<anthropic-vault-id-containing-static-bearer-for-the-same-url>' \
+  | npx wrangler secret put PLAYWRIGHT_MCP_VAULT_ID --name claude-managed-agents-control-plane
+printf '%s' 'browser_navigate,browser_snapshot,browser_take_screenshot,browser_type,browser_click' \
+  | npx wrangler secret put PLAYWRIGHT_MCP_ENABLED_TOOLS --name claude-managed-agents-control-plane
+printf '%s' '1' \
+  | npx wrangler secret put PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED --name claude-managed-agents-control-plane
+```
+
+The control-plane Worker attaches the configured MCP server/toolset to the
+existing MAKOTO employee agent during normal Google Chat turns.
 
 Optional vars:
 

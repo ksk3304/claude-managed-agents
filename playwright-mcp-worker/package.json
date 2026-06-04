@@ -1,0 +1,22 @@
+{
+  "name": "makoto-playwright-mcp-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/playwright": "^0.0.11",
+    "@cloudflare/playwright-mcp": "0.0.5",
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "agents": "^0.0.109"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250725.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.90.0"
+  }
+}

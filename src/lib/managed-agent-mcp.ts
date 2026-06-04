@@ -13,6 +13,8 @@ export const DEFAULT_PLAYWRIGHT_MCP_ENABLED_TOOLS = [
 const SAFE_PLAYWRIGHT_MCP_TOOLS = new Set<string>([
   ...DEFAULT_PLAYWRIGHT_MCP_ENABLED_TOOLS,
   'browser_take_screenshot',
+  'browser_type',
+  'browser_click',
 ]);
 
 export interface PlaywrightMcpConfig {
