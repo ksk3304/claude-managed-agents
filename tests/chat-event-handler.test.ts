@@ -1472,7 +1472,7 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
   });
 
-  it('shared space speaker context injects Chat user_id and roster displayName before CMA turn', async () => {
+  it('shared space speaker context injects webhook speaker identity without prefetching roster before CMA turn', async () => {
     const env = buildEnv({
       envOverrides: {
         CHAT_SA_KEY_JSON: fixtureSaKeyJson(),
@@ -1483,6 +1483,7 @@ describe('handleChatEvent', () => {
       spaceName: 'spaces/ROOM1',
       text: '@MAKOTOくん これは誰からの依頼？',
       senderName: 'users/U1',
+      senderDisplayName: 'Alice',
       annotations: [
         {
           type: 'USER_MENTION',
@@ -1507,23 +1508,6 @@ describe('handleChatEvent', () => {
 
     const origFetch = globalThis.fetch;
     const fetchMock = makeFetchMock(async (url) => {
-      if (url === 'https://oauth2.googleapis.com/token') {
-        return new Response(
-          JSON.stringify({ access_token: 'chat-bot-token', expires_in: 3600 }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
-      if (url === 'https://chat.googleapis.com/v1/spaces/ROOM1/members?pageSize=200') {
-        return new Response(
-          JSON.stringify({
-            memberships: [
-              { state: 'JOINED', member: { name: 'users/U1', displayName: 'Alice' } },
-              { state: 'JOINED', member: { name: 'users/U2', displayName: 'Bob' } },
-            ],
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
       throw new Error(`unexpected fetch: ${url}`);
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -1535,16 +1519,15 @@ describe('handleChatEvent', () => {
       const payloadText = JSON.stringify(payloads[0]);
       expect(payloadText).toContain('発話者 displayName: Alice');
       expect(payloadText).toContain('発話者 user_id: users/U1');
-      expect(payloadText).toContain('このスペースの在籍者');
-      expect(payloadText).toContain('- Alice');
-      expect(payloadText).toContain('- Bob');
+      expect(payloadText).not.toContain('このスペースの在籍者');
+      expect(payloadText).not.toContain('users/U2');
 
       const promptEvent = runtimeEvents(env).find(
         (row) => row.event_type === 'prompt_envelope_built',
       );
       const promptDetail = JSON.parse(String(promptEvent?.detail_json));
       expect(promptDetail.speaker_context_chars).toBeGreaterThan(0);
-      expect(promptDetail.roster_chars).toBeGreaterThan(0);
+      expect(promptDetail.roster_chars).toBe(0);
 
       const speakerEvent = runtimeEvents(env).find(
         (row) => row.event_type === 'chat_speaker_context_built',
@@ -1555,14 +1538,12 @@ describe('handleChatEvent', () => {
         shared_space: true,
         chat_api_configured: true,
         sender_user_id_present: true,
-        sender_display_name_source: 'roster',
-        sender_in_roster: true,
-        roster_reason: 'ok',
-        roster_member_count: 2,
+        chat_api_prefetch: false,
+        resolution_mode: 'cma_tool_on_demand',
+        sender_display_name_source: 'payload',
+        roster_chars: 0,
       });
-      expect(fetchMock.calls.map((c) => c.url)).toContain(
-        'https://chat.googleapis.com/v1/spaces/ROOM1/members?pageSize=200',
-      );
+      expect(fetchMock.calls).toHaveLength(0);
     } finally {
       globalThis.fetch = origFetch;
     }
