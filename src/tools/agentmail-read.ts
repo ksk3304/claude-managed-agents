@@ -12,7 +12,6 @@ import type { AgentMailMessage } from '../types/agentmail';
 import {
   ToolSchemaError,
   rejectUnknownKeys,
-  requireNonEmptyString,
   requirePositiveIntInRange,
 } from './tool-common';
 
@@ -24,6 +23,7 @@ const GET_MAX_CHARS_MAX = 12000;
 const KNOWN_KEYS = new Set([
   'action',
   'message_id',
+  'thread_id',
   'from_contains',
   'subject_contains',
   'query',
@@ -160,7 +160,11 @@ async function getMessage(
   inboxId: string,
   client: AgentMailClient,
 ): Promise<Record<string, unknown>> {
-  const messageId = requireNonEmptyString(input.message_id, 'message_id', TOOL_NAME);
+  const messageId = optionalString(input.message_id, 'message_id');
+  const threadId = optionalString(input.thread_id, 'thread_id');
+  if (!messageId && !threadId) {
+    throw new ToolSchemaError(`${TOOL_NAME}: get requires message_id or thread_id`);
+  }
   const maxChars = requirePositiveIntInRange(
     input.max_chars,
     'max_chars',
@@ -169,7 +173,67 @@ async function getMessage(
     GET_MAX_CHARS_MAX,
     GET_MAX_CHARS_DEFAULT,
   );
-  const msg = await client.getMessage(inboxId, messageId);
+  let msg: AgentMailMessage;
+  if (messageId) {
+    try {
+      msg = await client.getMessage(inboxId, messageId);
+    } catch (err) {
+      if (err instanceof AgentMailError && err.status === 404) {
+        const bracketed = maybeBracketRfc822MessageId(messageId);
+        if (bracketed && bracketed !== messageId) {
+          try {
+            msg = await client.getMessage(inboxId, bracketed);
+            return formatMessageForGet(msg, maxChars);
+          } catch (retryErr) {
+            if (
+              (!(retryErr instanceof AgentMailError) || retryErr.status !== 404) &&
+              !threadId &&
+              !looksLikeThreadId(messageId)
+            ) {
+              throw retryErr;
+            }
+            // Fall through to thread fallback or the original 404.
+          }
+        }
+      }
+      if (
+        !(err instanceof AgentMailError) ||
+        err.status !== 404 ||
+        (!threadId && !looksLikeThreadId(messageId))
+      ) {
+        throw err;
+      }
+      msg = await getMessageFromThread(input, inboxId, client, threadId || messageId);
+    }
+  } else {
+    msg = await getMessageFromThread(input, inboxId, client, threadId);
+  }
+  return formatMessageForGet(msg, maxChars);
+}
+
+async function getMessageFromThread(
+  input: Record<string, unknown>,
+  inboxId: string,
+  client: AgentMailClient,
+  threadId: string,
+): Promise<AgentMailMessage> {
+  const thread = await client.getThread(inboxId, threadId);
+  const messages = Array.isArray(thread.messages) ? thread.messages : [];
+  if (messages.length === 0) {
+    throw new AgentMailToolError(
+      'agentmail_thread_empty',
+      'AgentMail の取得に失敗しました。問題が続くようでしたら開発側に連絡します。',
+      { status: 404 },
+    );
+  }
+  const fromContains = optionalString(input.from_contains, 'from_contains');
+  const subjectContains = optionalString(input.subject_contains, 'subject_contains');
+  const query = optionalString(input.query, 'query');
+  const matching = messages.filter((msg) => matchesSearch(msg, { fromContains, subjectContains, query }));
+  return matching.at(-1) ?? messages.at(-1)!;
+}
+
+function formatMessageForGet(msg: AgentMailMessage, maxChars: number): Record<string, unknown> {
   const rawBody = extractBody(msg);
   const redacted = redactSecrets(rawBody);
   const clipped = redacted.length > maxChars;
@@ -191,15 +255,16 @@ function parseAction(value: unknown): Action {
 }
 
 function summarizeMessage(msg: AgentMailMessage): Record<string, unknown> {
+  const id = firstNonEmptyString(msg.id, msg.message_id);
   return {
-    id: stringField(msg.id),
-    message_id: stringField(msg.message_id),
+    id,
+    message_id: firstNonEmptyString(msg.message_id, msg.id),
     thread_id: stringField(msg.thread_id),
     from: stringField(msg.from),
     to: arrayField(msg.to),
     cc: arrayField(msg.cc),
     subject: stringField(msg.subject),
-    received_at: stringField(msg.received_at),
+    received_at: firstNonEmptyString(msg.received_at, msg.timestamp, msg.created_at),
     labels: arrayField(msg.labels),
   };
 }
@@ -247,6 +312,25 @@ function optionalString(value: unknown, fieldName: string): string {
     throw new ToolSchemaError(`${TOOL_NAME}: ${fieldName} must be string`);
   }
   return value.trim();
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    const str = stringField(value);
+    if (str) return str;
+  }
+  return '';
+}
+
+function looksLikeThreadId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+function maybeBracketRfc822MessageId(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('<') || trimmed.endsWith('>')) return trimmed;
+  if (!/^[^@\s<>]+@[^@\s<>]+$/.test(trimmed)) return '';
+  return `<${trimmed}>`;
 }
 
 function optionalStringArray(value: unknown, fieldName: string): string[] {
