@@ -103,7 +103,7 @@ describe('makoto-prime spec bundle (generated src/data/*.ts)', () => {
     const r = await buildMakotoSystemPrompt(PERSONA_SPEC, TOOLS_SPEC);
     expect(r.systemPrompt).toContain('## Google Chat 名簿参照能力');
     expect(r.systemPrompt).toContain('`chat_list_space_members` custom tool');
-    expect(r.systemPrompt).toContain('Worker は毎ターン名簿を自動注入しません');
+    expect(r.systemPrompt).toContain('Worker は共有スペースの発話者情報と名簿を内部メモとして注入します');
     expect(r.systemPrompt).toContain('{"space_name":"spaces/AAA...","limit":50}');
   });
 });

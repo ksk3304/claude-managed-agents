@@ -1472,6 +1472,102 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.patches[0]!.text).toBe('ご質問への回答です。');
   });
 
+  it('shared space speaker context injects Chat user_id and roster displayName before CMA turn', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        CHAT_SA_KEY_JSON: fixtureSaKeyJson(),
+      },
+    });
+    const msg = buildQueueMsg({
+      spaceType: 'ROOM',
+      spaceName: 'spaces/ROOM1',
+      text: '@MAKOTOくん これは誰からの依頼？',
+      senderName: 'users/U1',
+      annotations: [
+        {
+          type: 'USER_MENTION',
+          startIndex: 0,
+          length: 9,
+          userMention: { user: { type: 'BOT', name: 'users/123' } },
+        },
+      ],
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_speaker_context',
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: '話者情報を受け取りました。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    const fetchMock = makeFetchMock(async (url) => {
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(
+          JSON.stringify({ access_token: 'chat-bot-token', expires_in: 3600 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === 'https://chat.googleapis.com/v1/spaces/ROOM1/members?pageSize=200') {
+        return new Response(
+          JSON.stringify({
+            memberships: [
+              { state: 'JOINED', member: { name: 'users/U1', displayName: 'Alice' } },
+              { state: 'JOINED', member: { name: 'users/U2', displayName: 'Bob' } },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(payloads).toHaveLength(1);
+      const payloadText = JSON.stringify(payloads[0]);
+      expect(payloadText).toContain('発話者 displayName: Alice');
+      expect(payloadText).toContain('発話者 user_id: users/U1');
+      expect(payloadText).toContain('このスペースの在籍者');
+      expect(payloadText).toContain('- Alice');
+      expect(payloadText).toContain('- Bob');
+
+      const promptEvent = runtimeEvents(env).find(
+        (row) => row.event_type === 'prompt_envelope_built',
+      );
+      const promptDetail = JSON.parse(String(promptEvent?.detail_json));
+      expect(promptDetail.speaker_context_chars).toBeGreaterThan(0);
+      expect(promptDetail.roster_chars).toBeGreaterThan(0);
+
+      const speakerEvent = runtimeEvents(env).find(
+        (row) => row.event_type === 'chat_speaker_context_built',
+      );
+      const speakerDetail = JSON.parse(String(speakerEvent?.detail_json));
+      expect(speakerDetail).toMatchObject({
+        enabled: true,
+        shared_space: true,
+        chat_api_configured: true,
+        sender_user_id_present: true,
+        sender_display_name_source: 'roster',
+        sender_in_roster: true,
+        roster_reason: 'ok',
+        roster_member_count: 2,
+      });
+      expect(fetchMock.calls.map((c) => c.url)).toContain(
+        'https://chat.googleapis.com/v1/spaces/ROOM1/members?pageSize=200',
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('uploads session output xlsx to Drive and removes sandbox path from Chat reply', async () => {
     const env = buildEnv({
       envOverrides: {
