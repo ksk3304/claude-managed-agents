@@ -229,6 +229,61 @@ describe('heartbeat scheduled enqueue', () => {
     }
   });
 
+  it('async_wait shared target tells the agent to reply in the shared thread', async () => {
+    const env = envWithQueue({
+      HEARTBEAT_ENABLED: '1',
+      AGENTMAIL_API_KEY: 'am_test',
+      AGENTMAIL_DEFAULT_INBOX_ID: 'inbox_test',
+    } as Partial<Env>);
+    addAsyncWaitTask(env, {
+      target_scope: 'shared',
+      target_space_name: 'spaces/ROOM',
+      thread_ref: JSON.stringify({
+        inbox_id: 'inbox_test',
+        expected_from: ['alice@example.com', 'bob@example.com'],
+        since_ms: Date.parse('2026-06-03T07:00:00.000Z'),
+        subject_contains: 'ヒアリング',
+        target_thread_name: 'spaces/ROOM/threads/T1',
+      }),
+    });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          messages: [
+            {
+              id: 'msg_bob',
+              from: 'bob@example.com',
+              subject: 'Re: ヒアリング',
+              extracted_text: 'Bob answer',
+              received_at: '2026-06-03T07:12:00Z',
+            },
+            {
+              id: 'msg_alice',
+              from: 'Alice <alice@example.com>',
+              subject: 'Re: ヒアリング',
+              extracted_text: 'Alice answer',
+              received_at: '2026-06-03T07:10:00Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      )) as typeof fetch;
+    try {
+      const result = await runHeartbeatTick(env, Date.parse('2026-06-03T08:00:00.000Z'));
+      expect(result).toEqual({ kind: 'completed', checked: 1, enqueued: 1, skipped: 0 });
+      const sent = env.MAKOTO_CHAT_QUEUE._sent[0]!;
+      expect(sent.payload.space?.type).toBe('ROOM');
+      expect(sent.payload.message?.thread?.name).toBe('spaces/ROOM/threads/T1');
+      expect(sent.payload.message?.text).toContain('この共有スレッドへ短く集計');
+      expect(sent.payload.message?.text).toContain('この共有スレッドにそのまま出す');
+      expect(sent.payload.message?.text).not.toContain('本人DMへ');
+      expect(sent.payload.message?.text).not.toContain('本人DMに');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('hydrates matched mail replies when listMessages omits body text', async () => {
     const env = envWithQueue({
       HEARTBEAT_ENABLED: '1',
@@ -329,5 +384,6 @@ describe('heartbeat helpers', () => {
     expect(event.space?.name).toBe('spaces/ROOM');
     expect(event.message?.thread?.name).toBe('spaces/ROOM/threads/T1');
     expect(event.message?.text).toContain('返信を集計する');
+    expect(event.message?.text).toContain('この共有スレッドにそのまま出す');
   });
 });
