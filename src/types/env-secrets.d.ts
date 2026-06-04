@@ -103,6 +103,12 @@ declare namespace Cloudflare {
     /** Enables chat-only pending user mapping auto-create for first-time Chat senders. */
     CHAT_AUTO_PENDING_USER_MAPPING_ENABLED?: string;
     /**
+     * Shared-space speaker context kill switch. Default unset/on:
+     * Worker injects Chat sender displayName/user_id and app-auth roster
+     * context before CMA reasoning. Set "0" to disable without rollback.
+     */
+    CHAT_SPEAKER_CONTEXT_PREFETCH_ENABLED?: string;
+    /**
      * `/costguard` 運用者コマンドの mutation 系 (enable / disable / pause /
      * set / etc.) を実行できる admin email の csv (= Cloud Run 側
      * `COST_GUARD_ADMIN_EMAILS` 等価、Python `cost_guard/command.py:l.33`)。

@@ -368,6 +368,8 @@ describe('buildSpaceContextBlock', () => {
     expect(block).toContain('スペース名: Keisuke SetoDM');
     expect(block).toContain('resource: spaces/rKtECyAAAAE');
     expect(block).toContain('type: ROOM');
+    expect(block).toContain('発話者 displayName: Alice');
+    expect(block).toContain('発話者 user_id: users/100');
     expect(block).toContain('thread: spaces/rKtECyAAAAE/threads/T1');
     // Roster block appended (= 1 ブロック連結、Python l.4248-4253 等価)
     expect(block).toContain('このスペースの在籍者');
@@ -388,6 +390,8 @@ describe('buildSpaceContextBlock', () => {
     expect(block).toContain('スペース名: (取得失敗)');
     expect(block).toContain('resource: spaces/UNKNOWNXYZ');
     expect(block).toContain('type: ROOM'); // SPACE → ROOM canonical
+    expect(block).toContain('発話者 displayName: (取得失敗)');
+    expect(block).toContain('発話者 user_id: users/100');
     expect(block).toContain('thread: (新規/未参加)');
     // Roster block absent (= `roster` option omitted)
     expect(block).not.toContain('このスペースの在籍者');
@@ -411,6 +415,8 @@ describe('buildSpaceContextBlock', () => {
     const block = buildSpaceContextBlock(space, sender, { roster });
     // Context block present
     expect(block).toContain('type: DM');
+    expect(block).toContain('発話者 displayName: Alice');
+    expect(block).toContain('発話者 user_id: users/100');
     // Roster block suppressed (DM skip)
     expect(block).not.toContain('このスペースの在籍者');
   });
