@@ -1,335 +1,147 @@
-import { connect, launch } from '@cloudflare/playwright';
-import type { Browser, Page } from '@cloudflare/playwright';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { McpAgent } from 'agents/mcp';
+import { launch } from '@cloudflare/playwright';
+import { JSONRPCMessageSchema, type JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { DurableObject } from 'cloudflare:workers';
 
-type ToolResult = {
-  content: Array<{ type: 'text'; text: string }>;
-  isError?: boolean;
-};
+import { createConnection } from './patched-playwright-mcp';
 
-type PlaywrightState = {
-  browserSessionId?: string;
-  lastSnapshot?: string;
-  lastScreenshotBytes?: number;
-};
+type McpConnection = Awaited<ReturnType<typeof createConnection>>;
 
-type ToolDefinition = {
-  name: string;
-  title: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  readOnlyHint: boolean;
-};
+const MCP_CAPABILITIES = ['core', 'tabs', 'history', 'wait', 'files'] as const;
+const DEFAULT_SESSION_ID = 'makoto-agent-default';
 
-const tools: ToolDefinition[] = [
-  {
-    name: 'browser_navigate',
-    title: 'Navigate',
-    description: 'Navigate to a URL.',
-    inputSchema: {
-      type: 'object',
-      properties: { url: { type: 'string' } },
-      required: ['url'],
-      additionalProperties: false,
-    },
-    readOnlyHint: false,
-  },
-  {
-    name: 'browser_snapshot',
-    title: 'Page snapshot',
-    description: 'Return a compact text snapshot of the current page with element refs.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-    readOnlyHint: true,
-  },
-  {
-    name: 'browser_take_screenshot',
-    title: 'Take screenshot',
-    description: 'Capture a screenshot of the current page.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        type: { type: 'string', enum: ['png', 'jpeg'] },
-        filename: { type: 'string' },
-      },
-      additionalProperties: false,
-    },
-    readOnlyHint: true,
-  },
-  {
-    name: 'browser_type',
-    title: 'Type text',
-    description: 'Type text into an element ref returned by browser_snapshot.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        element: { type: 'string' },
-        ref: { type: 'string' },
-        text: { type: 'string' },
-        submit: { type: 'boolean' },
-        slowly: { type: 'boolean' },
-      },
-      required: ['ref', 'text'],
-      additionalProperties: false,
-    },
-    readOnlyHint: false,
-  },
-  {
-    name: 'browser_click',
-    title: 'Click',
-    description: 'Click an element ref returned by browser_snapshot.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        element: { type: 'string' },
-        ref: { type: 'string' },
-        doubleClick: { type: 'boolean' },
-      },
-      required: ['ref'],
-      additionalProperties: false,
-    },
-    readOnlyHint: false,
-  },
-];
+class DurableSseTransport {
+  readonly sessionId: string;
+  private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
+  private readonly encoder = new TextEncoder();
+  private started = false;
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: JSONRPCMessage, extra?: { requestInfo?: { headers: Headers; url: URL } }) => void;
 
-export class PlaywrightMCP extends McpAgent<Cloudflare.Env, PlaywrightState> {
-  initialState: PlaywrightState = {};
-  private browser: Browser | null = null;
-  private page: Page | null = null;
-  server = this.createServer();
-
-  async init(): Promise<void> {
-    return;
+  constructor(sessionId: string, writer: WritableStreamDefaultWriter<Uint8Array>) {
+    this.sessionId = sessionId;
+    this.writer = writer;
   }
 
-  private kvKey(key: string): string {
-    return `playwright-mcp:global:${key}`;
+  async start(): Promise<void> {
+    if (this.started) throw new Error('Transport already started');
+    this.started = true;
   }
 
-  private async getStored(key: string): Promise<string | undefined> {
-    return (await this.env.MAKOTO_KV.get(this.kvKey(key))) ?? undefined;
+  async send(message: JSONRPCMessage): Promise<void> {
+    if (!this.started) throw new Error('Transport not started');
+    await this.writer.write(this.encoder.encode(`event: message\ndata: ${JSON.stringify(message)}\n\n`));
   }
 
-  private async putStored(key: string, value: string): Promise<void> {
-    await this.env.MAKOTO_KV.put(this.kvKey(key), value, { expirationTtl: 600 });
-  }
-
-  private createServer(): Server {
-    const server = new Server(
-      { name: 'Makoto Playwright', version: '0.1.0' },
-      { capabilities: { tools: {} } },
-    );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        annotations: {
-          title: tool.title,
-          readOnlyHint: tool.readOnlyHint,
-          destructiveHint: !tool.readOnlyHint,
-          openWorldHint: true,
-        },
-      })),
-    }));
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      try {
-        const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-        switch (request.params.name) {
-          case 'browser_navigate':
-            return await this.navigate(String(args.url ?? ''));
-          case 'browser_snapshot':
-            return await this.snapshot();
-          case 'browser_take_screenshot':
-            return await this.screenshot(args);
-          case 'browser_type':
-            return await this.type(args);
-          case 'browser_click':
-            return await this.click(args);
-          default:
-            return errorResult(`Tool "${request.params.name}" not found`);
-        }
-      } catch (error) {
-        return errorResult(error instanceof Error ? error.message : String(error));
-      }
-    });
-    return server;
-  }
-
-  private async ensurePage(): Promise<Page> {
-    if (!this.browser) {
-      const browserSessionId = this.state.browserSessionId ?? (await this.getStored('browserSessionId'));
-      if (browserSessionId) {
-        console.log('[playwright-mcp] connect browser start');
-        this.browser = await connect(this.env.BROWSER, browserSessionId);
-        console.log('[playwright-mcp] connect browser ok');
-      } else {
-        console.log('[playwright-mcp] launch browser start');
-        this.browser = await launch(this.env.BROWSER, { keep_alive: 600_000 });
-        const sessionId = this.browser.sessionId();
-        await this.putStored('browserSessionId', sessionId);
-        this.setState({ ...this.state, browserSessionId: sessionId });
-        console.log('[playwright-mcp] launch browser ok');
-      }
-    }
-    if (!this.page) {
-      const existingPage = this.browser.contexts()[0]?.pages()[0];
-      if (existingPage) {
-        this.page = existingPage;
-      } else {
-        console.log('[playwright-mcp] new page start');
-        this.page = await this.browser.newPage();
-        console.log('[playwright-mcp] new page ok');
-      }
-    }
-    return this.page;
-  }
-
-  private async navigate(url: string): Promise<ToolResult> {
-    if (!url) return errorResult('url is required');
-    const page = await this.ensurePage();
-    console.log('[playwright-mcp] goto start');
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    console.log('[playwright-mcp] goto ok');
-    const snapshot = await this.captureSnapshot(page);
-    const screenshot = await page.screenshot({ type: 'png' });
-    await this.putStored('lastSnapshot', snapshot);
-    await this.putStored('lastScreenshotBytes', String(screenshot.byteLength));
-    this.setState({
-      ...this.state,
-      lastSnapshot: snapshot,
-      lastScreenshotBytes: screenshot.byteLength,
-    });
-    return textResult(`Navigated to ${page.url()}\nPage Title: ${await page.title()}`);
-  }
-
-  private async snapshot(): Promise<ToolResult> {
-    const storedSnapshot = this.state.lastSnapshot ?? (await this.getStored('lastSnapshot'));
-    if (storedSnapshot) return textResult(storedSnapshot);
-    const page = await this.ensurePage();
-    return textResult(await this.captureSnapshot(page));
-  }
-
-  private async captureSnapshot(page: Page): Promise<string> {
-    return page.evaluate(() => {
-      const lines: string[] = [];
-      let index = 0;
-      const interactiveSelector = [
-        'a',
-        'button',
-        'input',
-        'textarea',
-        'select',
-        '[role="button"]',
-        '[role="textbox"]',
-        '[contenteditable="true"]',
-      ].join(',');
-      const labelFor = (element: Element): string => {
-        const aria = element.getAttribute('aria-label');
-        if (aria) return aria.trim();
-        const labelledBy = element.getAttribute('aria-labelledby');
-        if (labelledBy) {
-          const text = labelledBy
-            .split(/\s+/)
-            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
-            .filter(Boolean)
-            .join(' ');
-          if (text) return text;
-        }
-        const placeholder = element.getAttribute('placeholder');
-        if (placeholder) return placeholder.trim();
-        const value = element.getAttribute('value');
-        const text = element.textContent?.replace(/\s+/g, ' ').trim();
-        return (text || value || element.getAttribute('name') || element.tagName.toLowerCase()).slice(0, 120);
-      };
-      const roleFor = (element: Element): string => {
-        const role = element.getAttribute('role');
-        if (role) return role;
-        const tag = element.tagName.toLowerCase();
-        if (tag === 'textarea') return 'textbox';
-        if (tag === 'input') return (element.getAttribute('type') || 'text') === 'submit' ? 'button' : 'textbox';
-        if (tag === 'a') return 'link';
-        return tag;
-      };
-      lines.push(`URL: ${location.href}`);
-      lines.push(`Title: ${document.title}`);
-      const heading = document.querySelector('h1,h2,main');
-      if (heading?.textContent?.trim()) {
-        lines.push(`Main: ${heading.textContent.replace(/\s+/g, ' ').trim().slice(0, 300)}`);
-      }
-      for (const element of Array.from(document.querySelectorAll(interactiveSelector)).slice(0, 80)) {
-        const rect = element.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        const ref = `e${index++}`;
-        element.setAttribute('data-makoto-pw-ref', ref);
-        lines.push(`- ${roleFor(element)} "${labelFor(element)}" [ref=${ref}]`);
-      }
-      return lines.join('\n');
-    });
-  }
-
-  private async screenshot(args: Record<string, unknown>): Promise<ToolResult> {
-    const storedBytes = this.state.lastScreenshotBytes ?? Number((await this.getStored('lastScreenshotBytes')) ?? '');
-    if (storedBytes) {
-      const type = args.type === 'jpeg' ? 'jpeg' : 'png';
-      const filename = typeof args.filename === 'string' && args.filename ? args.filename : `screenshot.${type}`;
-      return textResult(`Screenshot of viewport\nSaved: ${filename}\nBytes: ${storedBytes}`);
-    }
-    const page = await this.ensurePage();
-    const type = args.type === 'jpeg' ? 'jpeg' : 'png';
-    const filename = typeof args.filename === 'string' && args.filename ? args.filename : `screenshot.${type}`;
-    const bytes = await page.screenshot({ type });
-    return {
-      content: [
-        { type: 'text', text: `Screenshot of viewport\nSaved: ${filename}\nBytes: ${bytes.byteLength}` },
-      ],
-    };
-  }
-
-  private async type(args: Record<string, unknown>): Promise<ToolResult> {
-    const page = await this.ensurePage();
-    const ref = String(args.ref ?? '');
-    const text = String(args.text ?? '');
-    if (!ref) return errorResult('ref is required');
-    const locator = page.locator(`[data-makoto-pw-ref="${cssEscape(ref)}"]`).first();
-    await locator.waitFor({ state: 'visible', timeout: 10_000 });
+  async receive(request: Request): Promise<void> {
+    let parsed: JSONRPCMessage;
     try {
-      await locator.fill(text, { timeout: 10_000 });
-    } catch {
-      await locator.click();
-      await page.keyboard.type(text);
+      parsed = JSONRPCMessageSchema.parse(await request.json());
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.onerror?.(err);
+      throw err;
     }
-    if (args.submit === true) await page.keyboard.press('Enter');
-    return textResult(`Typed into ref=${ref}`);
+    this.onmessage?.(parsed, { requestInfo: { headers: request.headers, url: new URL(request.url) } });
   }
 
-  private async click(args: Record<string, unknown>): Promise<ToolResult> {
-    const page = await this.ensurePage();
-    const ref = String(args.ref ?? '');
-    if (!ref) return errorResult('ref is required');
-    const locator = page.locator(`[data-makoto-pw-ref="${cssEscape(ref)}"]`).first();
-    await locator.waitFor({ state: 'visible', timeout: 10_000 });
-    if (args.doubleClick === true) await locator.dblclick();
-    else await locator.click();
-    return textResult(`Clicked ref=${ref}`);
+  async close(): Promise<void> {
+    try {
+      await this.writer.close();
+    } catch {
+      // Stream may already be closed by the client.
+    }
+    this.onclose?.();
   }
 }
 
-function textResult(text: string): ToolResult {
-  return { content: [{ type: 'text', text }] };
+export class PlaywrightMCP extends DurableObject<Cloudflare.Env> {
+  private connection?: McpConnection;
+  private transport?: DurableSseTransport;
+  private sessionId?: string;
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === '/sse/connect') {
+      return this.openSse(request);
+    }
+    if (request.method === 'POST' && url.pathname === '/sse/message') {
+      return this.postMessage(request);
+    }
+    return new Response('not found', { status: 404 });
+  }
+
+  private async openSse(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get('sessionId') ?? DEFAULT_SESSION_ID;
+    await this.connection?.server.close().catch(() => undefined);
+
+    const { readable, writable } = new TransformStream<Uint8Array>();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    const endpointUrl = new URL(request.url);
+    endpointUrl.pathname = '/sse/message';
+    endpointUrl.searchParams.set('sessionId', sessionId);
+    void writer.write(encoder.encode(`event: endpoint\ndata: ${endpointUrl.pathname + endpointUrl.search}\n\n`)).catch((error) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.transport?.onerror?.(err);
+    });
+
+    this.sessionId = sessionId;
+    this.transport = new DurableSseTransport(sessionId, writer);
+    this.connection ??= await createConnection({
+      capabilities: MCP_CAPABILITIES,
+      browser: {
+        cdpEndpoint: launchEndpoint(this.env, sessionId),
+        isolated: true,
+      },
+    });
+    await this.connection.server.connect(this.transport as any);
+
+    return new Response(readable, {
+      headers: {
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        'content-type': 'text/event-stream',
+      },
+    });
+  }
+
+  private async postMessage(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get('sessionId');
+    if (!sessionId || sessionId !== this.sessionId || !this.transport) {
+      return new Response('SSE connection not established', { status: 500 });
+    }
+    await this.transport.receive(request);
+    return new Response('Accepted', {
+      status: 202,
+      headers: {
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        'content-type': 'text/event-stream',
+      },
+    });
+  }
 }
 
-function errorResult(text: string): ToolResult {
-  return { content: [{ type: 'text', text }], isError: true };
+function launchEndpoint(env: Cloudflare.Env, mcpSessionId: string): string {
+  const bindingKey = Object.keys(env).find((key) => env[key as keyof Cloudflare.Env] === env.BROWSER);
+  if (!bindingKey) throw new Error('No BROWSER binding found');
+  const url = new URL('http://fake.host/v1/devtools/browser');
+  url.searchParams.set('browser_binding', bindingKey);
+  url.searchParams.set('mcp_session', mcpSessionId);
+  return url.toString();
 }
 
-function cssEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+function corsHeaders(): HeadersInit {
+  return {
+    'access-control-allow-headers': 'Content-Type, Authorization',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-origin': '*',
+  };
 }
-
-const mcpHandler = PlaywrightMCP.serve('/mcp', { binding: 'PLAYWRIGHT_MCP' });
-const sseHandler = PlaywrightMCP.serveSSE('/sse', { binding: 'PLAYWRIGHT_MCP' });
 
 function unauthorized(): Response {
   return new Response('unauthorized', {
@@ -395,10 +207,12 @@ async function safeBrowserSelftest(env: Cloudflare.Env): Promise<Response> {
 }
 
 export default {
-  async fetch(request: Request, env: Cloudflare.Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Cloudflare.Env): Promise<Response> {
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
+
     const url = new URL(request.url);
     if (url.pathname === '/healthz') {
-      return Response.json({ ok: true, service: 'makoto-playwright-mcp' });
+      return Response.json({ ok: true, service: 'makoto-playwright-mcp', implementation: 'official-direct-sse' });
     }
 
     const bearer = env.MCP_BEARER_TOKEN ?? '';
@@ -418,9 +232,22 @@ export default {
       return safeBrowserSelftest(env);
     }
 
-    if (url.pathname === '/sse' || url.pathname.startsWith('/sse/')) {
-      return sseHandler.fetch(request, env, ctx);
+    if (url.pathname === '/sse' && request.method === 'GET') {
+      const sessionId = url.searchParams.get('sessionId') ?? DEFAULT_SESSION_ID;
+      const id = env.PLAYWRIGHT_MCP.idFromName(`sse:${sessionId}`);
+      const connectUrl = new URL(request.url);
+      connectUrl.pathname = '/sse/connect';
+      connectUrl.searchParams.set('sessionId', sessionId);
+      return env.PLAYWRIGHT_MCP.get(id).fetch(new Request(connectUrl, request));
     }
-    return mcpHandler.fetch(request, env, ctx);
+
+    if (url.pathname === '/sse/message' && request.method === 'POST') {
+      const sessionId = url.searchParams.get('sessionId');
+      if (!sessionId) return new Response('Missing sessionId', { status: 400 });
+      const id = env.PLAYWRIGHT_MCP.idFromName(`sse:${sessionId}`);
+      return env.PLAYWRIGHT_MCP.get(id).fetch(request);
+    }
+
+    return new Response('not found', { status: 404 });
   },
 };

@@ -10,8 +10,15 @@
   },
   "dependencies": {
     "@cloudflare/playwright": "1.3.0",
+    "@cloudflare/playwright-mcp": "^0.0.5",
     "@modelcontextprotocol/sdk": "^1.17.0",
-    "agents": "^0.0.109"
+    "agents": "^0.0.109",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "overrides": {
+    "@cloudflare/playwright-mcp": {
+      "@cloudflare/playwright": "1.3.0"
+    }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250725.0",

@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-04",
   "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    "@cloudflare/playwright/fs": "./src/playwright-fs-stub.ts",
+    "@cloudflare/playwright/test": "./src/playwright-test-bridge.ts",
+  },
   "observability": {
     "enabled": true,
   },
