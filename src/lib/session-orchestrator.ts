@@ -629,8 +629,10 @@ export async function orchestrateChatTurn(
   if (input.speakerContextBlock) {
     speakerOpt.contextBlock = input.speakerContextBlock;
   }
+  const extraBlocks = input.extraContentBlocks ?? [];
   const envelopeOpts: Parameters<typeof buildUserMessageEnvelope>[1] = {
     speaker: speakerOpt,
+    hasExtraContent: extraBlocks.length > 0,
   };
   if (input.historyBlock) envelopeOpts.history = input.historyBlock;
   if (input.intent) envelopeOpts.intent = input.intent;
@@ -643,7 +645,6 @@ export async function orchestrateChatTurn(
   // `messages.create(messages=[{"role":"user","content":[text, image, document...]}])`
   // と並ぶ形式を取っており、Workers 側も同じ並び順を踏襲する (= 文書内容を
   // 読ませる前に user 意図 text を提示)。
-  const extraBlocks = input.extraContentBlocks ?? [];
   const userMessage: string | UserMessageContentBlock[] =
     extraBlocks.length === 0
       ? userMessageText

@@ -4,8 +4,8 @@
  * 構築) の byte 等価性を担保する。
  *
  * 主なケース:
- *   1. 最小 envelope
- *   2. low-information routing を per-turn envelope へ差し込まないこと
+ *   1. 最小 envelope + gated response budget
+ *   2. response budget (#289): 作業シグナルなしの低情報入力だけ hint を差し込む
  *   3. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
  *   4. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
  *   5. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
@@ -15,21 +15,25 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageEnvelope,
+  classifyResponseBudget,
   MAIL_INTENT_INSTRUCTIONS,
   MENTION_SECTION_HEADER,
 } from '../src/lib/user-message-envelope';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () => {
-  it('opts 全省略で `<context>` + `<user_message>` を返す', () => {
+  it('低情報入力なら response budget + `<context>` + `<user_message>` を返す', () => {
     const out = buildUserMessageEnvelope('こんにちは');
     expect(out).toBe(
-      '<context>space_type=UNKNOWN sender=</context>\n' +
+      '<response_budget budget=short low_information=true heavy_signal=false reasons=low_information_ack_or_question_start>' +
+        'この発話単体では作業要求なし。tool/bash/Drive/Calendar/Chat API/memory深掘りを使わず1-2文で返し、必要情報を待つ。' +
+        '</response_budget>\n' +
+        '<context>space_type=UNKNOWN sender=</context>\n' +
         '<user_message>こんにちは</user_message>',
     );
   });
 
-  it('speaker のみ指定で最小 `<context>` を出す (= 旧 session-orchestrator 中間版と同形)', () => {
+  it('低情報でなければ response budget なしで最小 `<context>` を出す', () => {
     const out = buildUserMessageEnvelope('hi', {
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
@@ -40,19 +44,67 @@ describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () =>
   });
 });
 
-describe('buildUserMessageEnvelope — system-prompt-only low-information routing', () => {
-  it('low-information 用 per-turn 指示を envelope に差し込まない', () => {
+describe('buildUserMessageEnvelope — response budget (#289)', () => {
+  it.each(['こんにちは', 'OK', 'y', 'ありがとう', '質問です', '聞いていいですか', '相談です'])(
+    '%s は作業シグナルなしの low-information として short budget にする',
+    (text) => {
+      const hint = classifyResponseBudget(text);
+      const out = buildUserMessageEnvelope(text);
+
+      expect(hint).toEqual({
+        budget: 'short',
+        lowInformation: true,
+        heavySignal: false,
+        reasons: ['low_information_ack_or_question_start'],
+      });
+      expect(out).toContain('<response_budget budget=short low_information=true heavy_signal=false');
+      expect(out).toContain('この発話単体では作業要求なし');
+      expect(out).toContain('必要情報を待つ');
+    },
+  );
+
+  it('質問開始の合図は context より前に response budget を置く', () => {
     const out = buildUserMessageEnvelope('質問です', {
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
+    const idxBudget = out.indexOf('<response_budget');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
 
+    expect(idxBudget).toBe(0);
+    expect(idxBudget).toBeLessThan(idxContext);
+    expect(idxContext).toBeLessThan(idxBody);
+    expect(out).not.toContain('<routing_instructions>');
+  });
+
+  it.each([
+    ['昨日の議事録見て', ['date_or_relative_date', 'meeting_or_minutes', 'work_request']],
+    ['217どうなってる？', ['issue_reference']],
+    ['本番反映して', ['production_or_deploy']],
+    ['メール確認して', ['external_material', 'work_request']],
+  ])('%s は短文でも heavy signal として response budget を出さない', (text, reasons) => {
+    const hint = classifyResponseBudget(text);
+    const out = buildUserMessageEnvelope(text);
+
+    expect(hint.budget).toBe('normal');
+    expect(hint.lowInformation).toBe(false);
+    expect(hint.heavySignal).toBe(true);
+    expect(hint.reasons).toEqual(expect.arrayContaining(reasons));
     expect(out).not.toContain('<response_budget');
     expect(out).not.toContain('<routing_instructions>');
-    expect(out).not.toContain('tool / bash / Drive / Calendar / Chat API / memory 深掘りを使わず');
-    expect(idxContext).toBe(0);
-    expect(idxContext).toBeLessThan(idxBody);
+  });
+
+  it('添付など追加 content block がある場合は短文でも response budget を出さない', () => {
+    const hint = classifyResponseBudget('OK', { hasExtraContent: true });
+    const out = buildUserMessageEnvelope('OK', { hasExtraContent: true });
+
+    expect(hint).toMatchObject({
+      budget: 'normal',
+      lowInformation: false,
+      heavySignal: true,
+    });
+    expect(hint.reasons).toContain('extra_content');
+    expect(out).not.toContain('<response_budget');
   });
 });
 

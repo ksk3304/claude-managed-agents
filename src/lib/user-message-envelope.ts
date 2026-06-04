@@ -15,11 +15,13 @@
  *   3. `intent` (任意) — Python には input 側 prefix なし。TS port 拡張で
  *      `[intent: /mail, source=mail_intent]` の hint を入れて agent context 質
  *      を上げる (回帰防止: opts.intent 未指定なら 0 bytes 追加 = 旧挙動互換)
- *   4. `history` (任意) — Python `history_md` + `\n\n## 今回のメンション\n`
+ *   4. `response_budget` (低情報入力のみ) — 挨拶・相づち・質問開始の合図
+ *      など、作業シグナルが無い turn だけ短く返すための hint。
+ *   5. `history` (任意) — Python `history_md` + `\n\n## 今回のメンション\n`
  *      (l.4195) を byte 等価で port
- *   5. `roster` (任意) — Python `_build_space_roster_block` 出力を speaker
+ *   6. `roster` (任意) — Python `_build_space_roster_block` 出力を speaker
  *      block 直後に prepend (l.4244-4253)
- *   6. body — raw user text (mention strip 済 = caller 責務)
+ *   7. body — raw user text (mention strip 済 = caller 責務)
  *
  * 設計方針:
  *   - 純関数 (= I/O / 例外 / global state なし、入力同値 → 出力同値)
@@ -131,6 +133,11 @@ export interface BuildUserMessageEnvelopeOptions {
   intent?: IntentEnvelopeOption;
   speaker?: SpeakerEnvelopeOption;
   /**
+   * 添付や document/image/text block が user.message に追加される場合は true。
+   * 本文が短くても添付そのものが作業対象なので low-information hint は出さない。
+   */
+  hasExtraContent?: boolean;
+  /**
    * Python `history_md` (l.4194) と byte 等価。`## スレッド過去履歴...`
    * を含む完成形 string を caller が渡す (組立は `chat-history.ts` 責務)。
    * 非空時のみ `\n\n## 今回のメンション\n` を後段に付けて body と連結する。
@@ -158,6 +165,74 @@ export const MAIL_INTENT_INSTRUCTIONS =
   '- 宛先が無い場合、または件名/内容/本文の素材が何も無い場合だけ、不足項目を聞き返す。\n' +
   '- 宛先・cc・bcc は推測しない。\n' +
   '</mail_intent_instructions>';
+
+export interface ResponseBudgetHint {
+  budget: 'short' | 'normal';
+  lowInformation: boolean;
+  heavySignal: boolean;
+  reasons: string[];
+}
+
+const LOW_INFORMATION_RE =
+  /^(?:こんにちは|こんばんは|おはよう(?:ございます)?|お疲れ(?:様|さま)?(?:です)?|ありがとう(?:ございます)?|感謝|了解(?:です)?|承知(?:です)?|はい|うん|なるほど|助かる|助かりました|質問(?:です|があります)?|聞いて(?:いい|もいい)(?:ですか)?|相談(?:です|があります)?|ちょっと質問|ok|okay|y|yes|thanks?|thx)[\s。、.!！?？〜~ー-]*$/iu;
+
+const HEAVY_SIGNAL_RULES: ReadonlyArray<[string, RegExp]> = [
+  ['issue_reference', /(?:#\d{1,6}|\b\d{2,6}\s*(?:どう|どこ|進捗|状況|終わ|閉じ|close|やって|着手|確認|見て|直して|修正|実装|デプロイ|deploy|本番))/iu],
+  ['date_or_relative_date', /(?:昨日|今日|明日|一昨日|先週|今週|来週|先月|今月|来月|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})/iu],
+  ['meeting_or_minutes', /(?:議事録|朝MTG|mtg|会議|ミーティング)/iu],
+  ['external_material', /(?:https?:\/\/|資料|外部資料|添付|pdf|docx?|xlsx?|pptx?|drive|sheet|calendar|gmail|agentmail|メール)/iu],
+  ['production_or_deploy', /(?:本番反映|本番|deploy|デプロイ|rollback|ロールバック)/iu],
+  ['work_request', /(?:調査|確認して|見て|読んで|作って|直して|修正|実装|テスト|ログ|エラー|動かない|壊れ|送って|送信|探して|調べ)/iu],
+];
+
+function normalizeBudgetText(bodyText: string): string {
+  return (bodyText ?? '').normalize('NFKC').trim();
+}
+
+export function classifyResponseBudget(
+  bodyText: string,
+  opts: Pick<BuildUserMessageEnvelopeOptions, 'hasExtraContent'> = {},
+): ResponseBudgetHint {
+  const text = normalizeBudgetText(bodyText);
+  const reasons = HEAVY_SIGNAL_RULES
+    .filter(([, re]) => re.test(text))
+    .map(([reason]) => reason);
+  if (opts.hasExtraContent) {
+    reasons.push('extra_content');
+  }
+  const heavySignal = reasons.length > 0;
+  const lowInformation = !heavySignal && LOW_INFORMATION_RE.test(text);
+
+  if (lowInformation) {
+    return {
+      budget: 'short',
+      lowInformation: true,
+      heavySignal: false,
+      reasons: ['low_information_ack_or_question_start'],
+    };
+  }
+
+  return {
+    budget: 'normal',
+    lowInformation: false,
+    heavySignal,
+    reasons: heavySignal ? reasons : ['default'],
+  };
+}
+
+function buildResponseBudgetSegment(
+  bodyText: string,
+  opts: BuildUserMessageEnvelopeOptions,
+): string {
+  const hint = classifyResponseBudget(bodyText, opts);
+  if (!hint.lowInformation) return '';
+  return (
+    `<response_budget budget=short low_information=true heavy_signal=false ` +
+    `reasons=${hint.reasons.join(',')}>` +
+    'この発話単体では作業要求なし。tool/bash/Drive/Calendar/Chat API/memory深掘りを使わず1-2文で返し、必要情報を待つ。' +
+    '</response_budget>'
+  );
+}
 
 /**
  * speaker block を最小 `<context>...</context>` で組み立てる。
@@ -252,13 +327,14 @@ function buildBodySegment(
  *   ```
  *   <cap-notice (if opts.cap.noticePrefix)>
  *   <intent (if opts.intent)>
+ *   <response_budget (only if low-information and no heavy signal)>
  *   <speaker context>
  *   <roster (if opts.roster)>
  *   <user_message body or recovery prompt>
  *   ```
  *
- * - 全 opts 未指定 → `<context>...\n<user_message>...`
- *   (= low-information routing は system prompt 側だけで扱う)
+ * - low-information かつ heavy signal なし → `<response_budget>...` を context 前に追加
+ * - heavy signal あり / 通常入力 → response budget hint は 0 bytes
  * - cap.recovery=true → body 完全差し替え (Python recovery semantics)
  *
  * @param bodyText mention strip 済 raw 本文 (caller 責務)。cap-recovery の
@@ -288,16 +364,22 @@ export function buildUserMessageEnvelope(
     segments.push(mailIntentInstructions);
   }
 
-  // 3. speaker context (= 旧 `<context>` 等価 + Python `_build_space_context_block`)
+  // 3. response budget hint (#289)。低情報かつ作業シグナルなしの時だけ出す。
+  const responseBudgetSeg = buildResponseBudgetSegment(bodyText, opts);
+  if (responseBudgetSeg) {
+    segments.push(responseBudgetSeg);
+  }
+
+  // 4. speaker context (= 旧 `<context>` 等価 + Python `_build_space_context_block`)
   segments.push(buildSpeakerSegment(opts.speaker));
 
-  // 4. roster block (Python l.4244-4253)
+  // 5. roster block (Python l.4244-4253)
   const rosterSeg = buildRosterSegment(opts.roster);
   if (rosterSeg) {
     segments.push(rosterSeg);
   }
 
-  // 5. body / recovery (Python l.4195 byte 等価)
+  // 6. body / recovery (Python l.4195 byte 等価)
   segments.push(buildBodySegment(bodyText, opts.history, opts.cap));
 
   // 単一改行で連結 = 既存 envelope `<context>...</context>\n<user_message>...`
