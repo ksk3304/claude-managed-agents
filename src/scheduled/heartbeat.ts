@@ -222,7 +222,7 @@ export function buildHeartbeatChatEvent(
         displayName: 'MAKOTO Scheduler',
         email: task.owner_user_id,
       },
-      text: `${todayPrefix(nowMs)}${heartbeatPrompt(task.prompt)}`,
+      text: `${todayPrefix(nowMs)}${heartbeatPrompt(task.prompt, targetScope)}`,
       ...(threadName ? { thread: { name: threadName } } : {}),
       annotations: [],
       attachment: [],
@@ -477,6 +477,7 @@ async function hydrateAgentMailMessageBody(
 }
 
 function buildAsyncWaitResumePrompt(task: HeartbeatTaskRow, state: MailReplyWaitState): string {
+  const targetText = task.target_scope === 'shared' ? 'この共有スレッドへ' : '本人DMへ';
   const replies = state.matched
     .map((match, index) =>
       [
@@ -492,7 +493,7 @@ function buildAsyncWaitResumePrompt(task: HeartbeatTaskRow, state: MailReplyWait
   return `${task.prompt.trim()}
 
 # 非同期継続
-待っていたメール返信が揃いました。以下の返信内容を元に、本人DMへ短く集計・次アクション案を出してください。
+待っていたメール返信が揃いました。以下の返信内容を元に、${targetText}短く集計・次アクション案を出してください。
 
 期待返信者:
 ${state.expected.map((email) => `- ${email}`).join('\n')}
@@ -511,12 +512,13 @@ function normalizeEmail(value: string): string {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw) ? raw : '';
 }
 
-function heartbeatPrompt(prompt: string): string {
+function heartbeatPrompt(prompt: string, targetScope: string): string {
+  const targetText = targetScope === 'shared' ? 'この共有スレッドに' : '本人DMに';
   return `${prompt.trim()}
 
 # 出力規約（最優先）
 - 通知すべき内容が無い場合は、本文を次の 1 行だけにする: ${HEARTBEAT_NOTHING_MARKER}
-- 通知すべき内容がある場合は、本人 DM にそのまま出す短い本文だけを書く。
+- 通知すべき内容がある場合は、${targetText}そのまま出す短い本文だけを書く。
 - 内部状態・ツール名・session 名・store 名・実装事情を書かない。
 - メール送信、共有スペース投稿、外部変更は勝手に実行せず、必要なら提案だけにする。`;
 }

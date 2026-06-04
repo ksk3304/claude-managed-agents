@@ -20,9 +20,14 @@ export function isMailSendApprovalText(text: string): boolean {
 export function hasPendingMailSendDraft(historyBlock: string): boolean {
   const text = historyBlock.trim();
   if (!text) return false;
-  const hasFields = /宛先\s*[:：]/.test(text) && /件名\s*[:：]/.test(text) && /本文\s*[:：]/.test(text);
+  const hasBody =
+    /本文\s*[:：]/.test(text) ||
+    (/結果メール案|メール案|送信確認待ち/.test(text) && /```[\s\S]+```/.test(text));
+  const hasFields = /宛先\s*[:：]/.test(text) && /件名\s*[:：]/.test(text) && hasBody;
   const asksConfirmation =
     /送ってよいですか/.test(text) ||
+    /送信してよろしければ/.test(text) ||
+    /送って.*(お声がけ|ください)/.test(text) ||
     /送信しますか/.test(text) ||
     /このまま送信/.test(text) ||
     /このままお送り/.test(text) ||
