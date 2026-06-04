@@ -76,6 +76,22 @@ describe('Playwright MCP config', () => {
     });
   });
 
+  it('accepts SSE endpoints for Cloudflare MCP servers', () => {
+    const config = buildPlaywrightMcpConfig({
+      PLAYWRIGHT_MCP_URL: 'https://playwright.example.com/sse',
+      PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED: '1',
+    } as Env);
+    expect(config).toMatchObject({
+      status: 'configured',
+      attach: true,
+      server: {
+        name: 'playwright',
+        type: 'url',
+        url: 'https://playwright.example.com/sse',
+      },
+    });
+  });
+
   it('allows local loopback only for explicit smoke tests', () => {
     const config = buildPlaywrightMcpConfig({
       PLAYWRIGHT_MCP_URL: 'http://127.0.0.1:8931/mcp',

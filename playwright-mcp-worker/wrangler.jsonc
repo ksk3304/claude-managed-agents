@@ -10,6 +10,12 @@
   "browser": {
     "binding": "BROWSER",
   },
+  "kv_namespaces": [
+    {
+      "binding": "MAKOTO_KV",
+      "id": "1d58a2a715044909972de6cc2a0e9f40",
+    },
+  ],
   "durable_objects": {
     "bindings": [
       {
