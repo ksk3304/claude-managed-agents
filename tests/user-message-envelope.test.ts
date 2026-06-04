@@ -158,6 +158,7 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
     expect(out).toContain(MAIL_INTENT_INSTRUCTIONS);
     expect(out).toContain('こんにちはメール');
     expect(out).toContain('EMAIL_SEND');
+    expect(out).toContain('A宛cc=C と B宛cc=C の2通');
     // intent は context より前、body より前
     const idxIntent = out.indexOf('<intent>');
     const idxMailInstructions = out.indexOf('<mail_intent_instructions>');
@@ -189,6 +190,7 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
     expect(out).toContain('<intent>command=/mail source=slash_command action_skill=true</intent>');
     expect(out).toContain('<mail_intent_instructions>');
     expect(out).toContain('「こんにちはメール」は件名「こんにちは」、本文「こんにちは」で足りる');
+    expect(out).toContain('回答対象を `cc` に回さない');
   });
 });
 

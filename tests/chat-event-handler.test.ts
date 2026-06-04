@@ -1081,6 +1081,77 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('Case 1-async-wait-cc: A/B are reply targets and shared C stays CC-only', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text:
+        'keisukeseto.89103@gmail.com と mahirock0723@gmail.com にレビュー依頼して、全メールに takei@makotoprime.com をCCして。返信が揃ったら集計して再開してください。',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_async_wait_cc_register',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            '送信します。\n' +
+            'EMAIL_SEND:{"to":"keisukeseto.89103@gmail.com","cc":["takei@makotoprime.com"],"subject":"レビュー依頼","body":"レビューをお願いします。"}\n' +
+            'EMAIL_SEND:{"to":"mahirock0723@gmail.com","cc":["takei@makotoprime.com"],"subject":"レビュー依頼","body":"レビューをお願いします。"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const amPayloads: Array<Record<string, unknown>> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (_url, init) => {
+      amPayloads.push(JSON.parse(init.body as string));
+      return new Response(
+        JSON.stringify({
+          message_id: `msg_out_${amPayloads.length}`,
+          rfc822_message_id: `<out-${amPayloads.length}@example.com>`,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(amPayloads).toHaveLength(2);
+      expect(amPayloads.map((p) => p.to)).toEqual([
+        ['keisukeseto.89103@gmail.com'],
+        ['mahirock0723@gmail.com'],
+      ]);
+      expect(amPayloads.map((p) => p.cc)).toEqual([
+        ['takei@makotoprime.com'],
+        ['takei@makotoprime.com'],
+      ]);
+
+      const sent = (env.DB as unknown as { _tables: { sent_messages: Map<string, unknown> } })
+        ._tables.sent_messages;
+      expect(sent.size).toBe(2);
+      expect(
+        Array.from(sent.values()).map((row) => (row as { to_addr?: string }).to_addr),
+      ).toEqual(['keisukeseto.89103@gmail.com', 'mahirock0723@gmail.com']);
+
+      const tasks = (env.DB as unknown as { _tables: { heartbeat_tasks: Map<string, Record<string, unknown>> } })
+        ._tables.heartbeat_tasks;
+      expect(tasks.size).toBe(1);
+      const task = Array.from(tasks.values())[0]!;
+      expect(JSON.parse(String(task.thread_ref))).toMatchObject({
+        expected_from: ['keisukeseto.89103@gmail.com', 'mahirock0723@gmail.com'],
+        subject_contains: 'レビュー依頼',
+      });
+      expect(String(task.user_visible_status)).toBe('waiting for mail replies (0/2)');
+      expect(chatApiMock.patches.at(-1)?.text).toContain('対象: 2件');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 1-async-wait-shared: shared mail survey registers async_wait to original thread', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({
