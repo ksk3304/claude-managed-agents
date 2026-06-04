@@ -4,12 +4,22 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-04",
   "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    "@cloudflare/playwright/fs": "./src/playwright-fs-stub.ts",
+    "@cloudflare/playwright/test": "./src/playwright-test-bridge.ts",
+  },
   "observability": {
     "enabled": true,
   },
   "browser": {
     "binding": "BROWSER",
   },
+  "kv_namespaces": [
+    {
+      "binding": "MAKOTO_KV",
+      "id": "1d58a2a715044909972de6cc2a0e9f40",
+    },
+  ],
   "durable_objects": {
     "bindings": [
       {

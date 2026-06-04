@@ -354,7 +354,7 @@ Optional secrets:
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | Browser Rendering REST tools |
 | `ANTHROPIC_BASE_URL` | Override (defaults to `https://api.anthropic.com`) |
-| `PLAYWRIGHT_MCP_URL` | Optional URL-based Playwright MCP endpoint for the existing MAKOTO employee agent. Must point at `/mcp`. Production attach is disabled unless the URL is HTTPS and `PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED=1`. |
+| `PLAYWRIGHT_MCP_URL` | Optional URL-based Playwright MCP endpoint for the existing MAKOTO employee agent. Must point at `/mcp` or `/sse`. Production attach is disabled unless the URL is HTTPS and `PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED=1`. |
 | `PLAYWRIGHT_MCP_ENABLED_TOOLS` | Optional comma-separated Playwright MCP tool allowlist. Defaults to `browser_navigate,browser_snapshot`. Explicit test sessions may also enable `browser_take_screenshot,browser_type,browser_click`; execution tools such as `browser_evaluate` remain blocked. |
 | `PLAYWRIGHT_MCP_AUTH_BOUNDARY_CONFIRMED` | Set to `1` only after confirming the external MCP endpoint is not unauthenticated public access. |
 | `PLAYWRIGHT_MCP_ALLOW_INSECURE_LOCAL` | Local smoke-only opt-in for `http://127.0.0.1:8931/mcp` or localhost. Do not use for production. |
@@ -377,7 +377,7 @@ npm run deploy
 After deployment, point the control-plane Worker at the stable endpoint:
 
 ```bash
-printf '%s' 'https://makoto-playwright-mcp.<account-subdomain>.workers.dev/mcp' \
+printf '%s' 'https://makoto-playwright-mcp.<account-subdomain>.workers.dev/sse' \
   | npx wrangler secret put PLAYWRIGHT_MCP_URL --name claude-managed-agents-control-plane
 printf '%s' '<anthropic-vault-id-containing-static-bearer-for-the-same-url>' \
   | npx wrangler secret put PLAYWRIGHT_MCP_VAULT_ID --name claude-managed-agents-control-plane
