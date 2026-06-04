@@ -513,7 +513,8 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
       return objectSchema(
         {
           action: enumProp(['search', 'get'], 'search for messages or get one message.'),
-          message_id: stringProp('Required for get. AgentMail message id.'),
+          message_id: stringProp('For get. AgentMail message id from search result id/message_id.'),
+          thread_id: stringProp('For get fallback. AgentMail thread id from search result thread_id.'),
           from_contains: stringProp('Optional sender substring for search.'),
           subject_contains: stringProp('Optional subject substring for search.'),
           query: stringProp('Optional broad metadata query for search.'),

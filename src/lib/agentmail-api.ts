@@ -96,6 +96,12 @@ export interface SendMessageResult {
   rfc822_message_id: string;
 }
 
+export interface AgentMailThread {
+  thread_id?: string;
+  messages?: AgentMailMessage[];
+  [extra: string]: unknown;
+}
+
 export class AgentMailClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
@@ -142,6 +148,16 @@ export class AgentMailClient {
     const path = `/inboxes/${encodeURIComponent(inboxId)}/messages/${encodeURIComponent(messageId)}`;
     const r = await this.request<AgentMailMessage>('GET', path);
     return r;
+  }
+
+  /**
+   * `GET /inboxes/{inboxId}/threads/{threadId}` — fetch a thread and
+   * its messages. Used as the safe fallback when message list results
+   * carry `thread_id` but no directly retrievable message id.
+   */
+  async getThread(inboxId: string, threadId: string): Promise<AgentMailThread> {
+    const path = `/inboxes/${encodeURIComponent(inboxId)}/threads/${encodeURIComponent(threadId)}`;
+    return await this.request<AgentMailThread>('GET', path);
   }
 
   /**

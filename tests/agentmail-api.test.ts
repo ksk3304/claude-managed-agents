@@ -145,6 +145,23 @@ describe('AgentMailClient.getMessage', () => {
   });
 });
 
+describe('AgentMailClient.getThread', () => {
+  it('GETs the thread and returns messages', async () => {
+    const fetchMock = makeFetchMock(async (url, init) => {
+      expect(init.method).toBe('GET');
+      expect(url).toBe(`https://api.agentmail.to/v0/inboxes/${INBOX}/threads/thread_x`);
+      return jsonResponse(200, {
+        thread_id: 'thread_x',
+        messages: [{ message_id: '<m@example.com>', text: 'body' }],
+      });
+    });
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+    const thread = await client.getThread(INBOX, 'thread_x');
+    expect(thread.thread_id).toBe('thread_x');
+    expect(thread.messages?.[0]?.text).toBe('body');
+  });
+});
+
 describe('AgentMailClient.listMessages', () => {
   it('includes spam by default for polling-style readers', async () => {
     const fetchMock = makeFetchMock(async (url, init) => {
