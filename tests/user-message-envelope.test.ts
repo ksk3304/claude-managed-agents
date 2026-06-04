@@ -4,32 +4,27 @@
  * 構築) の byte 等価性を担保する。
  *
  * 主なケース:
- *   1. 最小 envelope + response budget + routing instructions
- *   2. response budget (#289)
- *   3. routing instructions (#217)
- *   4. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
- *   5. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
- *   6. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
- *   7. cap-recovery (body 完全差し替え = Python recovery semantics)
+ *   1. 最小 envelope
+ *   2. low-information routing を per-turn envelope へ差し込まないこと
+ *   3. history 層 (Python l.4195 `\n\n## 今回のメンション\n` byte 等価)
+ *   4. intent 層 (TS port 拡張 — 未指定なら 0 bytes、指定時 `<intent>` tag)
+ *   5. speaker contextBlock (Python `_build_space_context_block` 完成形貼付)
+ *   6. cap-recovery (body 完全差し替え = Python recovery semantics)
  */
 
 import { describe, it, expect } from 'vitest';
 import {
   buildUserMessageEnvelope,
-  classifyResponseBudget,
   MAIL_INTENT_INSTRUCTIONS,
   MENTION_SECTION_HEADER,
-  ROUTING_INSTRUCTIONS,
 } from '../src/lib/user-message-envelope';
 import { RECOVERY_PROMPT } from '../src/lib/cap-recovery';
 
 describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () => {
-  it('opts 全省略で routing instructions + `<context>` + `<user_message>` を返す', () => {
+  it('opts 全省略で `<context>` + `<user_message>` を返す', () => {
     const out = buildUserMessageEnvelope('こんにちは');
     expect(out).toBe(
-      '<response_budget budget=short low_information=true heavy_signal=false reasons=low_information_ack_or_greeting></response_budget>\n' +
-        `${ROUTING_INSTRUCTIONS}\n` +
-        '<context>space_type=UNKNOWN sender=</context>\n' +
+      '<context>space_type=UNKNOWN sender=</context>\n' +
         '<user_message>こんにちは</user_message>',
     );
   });
@@ -39,78 +34,25 @@ describe('buildUserMessageEnvelope — 最小 envelope (旧挙動互換)', () =>
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
     expect(out).toBe(
-      '<response_budget budget=normal low_information=false heavy_signal=false reasons=default></response_budget>\n' +
-        `${ROUTING_INSTRUCTIONS}\n` +
-        '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n' +
+      '<context>space_type=DM sender=k.seto@makotoprime.com</context>\n' +
         '<user_message>hi</user_message>',
     );
   });
 });
 
-describe('buildUserMessageEnvelope — response budget (#289)', () => {
-  it.each(['こんにちは', 'OK', 'y', 'ありがとう'])('%s は low-information として short budget にする', (text) => {
-    const hint = classifyResponseBudget(text);
-    const out = buildUserMessageEnvelope(text);
-
-    expect(hint).toEqual({
-      budget: 'short',
-      lowInformation: true,
-      heavySignal: false,
-      reasons: ['low_information_ack_or_greeting'],
-    });
-    expect(out).toContain(
-      '<response_budget budget=short low_information=true heavy_signal=false reasons=low_information_ack_or_greeting></response_budget>',
-    );
-  });
-
-  it.each([
-    ['昨日の議事録見て', ['date_or_relative_date', 'meeting_or_minutes', 'work_request']],
-    ['217どうなってる？', ['issue_reference']],
-    ['本番反映して', ['production_or_deploy']],
-  ])('%s は短文でも heavy signal として normal budget にする', (text, reasons) => {
-    const hint = classifyResponseBudget(text);
-    const out = buildUserMessageEnvelope(text);
-
-    expect(hint.budget).toBe('normal');
-    expect(hint.lowInformation).toBe(false);
-    expect(hint.heavySignal).toBe(true);
-    expect(hint.reasons).toEqual(expect.arrayContaining(reasons));
-    expect(out).toContain('budget=normal low_information=false heavy_signal=true');
-    for (const reason of reasons) {
-      expect(out).toContain(reason);
-    }
-  });
-
-  it('response budget は routing instructions と context より前に置く', () => {
-    const out = buildUserMessageEnvelope('OK', {
-      speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
-    });
-    const idxBudget = out.indexOf('<response_budget');
-    const idxRouting = out.indexOf('<routing_instructions>');
-    const idxContext = out.indexOf('<context>');
-
-    expect(idxBudget).toBe(0);
-    expect(idxBudget).toBeLessThan(idxRouting);
-    expect(idxRouting).toBeLessThan(idxContext);
-  });
-});
-
-describe('buildUserMessageEnvelope — routing instructions (#217)', () => {
-  it('lightweight 発話で tool / bash / API 深掘りを避ける指示を context 前に置く', () => {
+describe('buildUserMessageEnvelope — system-prompt-only low-information routing', () => {
+  it('low-information 用 per-turn 指示を envelope に差し込まない', () => {
     const out = buildUserMessageEnvelope('質問です', {
       speaker: { spaceType: 'DM', senderEmail: 'k.seto@makotoprime.com' },
     });
-    const idxRouting = out.indexOf('<routing_instructions>');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
-    const idxBudget = out.indexOf('<response_budget');
 
-    expect(idxBudget).toBe(0);
-    expect(idxBudget).toBeLessThan(idxRouting);
-    expect(idxRouting).toBeLessThan(idxContext);
+    expect(out).not.toContain('<response_budget');
+    expect(out).not.toContain('<routing_instructions>');
+    expect(out).not.toContain('tool / bash / Drive / Calendar / Chat API / memory 深掘りを使わず');
+    expect(idxContext).toBe(0);
     expect(idxContext).toBeLessThan(idxBody);
-    expect(out).toContain('tool / bash / Drive / Calendar / Chat API / memory 深掘りを使わず');
-    expect(out).toContain('入力中 placeholder は現在のユーザー依頼として扱わない');
   });
 });
 
@@ -162,16 +104,11 @@ describe('buildUserMessageEnvelope — intent 層 (TS port 拡張)', () => {
     // intent は context より前、body より前
     const idxIntent = out.indexOf('<intent>');
     const idxMailInstructions = out.indexOf('<mail_intent_instructions>');
-    const idxBudget = out.indexOf('<response_budget');
-    const idxRouting = out.indexOf('<routing_instructions>');
     const idxContext = out.indexOf('<context>');
     const idxBody = out.indexOf('<user_message>');
     expect(idxIntent).toBeLessThan(idxContext);
     expect(idxIntent).toBeLessThan(idxMailInstructions);
     expect(idxMailInstructions).toBeLessThan(idxContext);
-    expect(idxMailInstructions).toBeLessThan(idxBudget);
-    expect(idxBudget).toBeLessThan(idxRouting);
-    expect(idxRouting).toBeLessThan(idxContext);
     expect(idxContext).toBeLessThan(idxBody);
   });
 
