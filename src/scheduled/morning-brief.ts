@@ -24,14 +24,26 @@ const BRIEF_OUTPUT_RULES = `# 出力規約（最優先・絶対厳守）
 - あるセクションのデータが取得できなかった場合、その見出しの下に「（今回は該当データなし）」とだけ書き、理由・内部状態・できなかった事情は書かない。
 - 「attach されていない」「参照できません」「memory store」「一時的に」「エラー」等の語を本文に出さない。`;
 
+const ACTIVE_TASKS_READING_HINT = `# TODO読み取り方針（cc-secretary 参考）
+- ActiveTasks.md は、cc-secretary の Markdown TODO 管理の考え方を圧縮移植したものとして読む。
+- 可能なら「最優先」「通常」「余裕があれば」「完了」「メモ・振り返り」の見出しを前提に整理する。
+- [ ] は未完了、[x] は完了として扱う。
+- 「最優先」は今日中・重要、「通常」は今週中、「余裕があれば」は低優先度として扱う。
+- 期限切れ・当日期限・最優先を先に拾う。
+- 各TODOに対して、MAKOTOくんが次に手伝える具体行動（下書き、調査、整理、候補出し、文案化、リマインド等）を考える。
+- ActiveTasks.md が別形式でも、既存内容を壊さず読み、上記構造に近いものとして解釈する。
+- cc-secretary、ActiveTasks.md、見出し名、ファイル名、取得経路は本文に出さない。`;
+
 export const MORNING_BRIEF_SETO_PROMPT = `瀬戸さん向けの朝ブリーフを作成するタスク。情報収集（memory / issue 一覧 / session-log / Agent Core support の ActiveTasks.md 等の参照）はツールで自由に行ってよいが、テキストとして文章を出力するのは最終ブリーフ 1 回のみとする。
 
 ${BRIEF_OUTPUT_RULES}
 
+${ACTIVE_TASKS_READING_HINT}
+
 # ブリーフ本文（5 セクション）
 1. 直近 3 日分の日報サマリ（共有 / DM を区別して 1 行ずつ）
 2. 共有スペースで MAKOTOくん の返信待ち（最後の発話が人間）のスレッド
-3. 今日のTODO（Agent Core support の ActiveTasks.md を正本として読み、今やるべきものを最大 5 件。無ければ「該当なし」）
+3. 今日のTODO（ActiveTasks.md を正本として読み、最優先・期限切れ・当日期限を中心に最大 5 件。無ければ「該当なし」）
 4. status=open かつ 優先度=high の issue（無ければ「該当なし」）
 5. 瀬戸さんへの推奨アクション 1〜3 件（上記 1〜4 から導出。根拠を 1 行ずつ）
 
@@ -48,8 +60,10 @@ export const MIDDAY_BRIEF_SETO_PROMPT = `瀬戸さん向けの13時TODOチェッ
 
 ${BRIEF_OUTPUT_RULES}
 
+${ACTIVE_TASKS_READING_HINT}
+
 # ブリーフ本文（4 セクション）
-1. 13時時点のActiveTasks要約（今残っている重要TODOを最大 5 件。無ければ「該当なし」）
+1. 13時時点のTODO要約（最優先・期限切れ・当日期限・午前中に変化した項目を最大 5 件。無ければ「該当なし」）
 2. 午前中に進んだ / 変わった可能性があること（会話・日報・session-log から分かる範囲で短く）
 3. 午後にMAKOTOくんが手伝えること 1〜3 件
 4. 瀬戸さんへの次アクション 1〜3 件

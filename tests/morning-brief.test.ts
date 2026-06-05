@@ -47,6 +47,9 @@ describe('morning brief scheduled enqueue', () => {
     expect(event.message?.text).toContain('===BRIEF_FINAL===');
     expect(event.message?.text).toContain('今日のTODO');
     expect(event.message?.text).toContain('ActiveTasks.md');
+    expect(event.message?.text).toContain('cc-secretary');
+    expect(event.message?.text).toContain('最優先');
+    expect(event.message?.text).toContain('メモ・振り返り');
     expect(event.message?.text).toContain('内部状態・内部名を書かない');
     expect(event.message?.thread).toBeUndefined();
   });
@@ -62,6 +65,8 @@ describe('morning brief scheduled enqueue', () => {
     expect(event.message?.text).toContain('今日は 2026-05-25 (月) JST です。');
     expect(event.message?.text).toContain('13時TODOチェック');
     expect(event.message?.text).toContain('ActiveTasks.md');
+    expect(event.message?.text).toContain('cc-secretary');
+    expect(event.message?.text).toContain('期限切れ・当日期限');
     expect(event.message?.text).toContain('朝8:30の内容を暗記で再掲せず');
   });
 
