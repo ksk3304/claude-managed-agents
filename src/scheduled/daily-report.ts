@@ -2,11 +2,8 @@
  * Daily report runner — owner agent 単位の日報を Memory Store に書き込む
  * 定期実行バッチ.
  *
- * DM / shared space では分けない。発話者に紐づく owner agent の
- * `Makoto Prime_0001_session_log_store` のような company-numbered store から
- * `Makoto Prime_0001_daily_report_store` を作る。旧 mapping では
- * `agent_session_log_store` / `session_log_dm_store` 等を unified owner
- * store の legacy alias として扱う。
+ * user / agent 番号単位で `MAKOTO_Prime_000X_session_log` から
+ * `MAKOTO_Prime_000X_daily_report` を作る。DM / 共有スペースでは分けない。
  *
  * 入力ソース:
  *   - KV: `user_mapping:<email>` を全件 list (= Python の
@@ -29,12 +26,15 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import type { UserMappingValue } from '../lib/memory-attach';
 import { createSessionWithResources, sendAndStream } from '../lib/session';
+import { dateLabelToMemoryPath } from '../lib/session-log';
 
 // ============================================================================
 // Constants / route definitions
 // ============================================================================
 
-/** Owner-agent unified daily report route. */
+/**
+ * agent 番号単位の session_log → daily_report を 1 cron tick で巡回する.
+ */
 export interface ReportRoute {
   kind: 'owner_agent';
   source_store_name: string;
@@ -45,9 +45,9 @@ export interface ReportRoute {
 export const REPORT_ROUTES: readonly ReportRoute[] = [
   {
     kind: 'owner_agent',
-    source_store_name: 'agent_session_log_store',
-    target_store_name: 'agent_daily_report_store',
-    title: 'エージェント日報',
+    source_store_name: 'session_log',
+    target_store_name: 'daily_report',
+    title: '日報',
   },
 ] as const;
 
@@ -56,6 +56,9 @@ export const REPORT_ROUTES: readonly ReportRoute[] = [
  * store_name の attachment が無いとき instructions 文字列 substring 逆引き fallback.
  */
 const NEEDLES: Readonly<Record<string, readonly [string, string]>> = {
+  session_log: ['セッションログ', 'agent'],
+  daily_report: ['日報', 'agent'],
+  // legacy fallback
   agent_session_log_store: ['セッションログ', ''],
   agent_daily_report_store: ['日報', ''],
   session_log_dm_store: ['DM (個人 1:1)', 'セッションログ'],
@@ -125,6 +128,20 @@ export function storeIdFromEntry(
 
 function storeIdFromAliases(entry: UserMappingValue, storeName: string): string | null {
   const aliases: Readonly<Record<string, readonly string[]>> = {
+    session_log: [
+      'session_log',
+      'agent_session_log_store',
+      'session_log_store',
+      'session_log_dm_store',
+      'session_log_shared_store',
+    ],
+    daily_report: [
+      'daily_report',
+      'agent_daily_report_store',
+      'daily_report_store',
+      'daily_report_dm_store',
+      'daily_report_shared_store',
+    ],
     agent_session_log_store: [
       'agent_session_log_store',
       'session_log_store',
@@ -150,6 +167,8 @@ function storeIdFromAliases(entry: UserMappingValue, storeName: string): string 
 
 function storeIdFromNumberedAlias(entry: UserMappingValue, storeName: string): string | null {
   const patternByStore: Readonly<Record<string, RegExp>> = {
+    session_log: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+session_log$/i,
+    daily_report: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+daily_report$/i,
     agent_session_log_store: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+session_log_store$/i,
     agent_daily_report_store: /^[a-z0-9]+(?:[\s_-]+[a-z0-9]+)*[\s_-]+\d{4}[\s_-]+daily_report_store$/i,
   };
@@ -177,7 +196,7 @@ export function dailyReportPrompt(
   return (
     `${dateLabel} の ${route.title} を作成してください。\n` +
     '入力ログだけを根拠にし、推測で補完しないでください。\n' +
-    'DM と共有スペースを分けず、同じ owner agent の出来事として扱ってください。\n' +
+    'この agent 番号の1日分として、DMと共有スペースを分けずに整理してください。\n' +
     'ただし、ログ中の space_type / space / thread は場所情報として残してください。\n' +
     'ツールは使わず、Memory Store やファイルへの書き込みも行わず、日報本文だけを返してください。\n' +
     '形式:\n' +
@@ -276,7 +295,8 @@ function extractMemoryContent(content: unknown): string {
 
 /**
  * Python `_list_date_session_logs` (l.122-132) の TS port.
- * 指定 store の memory 一覧から `/<date>/` prefix の memory を全件 retrieve し、
+ * 指定 store の memory 一覧から新 `/<YYYY>/<MM>/<DD>` prefix と
+ * 旧 `/<YYYY-MM-DD>/` prefix の memory を全件 retrieve し、
  * `[path, content]` の sorted tuple list を返す.
  */
 export async function listDateSessionLogs(
@@ -284,14 +304,15 @@ export async function listDateSessionLogs(
   storeId: string,
   dateLabel: string,
 ): Promise<Array<[string, string]>> {
-  const prefix = `/${dateLabel}/`;
+  const newPrefix = dateLabelToMemoryPath(dateLabel);
+  const legacyPrefix = `/${dateLabel}/`;
   const out: Array<[string, string]> = [];
   const page = await client.beta.memoryStores.memories.list(storeId);
   for await (const rawItem of page as unknown as AsyncIterable<MemoryListItem>) {
     if (rawItem.type !== 'memory') continue;
     const path = typeof rawItem.path === 'string' ? rawItem.path : '';
     const id = typeof rawItem.id === 'string' ? rawItem.id : '';
-    if (!path.startsWith(prefix)) continue;
+    if (!path.startsWith(newPrefix) && !path.startsWith(legacyPrefix)) continue;
     if (!id) continue;
     const retrieved = (await client.beta.memoryStores.memories.retrieve(id, {
       memory_store_id: storeId,
@@ -305,7 +326,7 @@ export async function listDateSessionLogs(
 
 /**
  * Python `_write_report` (l.178-193) の TS port.
- * 既存 `/<date>.md` があれば update、なければ create.
+ * 既存 `/<YYYY>/<MM>/<DD>.md` があれば update、なければ create.
  */
 export async function writeReport(
   client: Anthropic,
@@ -313,7 +334,7 @@ export async function writeReport(
   dateLabel: string,
   content: string,
 ): Promise<string> {
-  const path = `/${dateLabel}.md`;
+  const path = `${dateLabelToMemoryPath(dateLabel)}.md`;
   const page = await client.beta.memoryStores.memories.list(storeId);
   let existingId: string | null = null;
   for await (const rawItem of page as unknown as AsyncIterable<MemoryListItem>) {
@@ -560,7 +581,7 @@ export async function generateDailyReports(
           pair.agentId,
           environmentId,
         );
-        let outputPath = `/${dateLabel}.md`;
+        let outputPath = `${dateLabelToMemoryPath(dateLabel)}.md`;
         if (!dryRun) {
           outputPath = await writeReport(client, pair.targetStoreId, dateLabel, summary.report);
         }

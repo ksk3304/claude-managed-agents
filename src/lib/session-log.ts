@@ -1,7 +1,7 @@
 /**
  * Session-log memory append — agent bot が 1 ターン応答した後、
  * 応答内容を Memory Store (Anthropic Managed Agents) の
- * `/YYYY-MM-DD/<slug>.md` に append する lib.
+ * `/YYYY/MM/DD.md` に append する lib.
  *
  * Cloud Run の `_append_session_log_memory`
  * (`scripts/cma_gchat_bot.py:417-490`) の TS port. byte 等価で動作する
@@ -9,11 +9,9 @@
  * 上限は厳密に踏襲する.
  *
  * 機能の役割:
- *   1. owner agent 単位の会社名 + 番号付き store (`Makoto Prime_0001_session_log_store`
- *      等) を優先し、旧 mapping は unified owner log の legacy alias
- *      として使う。
- *   2. JST date label (`YYYY-MM-DD`) + owner slug で base path 構築
- *      (`/YYYY-MM-DD/agent-<user_slug>`).
+ *   1. agent 番号単位の `session_log` attachment を保存先にする。
+ *   2. JST date label (`YYYY-MM-DD`) から agent 番号 store 内の
+ *      日次 base path を構築 (`sessionLogBasePath`).
  *   3. 1 entry の markdown を組み立てる (`buildSessionLogEntry`) — header
  *      に `space_type` / `space` / `thread` / `session_id` / `message_id`、
  *      本文に User / Agent の発話.
@@ -186,8 +184,8 @@ export interface SessionLogBasePathParams {
 }
 
 /**
- * `/YYYY-MM-DD/agent-<owner_slug>` を構築する。DM / shared space で
- * path を分けず、発話者に紐づく owner agent の 1 日ログへ集約する。
+ * `/YYYY/MM/DD` を構築する。store 自体が owner agent 単位なので、
+ * DM / shared space / sender slug では path を分けない。
  *
  * `cma_gchat_bot.py:_session_log_base_path` (l.321-340) の TS port.
  */
@@ -197,9 +195,18 @@ export async function sessionLogBasePath(
   void params.spaceType;
   void params.space;
   void params.reverseResolveAlias;
-  const fallbackSeed = params.sender.name || params.senderEmail;
-  const inner = await slugForMemoryPath(params.userSlug, fallbackSeed);
-  return `/${params.dateLabel}/agent-${inner}`;
+  void params.userSlug;
+  void params.senderEmail;
+  void params.sender;
+  return dateLabelToMemoryPath(params.dateLabel);
+}
+
+export function dateLabelToMemoryPath(dateLabel: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateLabel);
+  if (!match) {
+    throw new Error(`invalid dateLabel: ${JSON.stringify(dateLabel)}`);
+  }
+  return `/${match[1]}/${match[2]}/${match[3]}`;
 }
 
 export interface SessionLogEntryParams {
@@ -257,27 +264,26 @@ export function buildSessionLogEntry(params: SessionLogEntryParams): string {
 // ============================================================================
 
 /**
- * Unified owner-agent memory. DM / shared space で保存先を分けない。
- * New mappings should use company-numbered stores such as `Makoto Prime_0001_session_log_store`;
- * old mappings can keep `agent_session_log_store` or `session_log_dm_store`
- * as owner log aliases.
+ * `cma_gchat_bot.py:_select_session_log_attachment` (l.293-310) の TS port.
+ *
+ * 新 mapping では `MAKOTO_Prime_000X_session_log` を選ぶ。
+ * 後方互換として旧 mapping では space type に応じた
+ * `session_log_shared_store` / `session_log_dm_store` も許容する.
  */
 export function selectSessionLogAttachment(
   spaceType: string,
   attachments: MemoryAttachment[],
 ): MemoryAttachment | null {
-  void spaceType;
-  const preferred: Array<(storeName: string) => boolean> = [
-    (storeName) => isCompanyNumberedStore(storeName, 'session_log_store'),
-    (storeName) => storeName === 'agent_session_log_store',
-    (storeName) => storeName === 'session_log_store',
-    (storeName) => storeName === 'session_log_dm_store',
-    (storeName) => storeName === 'session_log_shared_store',
-  ];
-  for (const matches of preferred) {
-    for (const att of attachments) {
-      if (matches(att.store_name ?? '')) return att;
-    }
+  const target = 'session_log';
+  for (const att of attachments) {
+    const name = att.store_name ?? '';
+    if (name === target || isCompanyNumberedStore(name, 'session_log')) return att;
+  }
+  const legacyTarget = isSharedSpace(spaceType)
+    ? 'session_log_shared_store'
+    : 'session_log_dm_store';
+  for (const att of attachments) {
+    if (att.store_name === legacyTarget) return att;
   }
   // Backward compatibility: instructions 文字列で判定。DM legacy を先に見る。
   const instructionNeedles = ['agent', 'DM (個人 1:1)', '共有スペース'];

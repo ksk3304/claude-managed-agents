@@ -8,6 +8,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   copyAgent,
+  ensureMemoryStore,
   initUserMemoryStores,
   registerUserMapping,
   normalizeMappingEmail,
@@ -19,7 +20,10 @@ import {
   AGENT_SCOPED_STORES,
   AGENT_SCOPED_STORE_SET,
   COMMON_STORES,
+  USER_SCOPED_STORE_NAMES,
+  USER_SCOPED_STORES,
   actualStoreName,
+  storePrefixForUserSlug,
 } from '../src/cli/store-config';
 import { MAKOTO_TOOL_NAMES } from '../src/lib/makoto-capability-registry';
 import { main } from '../src/cli/onboarding';
@@ -85,6 +89,21 @@ function makeAnthropicFake(opts: {
             },
           };
         },
+        memories: {
+          list() {
+            return {
+              [Symbol.asyncIterator]: async function* () {
+                // empty
+              },
+            };
+          },
+          async retrieve() {
+            return { content: '' };
+          },
+          async create(_storeId, params) {
+            return { id: `mem_${params.path}`, path: params.path };
+          },
+        },
       },
       agents: {
         async retrieve(agentId) {
@@ -116,7 +135,7 @@ describe('initUserMemoryStores', () => {
       dryRun: true,
     });
     expect(Object.keys(r.stores).sort()).toEqual(
-      AGENT_SCOPED_STORES.map((n) => actualStoreName(n, '0001')).sort(),
+      USER_SCOPED_STORE_NAMES.map((n) => actualStoreName(n, '0001')).sort(),
     );
     for (const id of Object.values(r.stores)) {
       expect(id.startsWith('DRY_RUN_')).toBe(true);
@@ -135,14 +154,14 @@ describe('initUserMemoryStores', () => {
       agentNumber: '0001',
       dryRun: false,
     });
-    expect(ant._created.length).toBe(AGENT_SCOPED_STORES.length);
+    expect(ant._created.length).toBe(USER_SCOPED_STORE_NAMES.length);
     // KV cached
     for (const [actualName, id] of Object.entries(r.stores)) {
       expect(kv._store.get(`memstore_id:${actualName}`)).toBe(id);
     }
-    // Names are <company>_<number>_<purpose>.
-    for (const logical of AGENT_SCOPED_STORES) {
-      const actual = actualStoreName(logical, '0001');
+    // Names are <store_prefix>_<logical>
+    for (const logical of USER_SCOPED_STORE_NAMES) {
+      const actual = `MAKOTO_Prime_0001_${logical}`;
       expect(r.stores[actual]).toBeDefined();
     }
   });
@@ -170,12 +189,12 @@ describe('initUserMemoryStores', () => {
     });
     expect(ant._created.length).toBe(createdFirst); // no new creates
     expect(r2.created).toEqual([]);
-    expect(r2.cached.length).toBe(AGENT_SCOPED_STORES.length);
+    expect(r2.cached.length).toBe(USER_SCOPED_STORE_NAMES.length);
   });
 
   it('falls back to list() when KV cache is empty but the store already exists upstream', async () => {
     const kv = makeKvFake();
-    const actualName = actualStoreName('agent_session_log_store', '0001');
+    const actualName = actualStoreName('session_log', '0001');
     const ant = makeAnthropicFake({
       existing: [{ id: 'memstore_pre_existing_1', name: actualName }],
     });
@@ -187,9 +206,49 @@ describe('initUserMemoryStores', () => {
       dryRun: false,
     });
     expect(r.stores[actualName]).toBe('memstore_pre_existing_1');
-    expect(ant._created.length).toBe(AGENT_SCOPED_STORES.length - 1);
+    // The other user-scoped stores still need creation
+    expect(ant._created.length).toBe(USER_SCOPED_STORE_NAMES.length - 1);
     // KV is now populated for both
     expect(kv._store.get(`memstore_id:${actualName}`)).toBe('memstore_pre_existing_1');
+  });
+});
+
+// ---- ensureMemoryStore ----
+
+describe('ensureMemoryStore', () => {
+  it('creates company_core and caches it in KV', async () => {
+    const kv = makeKvFake();
+    const ant = makeAnthropicFake();
+    const r = await ensureMemoryStore({
+      anthropic: ant,
+      kv,
+      logicalName: 'company_core',
+      dryRun: false,
+    });
+
+    expect(r.storeName).toBe('company_core');
+    expect(r.created).toBe(true);
+    expect(r.cached).toBe(false);
+    expect(kv._store.get('memstore_id:company_core')).toBe(r.storeId);
+    expect(ant._created[0]?.name).toBe('company_core');
+  });
+
+  it('reuses an upstream company_core store when KV cache is empty', async () => {
+    const kv = makeKvFake();
+    const ant = makeAnthropicFake({
+      existing: [{ id: 'memstore_company_core_existing', name: 'company_core' }],
+    });
+    const r = await ensureMemoryStore({
+      anthropic: ant,
+      kv,
+      logicalName: 'company_core',
+      dryRun: false,
+    });
+
+    expect(r.storeId).toBe('memstore_company_core_existing');
+    expect(r.created).toBe(false);
+    expect(r.cached).toBe(true);
+    expect(ant._created).toEqual([]);
   });
 });
 
@@ -325,13 +384,12 @@ describe('registerUserMapping', () => {
     expect(stored.agent_number).toBe('0001');
     expect(stored.agent_id).toBe('agent_y');
     expect(stored.memory_attachments.length).toBe(COMMON_STORES.length);
+    // user-scoped store は <prefix>_<logical> で resolve されている
     const logAttachment = stored.memory_attachments.find(
-      (a: { store_name: string }) => a.store_name === 'Makoto Prime_0001_session_log_store',
+      (a: { store_name: string }) => a.store_name === 'MAKOTO_Prime_0001_session_log',
     );
     expect(logAttachment).toBeDefined();
-    expect(logAttachment.memory_store_id).toBe(
-      'memstore_id_for_Makoto Prime_0001_session_log_store',
-    );
+    expect(logAttachment.memory_store_id).toBe('memstore_id_for_MAKOTO_Prime_0001_session_log');
     // audit row
     expect(audit._rows.length).toBe(1);
     expect(audit._rows[0]).toMatchObject({
@@ -407,21 +465,18 @@ describe('registerUserMapping', () => {
 // ---- store-config sanity ----
 
 describe('store-config', () => {
-  it('AGENT_SCOPED_STORE_SET = AGENT_SCOPED_STORES', () => {
-    expect([...AGENT_SCOPED_STORE_SET].sort()).toEqual([...AGENT_SCOPED_STORES].sort());
+  it('USER_SCOPED_STORES = USER_SCOPED_STORE_NAMES', () => {
+    expect([...USER_SCOPED_STORES].sort()).toEqual([...USER_SCOPED_STORE_NAMES].sort());
   });
 
-  it('actualStoreName prefixes company and agent number only for agent-scoped stores', () => {
-    expect(actualStoreName('agent_session_log_store', '1')).toBe(
-      'Makoto Prime_0001_session_log_store',
-    );
-    expect(actualStoreName('agent_session_log_store', '2', 'Example Inc')).toBe(
-      'Example Inc_0002_session_log_store',
-    );
-    expect(actualStoreName('agent_session_log_store', 'Makoto Prime_0003')).toBe(
-      'Makoto Prime_0003_session_log_store',
-    );
-    expect(actualStoreName('company_core_memory', '1')).toBe('company_core_memory');
+  it('actualStoreName appends company + agent number only for user-scoped stores', () => {
+    expect(actualStoreName('session_log', '0001')).toBe('MAKOTO_Prime_0001_session_log');
+    expect(actualStoreName('company_core', 'yamada')).toBe('company_core');
+  });
+
+  it('storePrefixForUserSlug maps current MAKOTO Prime agent numbers', () => {
+    expect(storePrefixForUserSlug('k-seto')).toBe('MAKOTO_Prime_0001');
+    expect(storePrefixForUserSlug('takei')).toBe('MAKOTO_Prime_0002');
   });
 });
 
@@ -440,6 +495,7 @@ describe('CLI main', () => {
       expect(code).toBe(0);
       const all = writes.join('');
       expect(all).toMatch(/onboarding CLI/);
+      expect(all).toMatch(/init-common-memory-stores/);
       expect(all).toMatch(/init-user-memory-stores/);
       expect(all).toMatch(/copy-agent/);
       expect(all).toMatch(/register-user-mapping/);
@@ -480,7 +536,7 @@ describe('CLI main', () => {
       ]);
       expect(code).toBe(0);
       const all = writes.join('');
-      expect(all).toMatch(/DRY_RUN_Makoto Prime_0001_session_log_store/);
+      expect(all).toMatch(/DRY_RUN_MAKOTO_Prime_0001_session_log/);
     } finally {
       process.stdout.write = origWrite;
     }
