@@ -39,7 +39,9 @@
 import { spawn } from 'node:child_process';
 import {
   copyAgent,
+  ensureMemoryStore,
   initUserMemoryStores,
+  migrateMemoryStores,
   registerUserMapping,
   type AnthropicClientLike,
   type D1AuditWriter,
@@ -47,6 +49,8 @@ import {
   type RegisterMappingResult,
   type InitMemoryStoresResult,
   type CopyAgentResult,
+  type EnsureMemoryStoreResult,
+  type MigrateMemoryStoresResult,
 } from './onboarding-core';
 import { DEFAULT_MEMORY_STORE_COMPANY_NAME } from './store-config';
 
@@ -105,8 +109,8 @@ function parseArgs(argv: string[]): ParsedArgs {
         i++;
         continue;
       }
-      // store-id can repeat
-      if (key === 'store-id') {
+      // repeatable flags
+      if (key === 'store-id' || key === 'source' || key === 'store') {
         const arr = out.multi.get(key) ?? [];
         arr.push(next);
         out.multi.set(key, arr);
@@ -246,7 +250,9 @@ const USAGE = `MAKOTOくん 新メンバー onboarding CLI (Cloudflare 単独運
   npx tsx src/cli/onboarding.ts <subcommand> [flags]
 
 Sub-commands:
-  init-user-memory-stores   新規 agent 用 numbered memory store を発行
+  init-common-memory-stores 共通 memory store を発行
+  init-user-memory-stores   新規 user 用 memory store 3 種を発行
+  migrate-memory-stores     既存 memory store から新 store へ prefix 付きでコピー
   copy-agent                雛形 agent を copy して新 user 用 agent を発行
   register-user-mapping     KV (user_mapping:<email>) に登録 + D1 audit 記録
 
@@ -257,7 +263,12 @@ Common flags:
 
 Sub-command flags:
   init-user-memory-stores --user-slug <slug> --agent-number <0001>
-                          [--company-name "Makoto Prime"]
+                          [--company-name "MAKOTO_Prime"]
+
+  init-common-memory-stores [--store company_core]
+
+  migrate-memory-stores --target-store-id <memstore_id>
+                        --source <path_prefix>=<source_memstore_id> [...]
 
   copy-agent --from <template_agent_id> --to-slug <slug>
              --display-name "<name>" --addendum "<text>"
@@ -281,14 +292,20 @@ KV/D1 への real write は wrangler subprocess (\`npx wrangler kv key put\` /
 で切替可能。
 
 例:
-  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --company-name "Makoto Prime" --dry-run
+  npx tsx src/cli/onboarding.ts init-common-memory-stores --dry-run
+  npx tsx src/cli/onboarding.ts init-user-memory-stores --user-slug yamada --agent-number 0001 --dry-run
+  npx tsx src/cli/onboarding.ts migrate-memory-stores \\
+      --target-store-id memstore_new \\
+      --source "/identity=memstore_identity" \\
+      --source "/support=memstore_support" \\
+      --source "/agent_learnings=memstore_old_agent" --dry-run
   npx tsx src/cli/onboarding.ts copy-agent --from agent_xxx --to-slug yamada \\
       --display-name "山田 太郎" --addendum "あなたは山田 太郎さん専属の MAKOTOくんです" --dry-run
   npx tsx src/cli/onboarding.ts register-user-mapping --slug yamada \\
       --email yamada@example.com --agent-id agent_yyy \\
       --display-name "山田 太郎" --addendum "..." --agent-number 0001 \\
-      --store-id "Makoto Prime_0001_session_log_store=memstore_xxx" \\
-      --store-id "company_core_memory=memstore_common_xxx" --dry-run
+      --store-id "MAKOTO_Prime_0001_session_log=memstore_xxx" \\
+      --store-id "company_core=memstore_common_xxx" --dry-run
 `;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +335,26 @@ function resolveCompanyName(p: ParsedArgs): string {
     process.env.MAKOTO_MEMORY_COMPANY_NAME ??
     DEFAULT_MEMORY_STORE_COMPANY_NAME
   );
+}
+
+function parseMigrationSources(values: string[]): Array<{ pathPrefix: string; sourceStoreId: string }> {
+  const out: Array<{ pathPrefix: string; sourceStoreId: string }> = [];
+  for (const v of values) {
+    const eq = v.indexOf('=');
+    if (eq <= 0) {
+      throw new Error(`--source expects "<path_prefix>=<source_memstore_id>", got ${JSON.stringify(v)}`);
+    }
+    const pathPrefix = v.slice(0, eq).trim();
+    const sourceStoreId = v.slice(eq + 1).trim();
+    if (!pathPrefix || !sourceStoreId) {
+      throw new Error(`--source has empty prefix or store id: ${JSON.stringify(v)}`);
+    }
+    out.push({ pathPrefix, sourceStoreId });
+  }
+  if (out.length === 0) {
+    throw new Error('migrate-memory-stores: at least one --source is required');
+  }
+  return out;
 }
 
 async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
@@ -350,6 +387,41 @@ async function cmdInitStores(p: ParsedArgs): Promise<InitMemoryStoresResult> {
     agentNumber,
     companyName,
     dryRun: false,
+  });
+}
+
+async function cmdInitCommonStores(p: ParsedArgs): Promise<Record<string, EnsureMemoryStoreResult>> {
+  const dryRun = p.flags.has('dry-run');
+  const stores = p.multi.get('store') ?? ['company_core'];
+  const anthropic = dryRun ? createNoopAnthropic() : await makeAnthropic();
+  const target = dryRun ? null : resolveCfTargets();
+  const kv = dryRun
+    ? createInMemoryKv()
+    : makeWranglerKv(target!.kvNamespaceId, target!.remote);
+  const out: Record<string, EnsureMemoryStoreResult> = {};
+  for (const logicalName of stores) {
+    const ensured = await ensureMemoryStore({
+      anthropic,
+      kv,
+      logicalName,
+      actualName: logicalName,
+      dryRun,
+    });
+    out[ensured.storeName] = ensured;
+  }
+  return out;
+}
+
+async function cmdMigrateMemoryStores(p: ParsedArgs): Promise<MigrateMemoryStoresResult> {
+  const targetStoreId = requireString(p, 'target-store-id', 'migrate-memory-stores');
+  const sources = parseMigrationSources(p.multi.get('source') ?? []);
+  const dryRun = p.flags.has('dry-run');
+  const anthropic = await makeAnthropic();
+  return await migrateMemoryStores({
+    anthropic,
+    targetStoreId,
+    sources,
+    dryRun,
   });
 }
 
@@ -468,6 +540,21 @@ function createNoopAnthropic(): AnthropicClientLike {
             },
           };
         },
+        memories: {
+          list(): AsyncIterable<{ type?: unknown; id?: unknown; path?: unknown }> {
+            return {
+              [Symbol.asyncIterator]: async function* () {
+                // empty
+              },
+            };
+          },
+          async retrieve() {
+            throw new Error('createNoopAnthropic: memory retrieve called in dry-run');
+          },
+          async create() {
+            throw new Error('createNoopAnthropic: memory create called in dry-run');
+          },
+        },
       },
       agents: {
         async retrieve() {
@@ -518,8 +605,14 @@ export async function main(argv: string[]): Promise<number> {
   try {
     let result: unknown;
     switch (p.command) {
+      case 'init-common-memory-stores':
+        result = await cmdInitCommonStores(p);
+        break;
       case 'init-user-memory-stores':
         result = await cmdInitStores(p);
+        break;
+      case 'migrate-memory-stores':
+        result = await cmdMigrateMemoryStores(p);
         break;
       case 'copy-agent':
         result = await cmdCopyAgent(p);
@@ -545,6 +638,15 @@ export async function main(argv: string[]): Promise<number> {
 }
 
 function formatHuman(command: string, result: unknown): string {
+  if (command === 'init-common-memory-stores') {
+    const r = result as Record<string, EnsureMemoryStoreResult>;
+    const lines = [`[init-common-memory-stores] stores:`];
+    for (const [name, item] of Object.entries(r)) {
+      const tag = item.created ? 'CREATED' : 'CACHED';
+      lines.push(`  ${name} = ${item.storeId} (${tag})`);
+    }
+    return lines.join('\n');
+  }
   if (command === 'init-user-memory-stores') {
     const r = result as InitMemoryStoresResult;
     const lines = [`[init-user-memory-stores] stores:`];
@@ -559,6 +661,13 @@ function formatHuman(command: string, result: unknown): string {
     return (
       `[copy-agent] new agent_id = ${r.newAgentId} ` +
       `(template=${r.templateAgentId}, display_name='${r.displayName}')`
+    );
+  }
+  if (command === 'migrate-memory-stores') {
+    const r = result as MigrateMemoryStoresResult;
+    return (
+      `[migrate-memory-stores] target=${r.targetStoreId} ` +
+      `copied=${r.copied.length} skipped=${r.skipped.length}`
     );
   }
   if (command === 'register-user-mapping') {

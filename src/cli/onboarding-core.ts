@@ -28,6 +28,8 @@ import {
   AGENT_SCOPED_STORE_SET,
   COMMON_STORES,
   STORES,
+  USER_SCOPED_STORE_NAMES,
+  USER_SCOPED_STORES,
   actualStoreName,
   normalizeAgentNumber,
 } from './store-config';
@@ -53,6 +55,20 @@ export interface AnthropicClientLike {
        * のみ提供 (KV cache が hit すれば API は叩かない)。
        */
       list(params?: { limit?: number }): AsyncIterable<{ id: string; name: string }>;
+      memories: {
+        list(storeId: string): AsyncIterable<{
+          type?: unknown;
+          id?: unknown;
+          path?: unknown;
+        }>;
+        retrieve(memoryId: string, params: { memory_store_id: string }): Promise<{
+          content?: unknown;
+        }>;
+        create(storeId: string, params: { path: string; content: string }): Promise<{
+          id: string;
+          path?: string;
+        }>;
+      };
     };
     agents: {
       retrieve(agentId: string): Promise<{
@@ -136,14 +152,74 @@ export interface InitMemoryStoresResult {
   cached: string[]; // KV cache hit でスキップした actual_name
 }
 
+export interface EnsureMemoryStoreResult {
+  storeName: string;
+  storeId: string;
+  created: boolean;
+  cached: boolean;
+}
+
+export async function ensureMemoryStore(opts: {
+  anthropic: AnthropicClientLike;
+  kv: KvLike;
+  logicalName: string;
+  actualName?: string;
+  dryRun: boolean;
+}): Promise<EnsureMemoryStoreResult> {
+  const spec = STORES[opts.logicalName];
+  if (!spec) {
+    throw new Error(`ensureMemoryStore: unknown logical store ${JSON.stringify(opts.logicalName)}`);
+  }
+  const actualName = opts.actualName ?? opts.logicalName;
+  const cacheKey = memstoreCacheKey(actualName);
+
+  if (opts.dryRun) {
+    return {
+      storeName: actualName,
+      storeId: `DRY_RUN_${actualName}`,
+      created: true,
+      cached: false,
+    };
+  }
+
+  const cachedId = await opts.kv.get(cacheKey);
+  if (cachedId) {
+    return { storeName: actualName, storeId: cachedId, created: false, cached: true };
+  }
+
+  let foundExisting: string | null = null;
+  for await (const store of opts.anthropic.beta.memoryStores.list({ limit: 100 })) {
+    if (store.name === actualName) {
+      foundExisting = store.id;
+      break;
+    }
+  }
+
+  const storeId =
+    foundExisting ??
+    (
+      await opts.anthropic.beta.memoryStores.create({
+        name: actualName,
+        description: spec.description,
+      })
+    ).id;
+  await opts.kv.put(cacheKey, storeId);
+
+  return {
+    storeName: actualName,
+    storeId,
+    created: foundExisting === null,
+    cached: foundExisting !== null,
+  };
+}
+
 /**
- * 新規 agent 用 agent-scoped memory store を冪等に発行.
+ * 新規 user 用 memory store 3 種を冪等に発行.
  *
  * 発行対象:
- *   - `Makoto Prime_0001_identity_memory`
- *   - `Makoto Prime_0001_support_memory`
- *   - `Makoto Prime_0001_daily_report_store`
- *   - `Makoto Prime_0001_session_log_store`
+ *   - `MAKOTO_Prime_000X_agent_core`
+ *   - `MAKOTO_Prime_000X_session_log`
+ *   - `MAKOTO_Prime_000X_daily_report`
  *
  * 冪等性: KV `memstore_id:<actual_name>` に発行済 ID をキャッシュ。
  * cache hit 時は API を叩かない (= Python `ensure_store` 相当)。
@@ -161,66 +237,135 @@ export async function initUserMemoryStores(opts: {
   companyName?: string;
   dryRun: boolean;
 }): Promise<InitMemoryStoresResult> {
-  void opts.userSlug;
   const agentNumber = normalizeAgentNumber(opts.agentNumber);
   const out: Record<string, string> = {};
   const created: string[] = [];
   const cached: string[] = [];
 
-  for (const logicalName of AGENT_SCOPED_STORES) {
-    if (!AGENT_SCOPED_STORE_SET.has(logicalName)) continue; // defensive
+  for (const logicalName of USER_SCOPED_STORE_NAMES) {
+    if (!USER_SCOPED_STORES.has(logicalName)) continue; // defensive
     const actualName = actualStoreName(logicalName, agentNumber, opts.companyName);
-    const cacheKey = memstoreCacheKey(actualName);
-
-    if (opts.dryRun) {
-      out[actualName] = `DRY_RUN_${actualName}`;
-      created.push(actualName);
-      continue;
-    }
-
-    // 1. KV cache lookup
-    const cachedId = await opts.kv.get(cacheKey);
-    if (cachedId) {
-      out[actualName] = cachedId;
-      cached.push(actualName);
-      continue;
-    }
-
-    // 2. Anthropic side: list で既存を探す (= 別経路で create された孤児 cache miss
-    //    にも対応する。Python `ensure_store` も list ベースの同名探索を行う)。
-    let foundExisting: string | null = null;
-    for await (const store of opts.anthropic.beta.memoryStores.list({ limit: 100 })) {
-      if (store.name === actualName) {
-        foundExisting = store.id;
-        break;
-      }
-    }
-
-    let storeId: string;
-    if (foundExisting) {
-      storeId = foundExisting;
-      cached.push(actualName);
-    } else {
-      const spec = STORES[logicalName];
-      if (!spec) {
-        throw new Error(
-          `initUserMemoryStores: unknown logical store ${JSON.stringify(logicalName)} (store-config drift)`,
-        );
-      }
-      const created_store = await opts.anthropic.beta.memoryStores.create({
-        name: actualName,
-        description: spec.description,
-      });
-      storeId = created_store.id;
-      created.push(actualName);
-    }
-
-    // 3. KV cache write
-    await opts.kv.put(cacheKey, storeId);
-    out[actualName] = storeId;
+    const ensured = await ensureMemoryStore({
+      anthropic: opts.anthropic,
+      kv: opts.kv,
+      logicalName,
+      actualName,
+      dryRun: opts.dryRun,
+    });
+    out[actualName] = ensured.storeId;
+    if (ensured.created) created.push(actualName);
+    if (ensured.cached) cached.push(actualName);
   }
 
   return { stores: out, created, cached };
+}
+
+// ---------------------------------------------------------------------------
+// migrate memories
+// ---------------------------------------------------------------------------
+
+export interface MigrateMemorySource {
+  sourceStoreId: string;
+  pathPrefix: string;
+}
+
+export interface MigrateMemoryStoresResult {
+  targetStoreId: string;
+  copied: Array<{ source_store_id: string; source_path: string; target_path: string }>;
+  skipped: Array<{ source_store_id: string; source_path: string; target_path: string; reason: string }>;
+}
+
+function normalizeMemoryPathPrefix(raw: string): string {
+  const cleaned = raw.trim().replace(/^\/+|\/+$/g, '');
+  return cleaned ? `/${cleaned}` : '';
+}
+
+function prefixedMemoryPath(prefix: string, sourcePath: string): string {
+  const cleanPrefix = normalizeMemoryPathPrefix(prefix);
+  const cleanSource = sourcePath.startsWith('/') ? sourcePath : `/${sourcePath}`;
+  return `${cleanPrefix}${cleanSource}`.replace(/\/{2,}/g, '/');
+}
+
+function extractMemoryContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (typeof block === 'string') {
+        parts.push(block);
+      } else if (block && typeof block === 'object') {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === 'string') parts.push(text);
+      }
+    }
+    return parts.join('\n');
+  }
+  return '';
+}
+
+export async function migrateMemoryStores(opts: {
+  anthropic: AnthropicClientLike;
+  sources: MigrateMemorySource[];
+  targetStoreId: string;
+  dryRun: boolean;
+}): Promise<MigrateMemoryStoresResult> {
+  const copied: MigrateMemoryStoresResult['copied'] = [];
+  const skipped: MigrateMemoryStoresResult['skipped'] = [];
+  const existingTarget = new Map<string, string>();
+
+  for await (const item of opts.anthropic.beta.memoryStores.memories.list(opts.targetStoreId)) {
+    if (item.type !== 'memory') continue;
+    const id = typeof item.id === 'string' ? item.id : '';
+    const path = typeof item.path === 'string' ? item.path : '';
+    if (!id || !path) continue;
+    const retrieved = await opts.anthropic.beta.memoryStores.memories.retrieve(id, {
+      memory_store_id: opts.targetStoreId,
+    });
+    existingTarget.set(path, extractMemoryContent(retrieved.content));
+  }
+
+  for (const source of opts.sources) {
+    for await (const item of opts.anthropic.beta.memoryStores.memories.list(source.sourceStoreId)) {
+      if (item.type !== 'memory') continue;
+      const sourceMemoryId = typeof item.id === 'string' ? item.id : '';
+      const sourcePath = typeof item.path === 'string' ? item.path : '';
+      if (!sourceMemoryId || !sourcePath) continue;
+      const targetPath = prefixedMemoryPath(source.pathPrefix, sourcePath);
+      const retrieved = await opts.anthropic.beta.memoryStores.memories.retrieve(sourceMemoryId, {
+        memory_store_id: source.sourceStoreId,
+      });
+      const content = extractMemoryContent(retrieved.content);
+      const existingContent = existingTarget.get(targetPath);
+      if (existingContent !== undefined) {
+        if (existingContent === content) {
+          skipped.push({
+            source_store_id: source.sourceStoreId,
+            source_path: sourcePath,
+            target_path: targetPath,
+            reason: 'same_content',
+          });
+          continue;
+        }
+        throw new Error(
+          `migrateMemoryStores: target path conflict with different content: ${targetPath}`,
+        );
+      }
+      if (!opts.dryRun) {
+        await opts.anthropic.beta.memoryStores.memories.create(opts.targetStoreId, {
+          path: targetPath,
+          content,
+        });
+        existingTarget.set(targetPath, content);
+      }
+      copied.push({
+        source_store_id: source.sourceStoreId,
+        source_path: sourcePath,
+        target_path: targetPath,
+      });
+    }
+  }
+
+  return { targetStoreId: opts.targetStoreId, copied, skipped };
 }
 
 // ---------------------------------------------------------------------------
