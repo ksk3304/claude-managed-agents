@@ -564,6 +564,31 @@ describe('per-session staged approval', () => {
     expect(usd).toBeCloseTo(4.6665, 6);
   });
 
+  it('uses the official pricing table for newer canonical model IDs', () => {
+    const usd = usdFromUsage(
+      { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      'claude-opus-4-8',
+      sessionConfig,
+    );
+    expect(usd).toBeCloseTo(30, 6);
+  });
+
+  it('accepts explicit model aliases without substring matching', () => {
+    const aliasUsd = usdFromUsage(
+      { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      'claude-haiku-4-5-20251001',
+      sessionConfig,
+    );
+    expect(aliasUsd).toBeCloseTo(6, 6);
+
+    const fallbackUsd = usdFromUsage(
+      { input_tokens: 1_000_000, output_tokens: 0 },
+      'prefix-claude-opus-4-8-suffix',
+      { ...sessionConfig, fallbackModel: 'claude-haiku-4-5' },
+    );
+    expect(fallbackUsd).toBeCloseTo(1, 6);
+  });
+
   it('asks at $8 then allows yes until the $12 stage', async () => {
     const kv = makeKv();
     const threadSessionKey = 'chat_thread_session:user:spaces/A:threads/T';

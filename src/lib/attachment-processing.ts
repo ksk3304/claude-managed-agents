@@ -45,6 +45,10 @@ import type Anthropic from '@anthropic-ai/sdk';
 import { toFile } from '@anthropic-ai/sdk';
 import { unzipSync, type Unzipped } from 'fflate';
 
+import {
+  ANTHROPIC_MODEL_PRICING,
+  resolveAnthropicModelPricing,
+} from '../data/anthropic-model-pricing';
 import { assertBridgeEgressAllowed } from './egress-guard';
 import { CHAT_BOT_SCOPE, getChatAccessToken, type ChatApiDeps } from './chat-api';
 
@@ -109,18 +113,13 @@ export const PDF_PREFLIGHT_PROMPT_OVERHEAD_TOKENS = 50_000;
 export const PDF_PREFLIGHT_DEFAULT_SESSION_HARD_CAP_USD = 8;
 export const PDF_PREFLIGHT_DEFAULT_MODEL = 'claude-opus-4-7';
 
-export const PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK: Readonly<Record<string, number>> = {
-  'claude-opus-4-7': 5,
-  'claude-opus-4-6': 5,
-  'claude-opus-4-5': 5,
-  'claude-opus-4-1': 15,
-  'claude-opus-4': 15,
-  'claude-sonnet-4-6': 3,
-  'claude-sonnet-4-5': 3,
-  'claude-sonnet-4': 3,
-  'claude-haiku-4-5': 1,
-  'claude-haiku-3-5': 0.8,
-};
+export const PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK: Readonly<Record<string, number>> =
+  Object.fromEntries(
+    ANTHROPIC_MODEL_PRICING.map((row): [string, number] => [
+      row.model,
+      row.inputUsdPerMtok,
+    ]),
+  );
 
 /** 1 Office ファイルあたりのサイズ上限。 */
 export const MAX_OFFICE_ATTACHMENT_BYTES = 50 * 1024 * 1024;
@@ -784,15 +783,13 @@ function resolvePdfInputPriceUsdPerMtok(options: PdfPreflightOptions = {}): {
     && options.modelInputUsdPerMtok > 0) {
     return { model, inputUsdPerMtok: options.modelInputUsdPerMtok };
   }
-  if (PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[model]) {
-    return { model, inputUsdPerMtok: PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[model] };
-  }
-  for (const [key, value] of Object.entries(PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK)) {
-    if (model.includes(key)) return { model, inputUsdPerMtok: value };
-  }
+  const pricing = resolveAnthropicModelPricing(model);
+  if (pricing) return { model, inputUsdPerMtok: pricing.inputUsdPerMtok };
+  const fallback = resolveAnthropicModelPricing(PDF_PREFLIGHT_DEFAULT_MODEL);
   return {
     model,
-    inputUsdPerMtok: PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[PDF_PREFLIGHT_DEFAULT_MODEL]!,
+    inputUsdPerMtok: fallback?.inputUsdPerMtok
+      ?? PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK[PDF_PREFLIGHT_DEFAULT_MODEL]!,
   };
 }
 
