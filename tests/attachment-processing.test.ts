@@ -30,6 +30,7 @@ import {
   isOfficeZipSafe,
   INLINE_VS_FILES_THRESHOLD_BYTES,
   MAX_OFFICE_UNCOMPRESSED_BYTES,
+  PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK,
   type AttachmentDeps,
   type ChatAttachment,
 } from '../src/lib/attachment-processing';
@@ -321,6 +322,61 @@ describe('buildPdfAttachments', () => {
     expect(res.preflight?.tier).toBe('tier_a');
     expect(res.preflight?.totalPages).toBe(2);
     expect(res.notice).toBeNull();
+  });
+
+  it('prices PDF preflight with canonical models and explicit aliases only', async () => {
+    _resetChatTokenCacheForTests();
+    const fakePdf = makeMinimalPdf(1);
+    const fetchImpl = makeFetchMock([
+      () =>
+        new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/pdf',
+            'Content-Length': String(fakePdf.byteLength),
+          },
+        }),
+      () =>
+        new Response(fakePdf, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/pdf',
+            'Content-Length': String(fakePdf.byteLength),
+          },
+        }),
+    ]);
+
+    expect(PDF_PREFLIGHT_MODEL_INPUT_USD_PER_MTOK['claude-opus-4-8']).toBe(5);
+
+    const aliasRes = await buildPdfAttachments(
+      depsWithFetch(fetchImpl),
+      {
+        attachment: [
+          {
+            contentType: 'application/pdf',
+            contentName: 'doc.pdf',
+            attachmentDataRef: { resourceName: 'ALIAS' },
+          },
+        ],
+      },
+      { model: 'claude-haiku-4-5-20251001' },
+    );
+    expect(aliasRes.preflight?.estimatedCostLowUsd).toBeCloseTo(0.052025, 6);
+
+    const fallbackRes = await buildPdfAttachments(
+      depsWithFetch(fetchImpl),
+      {
+        attachment: [
+          {
+            contentType: 'application/pdf',
+            contentName: 'doc.pdf',
+            attachmentDataRef: { resourceName: 'PARTIAL' },
+          },
+        ],
+      },
+      { model: 'prefix-claude-haiku-4-5-suffix' },
+    );
+    expect(fallbackRes.preflight?.estimatedCostLowUsd).toBeCloseTo(0.260125, 6);
   });
 
   it('does not stop a 51-page PDF by page count alone', async () => {

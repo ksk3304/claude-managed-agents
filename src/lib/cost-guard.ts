@@ -40,6 +40,12 @@
  *         scripts/cma_gchat_bot.py:_configure_cost_guard_chat_sender
  */
 
+import {
+  ANTHROPIC_MODEL_PRICING,
+  resolveAnthropicModelPricing,
+  type AnthropicModelPricingRow,
+} from '../data/anthropic-model-pricing';
+
 const PREFIX = 'cost_guard';
 
 /**
@@ -571,59 +577,20 @@ const DEFAULT_SESSION_CONFIG: SessionCostGuardConfig = {
   fallbackModel: 'claude-opus-4-7',
 };
 
-const PRICING_USD_PER_MTOK: Record<
-  string,
-  {
-    input: number;
-    output: number;
-    cache_creation: number;
-    cache_creation_1h: number;
-    cache_read: number;
-  }
-> = {
-  'claude-opus-4-7': {
-    input: 5,
-    output: 25,
-    cache_creation: 6.25,
-    cache_creation_1h: 10,
-    cache_read: 0.5,
-  },
-  'claude-opus-4-6': {
-    input: 5,
-    output: 25,
-    cache_creation: 6.25,
-    cache_creation_1h: 10,
-    cache_read: 0.5,
-  },
-  'claude-opus-4-5': {
-    input: 5,
-    output: 25,
-    cache_creation: 6.25,
-    cache_creation_1h: 10,
-    cache_read: 0.5,
-  },
-  'claude-opus-4-1': {
-    input: 15,
-    output: 75,
-    cache_creation: 18.75,
-    cache_creation_1h: 30,
-    cache_read: 1.5,
-  },
-  'claude-sonnet-4-6': {
-    input: 3,
-    output: 15,
-    cache_creation: 3.75,
-    cache_creation_1h: 6,
-    cache_read: 0.3,
-  },
-  'claude-haiku-4-5': {
-    input: 1,
-    output: 5,
-    cache_creation: 1.25,
-    cache_creation_1h: 2,
-    cache_read: 0.1,
-  },
+type RuntimeModelPricing = {
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_creation_1h: number;
+  cache_read: number;
 };
+
+const PRICING_USD_PER_MTOK: Readonly<Record<string, RuntimeModelPricing>> = Object.fromEntries(
+  ANTHROPIC_MODEL_PRICING.map((row): [string, RuntimeModelPricing] => [
+    row.model,
+    runtimePricingFromRow(row),
+  ]),
+);
 
 interface SessionCostState {
   sessionId: string;
@@ -1373,13 +1340,21 @@ function parseApprovalDecision(text: string): 'yes' | 'no' | null {
 function pricingForModel(
   model: string,
   config: SessionCostGuardConfig,
-): typeof PRICING_USD_PER_MTOK[string] | null {
-  const trimmed = model.trim();
-  if (PRICING_USD_PER_MTOK[trimmed]) return PRICING_USD_PER_MTOK[trimmed];
-  for (const [key, value] of Object.entries(PRICING_USD_PER_MTOK)) {
-    if (trimmed.includes(key)) return value;
-  }
-  return PRICING_USD_PER_MTOK[config.fallbackModel] ?? null;
+): RuntimeModelPricing | null {
+  const resolved = resolveAnthropicModelPricing(model)
+    ?? resolveAnthropicModelPricing(config.fallbackModel);
+  if (!resolved) return null;
+  return PRICING_USD_PER_MTOK[resolved.model] ?? runtimePricingFromRow(resolved);
+}
+
+function runtimePricingFromRow(row: AnthropicModelPricingRow): RuntimeModelPricing {
+  return {
+    input: row.inputUsdPerMtok,
+    output: row.outputUsdPerMtok,
+    cache_creation: row.cacheWrite5mUsdPerMtok,
+    cache_creation_1h: row.cacheWrite1hUsdPerMtok,
+    cache_read: row.cacheReadUsdPerMtok,
+  };
 }
 
 function cacheCreationTokens(usage: Record<string, unknown>): [number, number] {
