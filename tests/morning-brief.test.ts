@@ -48,10 +48,12 @@ describe('morning brief scheduled enqueue', () => {
     expect(event.message?.text).toContain('今日の予定');
     expect(event.message?.text).toContain('今日のTODO');
     expect(event.message?.text).toContain('Google Calendar');
+    expect(event.message?.text).toContain('まことくん開発管理');
+    expect(event.message?.text).toContain('Google Drive');
+    expect(event.message?.text).toContain('未完了行');
     expect(event.message?.text).toContain('ActiveTasks.md');
     expect(event.message?.text).toContain('cc-secretary');
-    expect(event.message?.text).toContain('最優先');
-    expect(event.message?.text).toContain('メモ・振り返り');
+    expect(event.message?.text).toContain('補助メモ');
     expect(event.message?.text).toContain('MAKOTOくんができること');
     expect(event.message?.text).toContain('内部状態・内部名を書かない');
     expect(event.message?.thread).toBeUndefined();
@@ -69,6 +71,8 @@ describe('morning brief scheduled enqueue', () => {
     expect(event.message?.text).toContain('午後の予定');
     expect(event.message?.text).toContain('13時TODOチェック');
     expect(event.message?.text).toContain('Google Calendar');
+    expect(event.message?.text).toContain('まことくん開発管理');
+    expect(event.message?.text).toContain('未完了行');
     expect(event.message?.text).toContain('ActiveTasks.md');
     expect(event.message?.text).toContain('cc-secretary');
     expect(event.message?.text).toContain('期限切れ・当日期限');
