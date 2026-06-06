@@ -96,10 +96,18 @@
   //     Cloud Run `scripts/cma_daily_report.py` (Issue #186 Phase 2).
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     — `morning_brief_seto` via the Google Chat Queue path.
+  //   - `0 4 * * mon-fri` (04:00 UTC Mon-Fri = 平日 13:00 JST)
+  //     — `midday_brief_seto` via the Google Chat Queue path.
   //   - `*/30 * * * *` — heartbeat_tasks due gate; inert unless
   //     `HEARTBEAT_ENABLED` is explicitly enabled.
   "triggers": {
-    "crons": ["0 4 * * *", "30 15 * * *", "30 23 * * sun-thu", "*/30 * * * *"],
+    "crons": [
+      "0 4 * * *",
+      "30 15 * * *",
+      "30 23 * * sun-thu",
+      "0 4 * * mon-fri",
+      "*/30 * * * *"
+    ],
   },
   // Cloudflare Queues for the AgentMail bridge (Issue #186). One
   // single-purpose queue carries verified webhook deliveries from the

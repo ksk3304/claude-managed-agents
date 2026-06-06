@@ -33,7 +33,9 @@ import {
 import { pruneExpiredDedupe } from "./lib/dedupe";
 import { generateDailyReports, defaultDateLabel } from "./scheduled/daily-report";
 import {
+  enqueueMiddayBriefSeto,
   enqueueMorningBriefSeto,
+  MIDDAY_BRIEF_SETO_CRON,
   MORNING_BRIEF_SETO_CRON,
   MORNING_BRIEF_SETO_EMAIL,
   MORNING_BRIEF_SETO_SPACE,
@@ -119,6 +121,8 @@ export default {
   //     セッションログを Memory Store に集約・要約・書き込み)
   //   - `30 23 * * sun-thu` (23:30 UTC Sun-Thu = 平日 08:30 JST)
   //     → morning_brief_seto を Google Chat Queue 経路へ enqueue
+  //   - `0 4 * * mon-fri` (04:00 UTC Mon-Fri = 平日 13:00 JST)
+  //     → midday_brief_seto を Google Chat Queue 経路へ enqueue
   //   - `*/30 * * * *` → heartbeat_tasks due rows を Google Chat Queue
   //     経路へ enqueue (`HEARTBEAT_ENABLED` opt-in)
   async scheduled(
@@ -132,6 +136,10 @@ export default {
     }
     if (controller.cron === MORNING_BRIEF_SETO_CRON) {
       ctx.waitUntil(enqueueMorningBriefSeto(env));
+      return;
+    }
+    if (controller.cron === MIDDAY_BRIEF_SETO_CRON) {
+      ctx.waitUntil(enqueueMiddayBriefSeto(env));
       return;
     }
     if (controller.cron === HEARTBEAT_CRON) {
@@ -299,7 +307,7 @@ async function runDailyReportCron(env: Env): Promise<void> {
 }
 
 interface Issue206DebugBody {
-  mode?: "chat_observe" | "morning_brief" | "scheduled_text";
+  mode?: "chat_observe" | "morning_brief" | "midday_brief" | "scheduled_text";
   runId?: string;
   text?: string;
   senderEmail?: string;
@@ -328,6 +336,10 @@ async function handleIssue206ChatObserve(request: Request, env: Env): Promise<Re
   }
   if (body.mode === "morning_brief") {
     const result = await enqueueMorningBriefSeto(env);
+    return Response.json({ ok: result.kind !== "failed", mode: body.mode, ...result });
+  }
+  if (body.mode === "midday_brief") {
+    const result = await enqueueMiddayBriefSeto(env);
     return Response.json({ ok: result.kind !== "failed", mode: body.mode, ...result });
   }
   const runId = safeDebugId(body.runId || `issue206-${Date.now()}`);

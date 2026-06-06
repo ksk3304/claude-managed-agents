@@ -158,6 +158,7 @@ import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
+const MIDDAY_BRIEF_EVENT_KEY_PREFIX = 'scheduled:midday_brief_seto:';
 const MORNING_BRIEF_STREAM_TIMEOUT_MS = 10 * 60 * 1000;
 const CHAT_EVENT_LEASE_TTL_MS = 15 * 60 * 1000;
 const CHAT_EVENT_HEARTBEAT_INTERVAL_MS = 60 * 1000;
@@ -692,8 +693,8 @@ export async function handleChatEvent(
       messageId: message.name,
       owner: claim.owner,
       version: claim.version,
-      eventType: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
-        ? 'morning_brief_parent_lease_heartbeat_started'
+      eventType: isSetoBriefEvent(eventKey)
+        ? 'seto_brief_parent_lease_heartbeat_started'
         : 'chat_parent_lease_heartbeat_started',
     });
     if (!parentHeartbeat) {
@@ -1205,11 +1206,11 @@ export async function handleChatEvent(
   const attachmentNotice = attachmentBlocks.notice;
   const extraContentBlocks = attachmentBlocks.extraBlocks;
 
-  if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) {
+  if (isSetoBriefEvent(eventKey)) {
     await recordRuntimeEvent(env, {
       eventKey,
       messageId: message.name,
-      eventType: 'morning_brief_long_turn_mode',
+      eventType: 'seto_brief_long_turn_mode',
       source: 'chat-event-handler',
       detail: { stream_timeout_ms: MORNING_BRIEF_STREAM_TIMEOUT_MS },
     });
@@ -1311,7 +1312,7 @@ export async function handleChatEvent(
           // Issue #208: mail skill は既存社員 agent / session へ統合するため
           // forceFreshSession しない。その他 action skill は従来通り bypass。
           forceFreshSession,
-          timeoutMs: eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
+          timeoutMs: isSetoBriefEvent(eventKey)
             ? MORNING_BRIEF_STREAM_TIMEOUT_MS
             : parseReactiveStreamTimeoutMs(env.CMA_REACTIVE_STREAM_TIMEOUT_MS),
         });
@@ -3268,15 +3269,22 @@ function normalizeAutonomousTitleLine(line: string): string {
 }
 
 function defaultAutonomousReplyPrefix(eventKey: string): string {
-  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
-    ? '朝ブリーフ: '
-    : '定期実行: ';
+  if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) return '朝ブリーフ: ';
+  if (eventKey.startsWith(MIDDAY_BRIEF_EVENT_KEY_PREFIX)) return '13時TODOチェック: ';
+  return '定期実行: ';
 }
 
 function defaultAutonomousReplyTitle(eventKey: string): string {
-  return eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)
-    ? '朝ブリーフをまとめました'
-    : '結果をまとめました';
+  if (eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX)) return '朝ブリーフをまとめました';
+  if (eventKey.startsWith(MIDDAY_BRIEF_EVENT_KEY_PREFIX)) return '13時TODOチェックをまとめました';
+  return '結果をまとめました';
+}
+
+function isSetoBriefEvent(eventKey: string): boolean {
+  return (
+    eventKey.startsWith(MORNING_BRIEF_EVENT_KEY_PREFIX) ||
+    eventKey.startsWith(MIDDAY_BRIEF_EVENT_KEY_PREFIX)
+  );
 }
 
 function truncateDisplayChars(text: string, maxChars: number): string {
