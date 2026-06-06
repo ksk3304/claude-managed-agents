@@ -24,15 +24,15 @@ const BRIEF_OUTPUT_RULES = `# 出力規約（最優先・絶対厳守）
 - あるセクションのデータが取得できなかった場合、その見出しの下に「（今回は該当データなし）」とだけ書き、理由・内部状態・できなかった事情は書かない。
 - 「attach されていない」「参照できません」「memory store」「一時的に」「エラー」等の語を本文に出さない。`;
 
-const ACTIVE_TASKS_READING_HINT = `# TODO読み取り方針（cc-secretary 参考）
-- ActiveTasks.md は、cc-secretary の Markdown TODO 管理の考え方を圧縮移植したものとして読む。
-- 可能なら「最優先」「通常」「余裕があれば」「完了」「メモ・振り返り」の見出しを前提に整理する。
-- [ ] は未完了、[x] は完了として扱う。
-- 「最優先」は今日中・重要、「通常」は今週中、「余裕があれば」は低優先度として扱う。
-- 期限切れ・当日期限・最優先を先に拾う。
+const TODO_SOURCE_READING_HINT = `# TODO読み取り方針（cc-secretary 参考）
+- TODO / issue 風タスクの正本は Google Drive のスプレッドシート「まことくん開発管理」として扱う。
+- まず Drive で表題を検索し、見つかったスプレッドシートを読む。表題ゆれがある場合は「まことくん」「MAKOTO」「開発」「管理」等で探す。
+- 行の解釈は表のヘッダに従う。状態 / status / 完了 / close / 対応状況 などの列があれば、完了・終了・closed・done・対応済み等を除外し、未完了・open・未着手・進行中・要対応を候補にする。
+- 優先度 / 期限 / issue番号 / 担当 / 次アクション / メモ等の列があれば、今日進める候補の判断材料にする。
+- ActiveTasks.md は会話中に更新される補助メモ / scratchpad として読む。開発管理表より優先しないが、直近会話での優先度変更・一時メモ・ユーザーの言い換えがある場合は補助情報として反映する。
+- 期限切れ・当日期限・高優先度・止まっている未完了行を先に拾う。
 - 各TODOに対して、MAKOTOくんが次に手伝える具体行動（下書き、調査、整理、候補出し、文案化、リマインド等）を考える。
-- ActiveTasks.md が別形式でも、既存内容を壊さず読み、上記構造に近いものとして解釈する。
-- cc-secretary、ActiveTasks.md、見出し名、ファイル名、取得経路は本文に出さない。`;
+- cc-secretary、スプレッドシート名、ActiveTasks.md、ヘッダ名、ファイル名、取得経路は本文に出さない。ユーザー向けには「開発管理表」「TODO」程度の自然な表現にする。`;
 
 const CALENDAR_READING_HINT = `# 予定読み取り方針
 - 今日の予定は Google Calendar の予定一覧を確認して要約する。
@@ -47,11 +47,11 @@ const TODO_HELP_PROPOSAL_HINT = `# 手伝い提案方針
 - ユーザーが「これやって」「詳しく」「どう進める?」と返したら、そのTODOについて通常会話で続きの支援に入れる前提で書く。
 - 外部送信、予定作成、Issue起票、ファイル削除など副作用がある行動は、提案で止める。承認後に実行する。`;
 
-export const MORNING_BRIEF_SETO_PROMPT = `瀬戸さん向けの朝ブリーフを作成するタスク。情報収集（memory / issue 一覧 / session-log / Agent Core support の ActiveTasks.md 等の参照）はツールで自由に行ってよいが、テキストとして文章を出力するのは最終ブリーフ 1 回のみとする。
+export const MORNING_BRIEF_SETO_PROMPT = `瀬戸さん向けの朝ブリーフを作成するタスク。情報収集（memory / issue 一覧 / session-log / Google Drive の開発管理表 / Agent Core support の ActiveTasks.md 等の参照）はツールで自由に行ってよいが、テキストとして文章を出力するのは最終ブリーフ 1 回のみとする。
 
 ${BRIEF_OUTPUT_RULES}
 
-${ACTIVE_TASKS_READING_HINT}
+${TODO_SOURCE_READING_HINT}
 
 ${CALENDAR_READING_HINT}
 
@@ -69,17 +69,17 @@ ${TODO_HELP_PROPOSAL_HINT}
 - 1: daily-report-shared-store / daily-report-dm-store を参照
 - 2: session-log-shared-store から「最後の発話が人間」を抽出
 - 3: calendar_list_events で今日 00:00〜23:59 JST の予定を参照
-- 4: Agent Core support の ActiveTasks.md を参照。これはTODOの正本。会話中に更新される前提なので、この時点のスナップショットとして読む
+- 4: Google Drive で「まことくん開発管理」を探し、未完了行をTODO正本として読む。ActiveTasks.md は直近会話の補助メモとして読む
 - 5: open_issues_v2（read scope）を参照
 これらの参照先名・ツール名・取得経路は収集に使うだけ。ブリーフ本文には一切書かない。
 
 - 末尾に「気になる点」を 1〜2 行添えてよい（任意）。ただし瀬戸さんの仕事の中身に関する指摘に限り、ツール / システムの不具合や自分の処理状況の話は書かない。`;
 
-export const MIDDAY_BRIEF_SETO_PROMPT = `瀬戸さん向けの13時TODOチェックを作成するタスク。Agent Core support の ActiveTasks.md を正本として、この時点のスナップショットを読み、午後に向けた提案だけを短く出す。情報収集はツールで自由に行ってよいが、テキストとして文章を出力するのは最終ブリーフ 1 回のみとする。
+export const MIDDAY_BRIEF_SETO_PROMPT = `瀬戸さん向けの13時TODOチェックを作成するタスク。Google Drive の開発管理表をTODO正本、Agent Core support の ActiveTasks.md を補助メモとして、この時点のスナップショットを読み、午後に向けた提案だけを短く出す。情報収集はツールで自由に行ってよいが、テキストとして文章を出力するのは最終ブリーフ 1 回のみとする。
 
 ${BRIEF_OUTPUT_RULES}
 
-${ACTIVE_TASKS_READING_HINT}
+${TODO_SOURCE_READING_HINT}
 
 ${CALENDAR_READING_HINT}
 
@@ -93,10 +93,10 @@ ${TODO_HELP_PROPOSAL_HINT}
 5. 瀬戸さんへの次アクション 1〜3 件
 
 # 収集の手がかり（内部メモ。本文には絶対に書かない）
-- ActiveTasks.md を正本として読む。朝8:30の内容を暗記で再掲せず、この13時時点の内容を使う。
+- Google Drive の開発管理表をTODO正本として読む。朝8:30の内容を暗記で再掲せず、この13時時点の未完了行を使う。
 - calendar_list_events で今日 13:00〜23:59 JST の予定を参照し、TODOとは別セクションで扱う。
-- session-log / 直近会話 / issue 一覧は補助情報として使ってよい。
-- ActiveTasks.md そのもののファイル名・格納場所・取得経路は本文に書かない。
+- ActiveTasks.md / session-log / 直近会話 / issue 一覧は補助情報として使ってよい。
+- スプレッドシート名、ActiveTasks.md そのもののファイル名・格納場所・取得経路は本文に書かない。
 - 勝手に Issue 起票、メール送信、Chat 投稿、外部操作をしない。必要なら「手伝えます」と提案で止める。`;
 
 const WEEKDAY_JP = ['日', '月', '火', '水', '木', '金', '土'] as const;
