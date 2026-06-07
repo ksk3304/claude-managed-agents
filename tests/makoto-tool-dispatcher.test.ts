@@ -11,7 +11,10 @@ import {
   isMakotoToolName,
   MAKOTO_TOOL_NAMES,
 } from '../src/dispatch/makoto-tool-dispatcher';
-import { MAKOTO_AGENT_TOOLS } from '../src/lib/makoto-capability-registry';
+import {
+  buildMakotoAgentTools,
+  MAKOTO_AGENT_TOOLS,
+} from '../src/lib/makoto-capability-registry';
 import { putRefreshToken } from '../src/lib/oauth-vault';
 import {
   makeFetchMock,
@@ -41,11 +44,12 @@ function jsonResponse(status: number, body: unknown): Response {
 
 describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
   it('covers all tools', () => {
-    expect(MAKOTO_TOOL_NAMES.length).toBe(14);
+    expect(MAKOTO_TOOL_NAMES.length).toBe(20);
     expect(MAKOTO_TOOL_NAMES).toContain('chat_list_space_members');
     expect(MAKOTO_TOOL_NAMES).toContain('drive_stage_file');
     expect(MAKOTO_TOOL_NAMES).toContain('agentmail_read');
     expect(MAKOTO_TOOL_NAMES).toContain('makoto_introspect');
+    expect(MAKOTO_TOOL_NAMES).toContain('memory_manifest');
   });
   it('isMakotoToolName narrows correctly', () => {
     expect(isMakotoToolName('drive_search')).toBe(true);
@@ -55,7 +59,9 @@ describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
     expect(isMakotoToolName('drive_bogus')).toBe(false);
   });
   it('agent create tool schema stays aligned with dispatcher names', () => {
-    const customToolNames = MAKOTO_AGENT_TOOLS
+    const customToolNames = buildMakotoAgentTools({
+      CMA_MEMORY_WRAPPER_POC_ENABLED: '1',
+    } as Pick<Env, 'CMA_MEMORY_WRAPPER_POC_ENABLED'>)
       .filter((tool) => tool.type === 'custom')
       .map((tool) => tool.name);
     expect(customToolNames.sort()).toEqual([...MAKOTO_TOOL_NAMES].sort());
@@ -74,6 +80,12 @@ describe('MAKOTO_TOOL_NAMES + isMakotoToolName', () => {
       },
       required: [],
     });
+  });
+  it('default agent tools keep memory wrapper disabled until flag on', () => {
+    const customToolNames = MAKOTO_AGENT_TOOLS
+      .filter((tool) => tool.type === 'custom')
+      .map((tool) => tool.name);
+    expect(customToolNames).not.toContain('memory_manifest');
   });
 });
 
@@ -123,6 +135,18 @@ describe('dispatchMakotoTool error envelopes', () => {
     });
     expect(r.ok).toBe(false);
     expect((r.payload as Record<string, unknown>).error).toBe('oauth_missing');
+  });
+
+  it('memory wrapper tool is gated off until feature flag enables it', async () => {
+    const env = envWith(makeFetchMock(async () => new Response('', { status: 200 })));
+    const r = await dispatchMakotoTool('memory_manifest', {}, {
+      env,
+      userSlug: 'alice',
+      boundMessageId: 'm-1',
+      memoryAttachments: [],
+    });
+    expect(r.ok).toBe(false);
+    expect((r.payload as Record<string, unknown>).error).toBe('memory_wrapper_disabled');
   });
 });
 

@@ -397,6 +397,7 @@ Optional vars:
 | `EMAIL_DOMAIN` | Suffix for per-session inbox addresses |
 | `EMAIL_FROM` | Default sender for `cf_email_send` |
 | `EMAIL_FORWARD` | Fallback inbox for stray (non-session) email |
+| `CMA_MEMORY_WRAPPER_POC_ENABLED` | Issue #314 PoC flag. `1` enables self-managed memory bootstrap + `memory_manifest` / `memory_search` / `memory_read` / `memory_write` / `memory_update` / `memory_append_session_log`. Unset/off preserves current `/mnt/memory` path. |
 
 Optional bindings (declare in `wrangler.jsonc`):
 

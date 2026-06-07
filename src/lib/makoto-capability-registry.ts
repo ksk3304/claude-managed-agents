@@ -3,6 +3,11 @@ import { PERSONA_SPEC } from '../data/persona-spec';
 import { TOOLS_SPEC } from '../data/tools-spec';
 import { BUILT_IN_DOCUMENT_SKILL_IDS } from './attached-skills';
 import { buildPlaywrightMcpConfig } from './managed-agent-mcp';
+import {
+  isMemoryWrapperPocEnabled,
+  MEMORY_WRAPPER_TOOL_NAMES,
+  type MemoryWrapperToolName,
+} from './memory-wrapper';
 import { buildMakotoSystemPrompt } from './persona-builder';
 
 export type MakotoToolName =
@@ -19,7 +24,8 @@ export type MakotoToolName =
   | 'calendar_list_events'
   | 'chat_list_space_members'
   | 'agentmail_read'
-  | 'makoto_introspect';
+  | 'makoto_introspect'
+  | MemoryWrapperToolName;
 
 type IntrospectionDetail =
   | 'summary'
@@ -49,6 +55,7 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
   description: string;
   status: 'cloudflare_code' | 'cloudflare_code_live_observed' | 'cloudflare_code_live_unverified';
   requires_workspace_oauth: boolean;
+  feature_flag_env?: string;
 }> = [
   {
     name: 'drive_search',
@@ -135,21 +142,77 @@ export const MAKOTO_CUSTOM_TOOL_CAPABILITIES: ReadonlyArray<{
     status: 'cloudflare_code',
     requires_workspace_oauth: false,
   },
+  {
+    name: 'memory_manifest',
+    description: 'Return session-allowed memory store aliases, access, and sample paths.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
+  {
+    name: 'memory_search',
+    description: 'Search session-allowed memory stores by store_alias, path_prefix, and query.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
+  {
+    name: 'memory_read',
+    description: 'Read one exact memory by store_alias plus exact path.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
+  {
+    name: 'memory_write',
+    description: 'Create a new memory file in an allowed writable namespace. Use store_alias only; company_core and session_log are forbidden.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
+  {
+    name: 'memory_update',
+    description: 'Update an existing memory in an allowed writable namespace using expected_content_sha256 optimistic concurrency.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
+  {
+    name: 'memory_append_session_log',
+    description: 'Append one immutable session-log entry under the session_log store using append-only path semantics.',
+    status: 'cloudflare_code_live_unverified',
+    requires_workspace_oauth: false,
+    feature_flag_env: 'CMA_MEMORY_WRAPPER_POC_ENABLED',
+  },
 ];
 
 export const MAKOTO_TOOL_NAMES = MAKOTO_CUSTOM_TOOL_CAPABILITIES.map(
   (tool) => tool.name,
 ) as readonly MakotoToolName[];
 
-export const MAKOTO_AGENT_TOOLS: ReadonlyArray<Record<string, unknown>> = [
-  { type: 'agent_toolset_20260401' },
-  ...MAKOTO_CUSTOM_TOOL_CAPABILITIES.map((tool) => ({
+function customToolRecord(tool: (typeof MAKOTO_CUSTOM_TOOL_CAPABILITIES)[number]): Record<string, unknown> {
+  return {
     type: 'custom',
     name: tool.name,
     description: tool.description,
     input_schema: inputSchemaForTool(tool.name),
-  })),
-];
+  };
+}
+
+export function buildMakotoAgentTools(
+  env?: Pick<Env, 'CMA_MEMORY_WRAPPER_POC_ENABLED'>,
+): ReadonlyArray<Record<string, unknown>> {
+  const memoryWrapperEnabled = env ? isMemoryWrapperPocEnabled(env) : false;
+  return [
+    { type: 'agent_toolset_20260401' },
+    ...MAKOTO_CUSTOM_TOOL_CAPABILITIES.filter((tool) => {
+      if (!MEMORY_WRAPPER_TOOL_NAMES.includes(tool.name as MemoryWrapperToolName)) return true;
+      return memoryWrapperEnabled;
+    }).map(customToolRecord),
+  ];
+}
+
+export const MAKOTO_AGENT_TOOLS: ReadonlyArray<Record<string, unknown>> = buildMakotoAgentTools();
 
 const ACTION_MARKERS = [
   {
@@ -550,6 +613,76 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
         },
         [],
       );
+    case 'memory_manifest':
+      return objectSchema({}, []);
+    case 'memory_search':
+      return objectSchema(
+        {
+          store_alias: oneOfProp(
+            [
+              { type: 'string' },
+              { type: 'array', items: { type: 'string' } },
+            ],
+            'Optional one alias or alias list. Omit to search all allowed stores.',
+          ),
+          path_prefix: stringProp('Optional path prefix filter, e.g. /2026-06-07/.'),
+          query: stringProp('Optional keyword for path/content search.'),
+          max_results: numberProp('Optional result cap. 1-10, default 5.'),
+        },
+        [],
+      );
+    case 'memory_read':
+      return objectSchema(
+        {
+          store_alias: enumProp(
+            ['company_core', 'agent_core', 'daily_report', 'session_log'],
+            'Allowed canonical store alias.',
+          ),
+          path: stringProp('Exact memory path, e.g. /2026-06-07.md.'),
+        },
+        ['store_alias', 'path'],
+      );
+    case 'memory_write':
+      return objectSchema(
+        {
+          store_alias: enumProp(
+            ['agent_core', 'daily_report'],
+            'Writable canonical store alias. company_core and session_log are forbidden.',
+          ),
+          path: stringProp(
+            'New exact memory path. agent_core: /agent_learnings/, /preferences/, /projects/, /probes/issue-314/. daily_report: /YYYY-MM-DD.md or /YYYY/MM/DD.md.',
+          ),
+          content: stringProp('UTF-8 text content to create.'),
+        },
+        ['store_alias', 'path', 'content'],
+      );
+    case 'memory_update':
+      return objectSchema(
+        {
+          store_alias: enumProp(
+            ['agent_core', 'daily_report'],
+            'Writable canonical store alias. company_core and session_log are forbidden.',
+          ),
+          path: stringProp(
+            'Existing exact memory path in an allowed write namespace.',
+          ),
+          content: stringProp('New UTF-8 text content.'),
+          expected_content_sha256: stringProp(
+            'Current content_sha256 returned by memory_read or memory_search.',
+          ),
+        },
+        ['store_alias', 'path', 'content', 'expected_content_sha256'],
+      );
+    case 'memory_append_session_log':
+      return objectSchema(
+        {
+          date_label: stringProp('Target date in YYYY-MM-DD.'),
+          source_slug: stringProp('Path slug such as dm-k-seto or makoto-prime.'),
+          event_id: stringProp('Stable append-only event id.'),
+          entry_markdown: stringProp('Full markdown entry to create as one immutable log item.'),
+        },
+        ['date_label', 'source_slug', 'event_id', 'entry_markdown'],
+      );
   }
 }
 
@@ -578,4 +711,8 @@ function arrayProp(description: string): Record<string, unknown> {
 
 function enumProp(values: string[], description: string): Record<string, unknown> {
   return { type: 'string', enum: values, description };
+}
+
+function oneOfProp(values: Record<string, unknown>[], description: string): Record<string, unknown> {
+  return { oneOf: values, description };
 }

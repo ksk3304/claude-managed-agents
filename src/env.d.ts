@@ -86,6 +86,8 @@ declare namespace Cloudflare {
 
     /** Incident/debug-only payload audit switch. Normal operation leaves this unset/off. */
     CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Feature flag for Issue #314 memory wrapper PoC custom tools + bootstrap. */
+    CMA_MEMORY_WRAPPER_POC_ENABLED?: string;
     /** Reactive Chat session watchdog override in seconds. Unset = 600. */
     CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
     /** Reactive Chat stream timeout override in milliseconds. Unset = 110000. */

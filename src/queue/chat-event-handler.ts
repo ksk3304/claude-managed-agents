@@ -614,6 +614,9 @@ export async function handleChatEvent(
             currentSpaceName: spaceName,
             currentThreadName: threadName ?? undefined,
             anthropic: client,
+            memoryAttachments: userMapping.memory_attachments,
+            eventKey,
+            messageId: message.name,
           })
         : gateExternalToolCall(env, {
             eventKey,
@@ -1297,6 +1300,9 @@ export async function handleChatEvent(
                   currentSpaceName: spaceName,
                   currentThreadName: threadName ?? undefined,
                   anthropic: client,
+                  memoryAttachments: userMapping.memory_attachments,
+                  eventKey,
+                  messageId: message.name,
                 })
               : gateExternalToolCall(env, {
                   eventKey,

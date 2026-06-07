@@ -79,12 +79,21 @@ import {
   readUserMappingByAgentId,
   resolveSenderToResources,
 } from '../lib/memory-attach';
-import { toResourceParam, type MemoryStoreResourceParam } from '../types/memory';
+import {
+  toResourceParam,
+  type MemoryAttachment,
+  type MemoryStoreResourceParam,
+} from '../types/memory';
 import {
   buildAnthropicClient,
   createSessionWithResources,
   sendAndStreamWithToolDispatch,
 } from '../lib/session';
+import {
+  buildMemoryBootstrapBlock,
+  isMemoryWrapperPocEnabled,
+  storeMemoryWrapperSessionBinding,
+} from '../lib/memory-wrapper';
 import { scrubInternalStateForChat } from '../redact/internal-state';
 import { redactPiiInText } from '../redact/pii';
 import { findSessionByRfc822MessageId, recordSentMessage } from '../storage';
@@ -207,11 +216,13 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
   let userSlug = senderResolution?.user_slug ?? '';
   let agentId = senderResolution?.agent_id ?? '';
   let resources: MemoryStoreResourceParam[] = senderResolution?.resources ?? [];
+  let memoryAttachments = senderResolution?.full.memory_attachments ?? [];
 
   if (sessionId !== null && sessionAgentId) {
     const owner = await readUserMappingByAgentId(env.MAKOTO_KV, sessionAgentId);
     agentId = sessionAgentId;
     userSlug = owner?.mapping.user_slug ?? userSlug;
+    memoryAttachments = owner?.mapping.memory_attachments ?? memoryAttachments;
     if (!userSlug) {
       userSlug = `agent-${sessionAgentId.slice(-8)}`;
       console.warn(
@@ -230,9 +241,11 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     userSlug = fallback.userSlug;
     agentId = fallback.agentId;
     resources = fallback.resources;
+    memoryAttachments = fallback.memoryAttachments;
   }
 
   let userMessage: string;
+  let createdNewSession = false;
   if (sessionId === null) {
     try {
       sessionId = await createSessionWithResources(client, {
@@ -251,9 +264,25 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       // current lease expires.
       return { kind: 'release_and_retry', reason: 'sessions_create_failed' };
     }
+    createdNewSession = true;
     console.log(
       `[agentmail-dispatch] created session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey}`,
     );
+    if (isMemoryWrapperPocEnabled(env)) {
+      try {
+        await storeMemoryWrapperSessionBinding(env.MAKOTO_KV, {
+          sessionId,
+          userSlug,
+          memoryAttachments,
+        });
+      } catch (err) {
+        console.warn(
+          `[agentmail-dispatch] memory binding put failed session=${sessionId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
     if (isContinuation) {
       userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, signalBHistory)}`;
     } else {
@@ -300,6 +329,20 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     );
   }
 
+  if (createdNewSession && isMemoryWrapperPocEnabled(env)) {
+    try {
+      const bootstrap = await buildMemoryBootstrapBlock(client, memoryAttachments, sessionId);
+      userMessage = `${bootstrap}\n\n${userMessage}`;
+    } catch (err) {
+      console.error(
+        `[agentmail-dispatch] memory bootstrap failed eventKey=${eventKey} session=${sessionId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return { kind: 'release_and_retry', reason: 'memory_bootstrap_failed' };
+    }
+  }
+
   // 5. Drive the SDK event loop.
   let streamResult;
   try {
@@ -313,6 +356,8 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
           boundMessageId: rfc822MsgId,
           callerSessionId: sessionId!,
           anthropic: client,
+          memoryAttachments,
+          eventKey,
         }),
       timeoutMs: SESSION_STREAM_TIMEOUT_MS,
       payloadAudit: {
@@ -701,6 +746,7 @@ async function resolveDefaultMailOwner(
   userSlug: string;
   agentId: string;
   resources: MemoryStoreResourceParam[];
+  memoryAttachments: MemoryAttachment[];
 } | null> {
   const r = await readUserMappingWithDefault(env.MAKOTO_KV, '', env.DEFAULT_USER_SLUG);
   if (!r) return null;
@@ -708,6 +754,7 @@ async function resolveDefaultMailOwner(
     userSlug: r.mapping.user_slug,
     agentId: r.mapping.agent_id,
     resources: r.mapping.memory_attachments.map(toResourceParam),
+    memoryAttachments: r.mapping.memory_attachments,
   };
 }
 

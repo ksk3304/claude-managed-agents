@@ -25,7 +25,7 @@ import {
   actualStoreName,
   storePrefixForUserSlug,
 } from '../src/cli/store-config';
-import { MAKOTO_TOOL_NAMES } from '../src/lib/makoto-capability-registry';
+import { MAKOTO_AGENT_TOOLS } from '../src/lib/makoto-capability-registry';
 import { main } from '../src/cli/onboarding';
 
 // ---- in-memory fakes ----
@@ -298,7 +298,10 @@ describe('copyAgent', () => {
     const customToolNames = tools
       .filter((tool) => tool.type === 'custom')
       .map((tool) => tool.name);
-    expect(customToolNames.sort()).toEqual([...MAKOTO_TOOL_NAMES].sort());
+    const defaultCustomToolNames = MAKOTO_AGENT_TOOLS
+      .filter((tool) => tool.type === 'custom')
+      .map((tool) => tool.name);
+    expect(customToolNames.sort()).toEqual(defaultCustomToolNames.sort());
     expect(customToolNames).toContain('makoto_introspect');
   });
 

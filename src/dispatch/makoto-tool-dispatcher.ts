@@ -60,6 +60,15 @@ import {
   type MakotoToolName,
 } from '../lib/makoto-capability-registry';
 import {
+  dispatchMemoryWrapperTool,
+  isMemoryWrapperPocEnabled,
+  isMemoryWrapperToolName,
+  MemoryWrapperToolError,
+  verifyMemoryWrapperSessionBinding,
+} from '../lib/memory-wrapper';
+import { recordRuntimeEvent } from '../lib/observability';
+import { buildAnthropicClient } from '../lib/session';
+import {
   GoogleApiToolError,
   ToolSchemaError,
   createKvConfirmTokenStore,
@@ -98,6 +107,12 @@ export interface MakotoToolDispatchContext {
   currentThreadName?: string;
   /** Optional — required for tools that mount files into the active session. */
   anthropic?: Anthropic;
+  /** Session-bound memory attachments for the memory wrapper PoC. */
+  memoryAttachments?: import('../types/memory').MemoryAttachment[];
+  /** Observability event key. */
+  eventKey?: string;
+  /** Observability message id. */
+  messageId?: string;
   /** Optional fetch override for tests. */
   fetchImpl?: typeof fetch;
 }
@@ -191,6 +206,12 @@ export async function dispatchMakotoTool(
 
   if (name === 'chat_list_space_members') {
     return listChatSpaceMembers(args, ctx);
+  }
+
+  if (isMemoryWrapperToolName(name)) {
+    const result = await dispatchMemoryWrapperToolResult(name, args, ctx);
+    await recordMemoryWrapperEvent(name, args, result, ctx);
+    return result;
   }
 
   // Resolve per-user access token. Fail-close if the vault has no
@@ -496,4 +517,119 @@ function calendarDeps(
   const deps: CalendarToolDeps = { accessToken, refreshAccessToken };
   if (ctx.fetchImpl) deps.fetcher = ctx.fetchImpl;
   return deps;
+}
+
+async function dispatchMemoryWrapperToolResult(
+  name: import('../lib/memory-wrapper').MemoryWrapperToolName,
+  args: Record<string, unknown>,
+  ctx: MakotoToolDispatchContext,
+): Promise<MakotoToolResult> {
+  if (!isMemoryWrapperPocEnabled(ctx.env)) {
+    return {
+      ok: false,
+      payload: {
+        error: 'memory_wrapper_disabled',
+        tool: name,
+        message: 'memory wrapper PoC is disabled on this Worker',
+      },
+    };
+  }
+  const client = buildAnthropicClient(ctx.env);
+  if (!client) {
+    return {
+      ok: false,
+      payload: {
+        error: 'memory_unavailable',
+        tool: name,
+        message: 'Anthropic API key missing on this Worker',
+      },
+    };
+  }
+  const bindingVerification = await verifyMemoryWrapperSessionBinding(ctx.env.MAKOTO_KV, {
+    sessionId: ctx.callerSessionId,
+    userSlug: ctx.userSlug,
+    memoryAttachments: ctx.memoryAttachments ?? [],
+  });
+  if (!bindingVerification.ok) {
+    return {
+      ok: false,
+      payload: {
+        error: bindingVerification.reason ?? 'memory_binding_mismatch',
+        tool: name,
+        message: 'memory binding is not attached to this session/user context',
+        ...(bindingVerification.expected_hash
+          ? { expected_binding_hash: bindingVerification.expected_hash }
+          : {}),
+        ...(bindingVerification.actual_hash
+          ? { actual_binding_hash: bindingVerification.actual_hash }
+          : {}),
+      },
+    };
+  }
+  try {
+    return ok(
+      await dispatchMemoryWrapperTool(name, args, {
+        client,
+        memoryAttachments: ctx.memoryAttachments ?? [],
+        callerSessionId: ctx.callerSessionId,
+      }),
+    );
+  } catch (err) {
+    if (err instanceof MemoryWrapperToolError) {
+      const payload: Record<string, unknown> = {
+        error: err.code,
+        tool: name,
+        message: err.message,
+      };
+      if (err.status !== undefined) payload.status = err.status;
+      if (err.detail) payload.detail = err.detail;
+      return { ok: false, payload };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      payload: { error: 'unexpected', tool: name, message },
+    };
+  }
+}
+
+async function recordMemoryWrapperEvent(
+  name: import('../lib/memory-wrapper').MemoryWrapperToolName,
+  args: Record<string, unknown>,
+  result: MakotoToolResult,
+  ctx: MakotoToolDispatchContext,
+): Promise<void> {
+  if (!ctx.eventKey) return;
+  const payload = result.payload as Record<string, unknown>;
+  const storeAlias =
+    typeof args.store_alias === 'string'
+      ? args.store_alias
+      : name === 'memory_append_session_log'
+        ? 'session_log'
+        : null;
+  const path =
+    typeof args.path === 'string'
+      ? args.path
+      : typeof args.path_prefix === 'string'
+        ? args.path_prefix
+        : typeof args.date_label === 'string' &&
+            typeof args.source_slug === 'string' &&
+            typeof args.event_id === 'string'
+          ? `/${args.date_label}/${args.source_slug}/${args.event_id}.md`
+          : null;
+  await recordRuntimeEvent(ctx.env, {
+    eventKey: ctx.eventKey,
+    sessionId: ctx.callerSessionId ?? null,
+    messageId: ctx.messageId ?? null,
+    userSlug: ctx.userSlug,
+    eventType: 'memory_wrapper_tool',
+    source: 'makoto-tool-dispatcher',
+    detail: {
+      tool_name: name,
+      decision: result.ok ? 'allow' : 'fail',
+      store_alias: storeAlias,
+      path,
+      error: result.ok ? null : payload.error ?? null,
+    },
+  });
 }
