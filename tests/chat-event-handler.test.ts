@@ -1805,6 +1805,135 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('uploads recovered session output created before the retry window', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        OAUTH_VAULT_KEY: TEST_VAULT_KEY_B64,
+        OAUTH_CLIENT_ID: 'cid',
+        OAUTH_CLIENT_SECRET: 'csec',
+        MAKOTO_OAUTH_LEASE: makeFakeOAuthLeaseNamespace(),
+      },
+    });
+    await putRefreshToken(env.MAKOTO_KV, TEST_VAULT_KEY_B64, 'alice', 'refresh-token');
+    const msg = buildQueueMsg({
+      text: 'Drive上のExcelを埋めてください。ファイル名は 営業経歴書・振込口座登録依頼書_MAKOTO Prime記入済.xlsx。',
+    });
+    msg.receivedAtMs = Date.now() - 10 * 60_000;
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await preClaim(env, chatTurnProcessingKey(msg.eventKey), 'other-consumer');
+    await putMapping(env, 'alice@example.com');
+    await env.DB
+      .prepare(
+        `INSERT INTO cma_session_binds
+         (created_at_ms, expire_at_ms, session_key_hash, session_id, event_key,
+          message_id, user_slug, thread_name_hash, is_new_session)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+      )
+      .bind(
+        Date.now() - 5 * 60_000,
+        Date.now() + 86_400_000,
+        'hash',
+        'sesn_recovered_output_xlsx',
+        msg.eventKey,
+        msg.payload.message.name,
+        'alice',
+        'thread_hash',
+        1,
+      )
+      .run();
+
+    installFakeAnthropic({
+      sessionId: 'sesn_should_not_start',
+      events: [],
+      listEvents: [
+        {
+          type: 'user.message',
+          content: [{ type: 'text', text: msg.payload.message.text }],
+        },
+        {
+          type: 'agent.message',
+          content: [
+            {
+              type: 'text',
+              text:
+                '保存しました: /mnt/session/outputs/営業経歴書・振込口座登録依頼書_MAKOTO Prime記入済.xlsx',
+            },
+          ],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+    });
+
+    const uploadCalls: Array<{ auth: string | null; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      if (
+        url ===
+        'https://api.anthropic.com/v1/files?scope_id=sesn_recovered_output_xlsx&limit=20'
+      ) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: 'file_recovered_xlsx_1',
+                filename: '営業経歴書・振込口座登録依頼書_MAKOTO Prime記入済.xlsx',
+                mime_type:
+                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                size_bytes: 4830,
+                downloadable: true,
+                created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+                scope: { type: 'session', id: 'sesn_recovered_output_xlsx' },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(JSON.stringify({ access_token: 'drive-access', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url === 'https://api.anthropic.com/v1/files/file_recovered_xlsx_1/content') {
+        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), { status: 200 });
+      }
+      if (url.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+        const body = init.body as Blob;
+        uploadCalls.push({
+          auth: (init.headers as Headers).get('Authorization'),
+          body: await body.text(),
+        });
+        return new Response(
+          JSON.stringify({
+            id: 'drive-file-recovered-1',
+            name: '営業経歴書・振込口座登録依頼書_MAKOTO Prime記入済.xlsx',
+            webViewLink: 'https://docs.google.com/spreadsheets/d/drive-file-recovered-1/edit',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(`unexpected fetch url: ${url}`);
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+      expect(result.kind).toBe('committed');
+      expect(uploadCalls).toHaveLength(1);
+      expect(uploadCalls[0]!.auth).toBe('Bearer drive-access');
+      expect(uploadCalls[0]!.body).toContain('営業経歴書・振込口座登録依頼書_MAKOTO Prime記入済.xlsx');
+      const finalReply = chatApiMock.patches.at(-1)?.text ?? '';
+      expect(finalReply).toContain('*Driveに保存しました*');
+      expect(finalReply).toContain('https://docs.google.com/spreadsheets/d/drive-file-recovered-1/edit');
+      expect(finalReply).not.toContain('/mnt/session/outputs');
+      expect(runtimeEvents(env).map((row) => row.event_type)).toContain(
+        'cma_completed_session_recovered',
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('Case 2b: shared thread history uses User OAuth token instead of service account', async () => {
     const env = buildEnv({
       envOverrides: {

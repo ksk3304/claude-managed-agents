@@ -11,8 +11,9 @@ import {
 } from '../tools/drive';
 
 const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14,managed-agents-2026-04-01';
-const SESSION_OUTPUT_PATH_RE = /\/mnt\/session\/outputs\/([^\s"'<>),\]]+)/g;
-const ARTIFACT_FILENAME_HINT_RE = /\b[^\s"'<>),\]]+\.(xlsx|xlsm|docx|pptx|pdf|csv|tsv)\b/i;
+const SESSION_OUTPUT_PATH_RE =
+  /\/mnt\/session\/outputs\/([^\n"'<>]+?\.(?:xlsx|xlsm|docx|pptx|pdf|csv|tsv))/gi;
+const ARTIFACT_FILENAME_HINT_RE = /[^\s"'<>),\]]+\.(xlsx|xlsm|docx|pptx|pdf|csv|tsv)/i;
 const MAX_UPLOAD_FILES = 5;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;

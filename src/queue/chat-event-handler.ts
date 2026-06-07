@@ -1244,7 +1244,9 @@ export async function handleChatEvent(
   let sessionId: string;
   let assistantText: string;
   let sessionCostPrompt = '';
-  const sessionOutputMinCreatedAtMs = Date.now() - 60_000;
+  const sessionOutputMinCreatedAtMs = resolveSessionOutputMinCreatedAtMs(
+    body.receivedAtMs,
+  );
   try {
     try {
       let orchestrated:
@@ -1738,6 +1740,7 @@ export async function handleChatEvent(
   if (
     outputDelivery.uploaded.length > 0 ||
     outputDelivery.failures.length > 0 ||
+    outputDelivery.skipped.length > 0 ||
     outputDelivery.sanitizedPathCount > 0
   ) {
     console.log(
@@ -3170,6 +3173,13 @@ async function safeReleaseChatTurnProcessing(
       }`,
     );
   }
+}
+
+function resolveSessionOutputMinCreatedAtMs(receivedAtMs: unknown): number {
+  const base = typeof receivedAtMs === 'number' && Number.isFinite(receivedAtMs)
+    ? receivedAtMs
+    : Date.now();
+  return base - 60_000;
 }
 
 async function startParentLeaseHeartbeat(
