@@ -29,7 +29,7 @@ import {
   ensureManagedAgentSkills,
   hasAttachedSkills,
 } from './attached-skills';
-import { MAKOTO_AGENT_TOOLS } from './makoto-capability-registry';
+import { buildMakotoAgentTools } from './makoto-capability-registry';
 import { ensureManagedAgentTools } from './managed-agent-tools';
 import {
   buildPlaywrightMcpConfig,
@@ -40,6 +40,12 @@ import {
   routeMemoryAttachmentsForSession,
   type UserMappingValue,
 } from './memory-attach';
+import {
+  buildMemoryBootstrapBlock,
+  isMemoryWrapperPocEnabled,
+  memoryAttachmentBindingHash,
+  storeMemoryWrapperSessionBinding,
+} from './memory-wrapper';
 import {
   buildAnthropicClient,
   createSessionWithResources,
@@ -283,7 +289,7 @@ export async function buildChatCapabilitySessionKey(
   env: Env,
   resources: MemoryStoreResourceParam[] = [],
 ): Promise<string> {
-  const desiredAgentToolsHash = await toolsHash([...MAKOTO_AGENT_TOOLS]);
+  const desiredAgentToolsHash = await toolsHash([...buildMakotoAgentTools(env)]);
   const attachedSkillsHash = await skillsHash(buildAllManagedAgentSkills(env));
   const playwrightMcpConfig = buildPlaywrightMcpConfig(env);
   const desiredMcpHash = await playwrightMcpHash(playwrightMcpConfig);
@@ -403,6 +409,8 @@ export interface OrchestrateChatTurnInput {
    * なら envelope に 0 bytes (= 旧挙動互換).
    */
   rosterBlock?: string;
+  /** New-session memory wrapper bootstrap block. */
+  memoryBootstrapBlock?: string;
   /**
    * cap-recovery turn opt-in。`{recovery: true}` 時 body は RECOVERY_PROMPT
    * で完全差し替え (Python recovery semantics)。未指定 = 通常 turn (旧挙動互換).
@@ -454,6 +462,7 @@ export interface OrchestrateChatTurnResult {
 export type OrchestratorFailureReason =
   | 'no_anthropic_client'
   | 'sessions_create_failed'
+  | 'memory_bootstrap_failed'
   | 'stream_failed';
 
 export class OrchestratorFailure extends Error {
@@ -543,7 +552,7 @@ export async function orchestrateChatTurn(
   // Existing employee agents predate new Worker-side tools. Patch their tool
   // catalog in place before session reuse so model-visible tools and the
   // Worker dispatcher cannot drift.
-  const desiredAgentTools = MAKOTO_AGENT_TOOLS;
+  const desiredAgentTools = buildMakotoAgentTools(input.env);
   const desiredAgentToolsHash = await toolsHash([...desiredAgentTools]);
   try {
     const ensuredTools = await ensureManagedAgentTools(
@@ -656,11 +665,20 @@ export async function orchestrateChatTurn(
   // Google Chat は sender + space + thread の stable base key で CMA session を継続する。
   // capability suffix は旧KV互換と観測用 metadata に留める。deploy / MCP設定差分だけで
   // 同じ Chat thread が分裂しないよう、base miss 時だけ legacy suffix key へ fallback する。
+  // ただし memory wrapper 有効時は、running session に Memory store を後付けできないため、
+  // current capability key 専用にして memory binding 変更後の stale session 再利用を避ける。
+  const memoryWrapperEnabled = isMemoryWrapperPocEnabled(input.env);
+  const memoryBindingsHash = memoryWrapperEnabled
+    ? await memoryAttachmentBindingHash(input.userMapping.memory_attachments)
+    : undefined;
   const capabilitySessionKey = buildChatCapabilitySessionKeyFromHashes(
     desiredAgentToolsHash,
     attachedSkillsHash,
     desiredMcpHash,
-  ) + `:mcp-vault-${playwrightMcpVaultHash}:memory-${memoryResourcesHash}`;
+  ) +
+    `:mcp-vault-${playwrightMcpVaultHash}` +
+    `:memory-${memoryResourcesHash}` +
+    (memoryBindingsHash ? `:memory-wrapper-${memoryBindingsHash}` : '');
   const forceFreshSession = input.forceFreshSession === true;
   const baseSessionKey = forceFreshSession
     ? null
@@ -677,7 +695,7 @@ export async function orchestrateChatTurn(
   const sessionLookup = forceFreshSession
     ? emptyChatThreadSessionLookup('force_fresh', baseSessionKey, currentCapabilitySessionKey)
     : await resolveChatThreadSessionFromKv(kv, baseSessionKey, currentCapabilitySessionKey, {
-        currentCapabilityOnly: playwrightMcpConfig.attach,
+        currentCapabilityOnly: playwrightMcpConfig.attach || memoryWrapperEnabled,
       });
   let sessionId: string | null = sessionLookup.sessionId;
 
@@ -729,6 +747,21 @@ export async function orchestrateChatTurn(
         sessionId,
       );
     }
+    if (isMemoryWrapperPocEnabled(input.env)) {
+      try {
+        await storeMemoryWrapperSessionBinding(kv, {
+          sessionId,
+          userSlug: input.userMapping.user_slug,
+          memoryAttachments: input.userMapping.memory_attachments,
+        });
+      } catch (err) {
+        console.warn(
+          `[chat-event] memory binding put failed session=${sessionId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
   } else {
     console.log(
       `[chat-event] continuing session=${sessionId} agent=${input.userMapping.agent_id} ` +
@@ -775,10 +808,34 @@ export async function orchestrateChatTurn(
         selected_memory_store_names: routedMemory.selected_store_names,
         dropped_memory_store_names: routedMemory.dropped_store_names,
         memory_resources_hash: memoryResourcesHash,
+        memory_binding_hash: memoryBindingsHash ?? null,
       },
     });
   }
   await input.onSessionIdResolved?.(sessionId);
+
+  let memoryBootstrapBlock = input.memoryBootstrapBlock;
+  if (
+    !memoryBootstrapBlock &&
+    isNewSession &&
+    isMemoryWrapperPocEnabled(input.env)
+  ) {
+    try {
+      memoryBootstrapBlock = await buildMemoryBootstrapBlock(
+        client,
+        input.userMapping.memory_attachments,
+        sessionId,
+      );
+    } catch (err) {
+      throw new OrchestratorFailure(
+        'memory_bootstrap_failed',
+        `memory bootstrap failed for agent=${input.userMapping.agent_id}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        err,
+      );
+    }
+  }
 
   // ---- user message envelope ----
   // 完全版 envelope: cap-recovery + intent + speaker prefix + history + roster
@@ -801,6 +858,7 @@ export async function orchestrateChatTurn(
   if (input.historyBlock) envelopeOpts.history = input.historyBlock;
   if (input.intent) envelopeOpts.intent = input.intent;
   if (input.rosterBlock) envelopeOpts.roster = input.rosterBlock;
+  if (memoryBootstrapBlock) envelopeOpts.memoryBootstrap = memoryBootstrapBlock;
   if (input.cap) envelopeOpts.cap = input.cap;
   const userMessageText = buildUserMessageEnvelope(input.bodyText, envelopeOpts);
 

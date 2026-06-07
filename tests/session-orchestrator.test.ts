@@ -13,6 +13,16 @@ interface MakeClientOpts {
   streamEvents?: Array<Record<string, unknown>>;
   sessionIds?: string[];
   sendErrors?: Error[];
+  sendCapturePayloads?: unknown[];
+  memoryListItems?: Record<string, Array<Record<string, unknown>>>;
+}
+
+function asyncPage(items: Array<Record<string, unknown>>): AsyncIterable<Record<string, unknown>> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const item of items) yield item;
+    },
+  };
 }
 
 function makeClient(
@@ -53,15 +63,24 @@ function makeClient(
           return { id, args };
         },
         events: {
-          async send() {
+          async send(_sessionId: string, payload: unknown) {
             calls.push('events.send');
             const error = options.sendErrors?.[sendCallCount];
             sendCallCount += 1;
             if (error) throw error;
+            options.sendCapturePayloads?.push(payload);
           },
           async stream() {
             calls.push('events.stream');
             return stream();
+          },
+        },
+      },
+      memoryStores: {
+        memories: {
+          async list(memoryStoreId: string) {
+            calls.push('memories.list');
+            return asyncPage(options.memoryListItems?.[memoryStoreId] ?? []);
           },
         },
       },
@@ -193,6 +212,54 @@ describe('orchestrateChatTurn', () => {
       'mem_shared_log',
       'mem_extra_1',
     ]);
+  });
+
+  it('injects memory bootstrap on new session when memory wrapper flag is on', async () => {
+    const calls: string[] = [];
+    const sendPayloads: unknown[] = [];
+    const kv = makeKv();
+    const client = makeClient(calls, {
+      sendCapturePayloads: sendPayloads,
+      memoryListItems: {
+        mem_company: [{ type: 'memory', id: 'mem_1', path: '/company.md' }],
+      },
+    });
+
+    await orchestrateChatTurn({
+      env: {
+        ENVIRONMENT_ID: 'env_employee',
+        MAKOTO_KV: kv,
+        CMA_MEMORY_WRAPPER_POC_ENABLED: '1',
+      } as Env,
+      client,
+      senderEmail: 'alice@example.com',
+      spaceName: 'spaces/AAA',
+      spaceType: 'DM',
+      threadName: 'spaces/AAA/threads/T2',
+      bodyText: '直近の状況を教えて',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [
+          {
+            memory_store_id: 'mem_company',
+            access: 'read_only',
+            store_name: 'company_core',
+          },
+        ],
+      },
+      personaSpec: 'persona',
+      toolsSpec: 'tools',
+      toolDispatcher: async () => ({ ok: true, payload: null }),
+    });
+
+    const firstPayload = sendPayloads[0] as { events: Array<{ content: Array<{ text?: string }> }> };
+    const text = firstPayload.events[0]!.content[0]!.text ?? '';
+    expect(text).toContain('<memory_bootstrap>');
+    expect(text).toContain('memory_manifest');
+    expect(text).toContain('/mnt/memory is unavailable');
+    expect(await kv.get('memory_wrapper_binding:sesn_new')).not.toBeNull();
+    expect(calls).toContain('memories.list');
   });
 
   it('exposes the active session id before custom tool dispatch', async () => {

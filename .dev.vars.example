@@ -35,3 +35,10 @@ BACKUP_BUCKET_NAME=<bucket-name-matching-r2_buckets[].bucket_name>
 
 # Optional — fallback inbox for stray (non-session) email arriving on the catch-all.
 # EMAIL_FORWARD=ops@example.com
+
+# Optional — Issue #314 self-managed memory wrapper PoC.
+# "1" enables bootstrap + custom memory tools (`memory_manifest`,
+# `memory_search`, `memory_read`, `memory_write`, `memory_update`,
+# `memory_append_session_log`). Default unset/off keeps current `/mnt/memory`
+# path unchanged.
+# CMA_MEMORY_WRAPPER_POC_ENABLED=1

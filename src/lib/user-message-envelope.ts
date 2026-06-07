@@ -149,6 +149,11 @@ export interface BuildUserMessageEnvelopeOptions {
    * なら 0 bytes。
    */
   roster?: string;
+  /**
+   * self-managed memory wrapper bootstrap block。new session で only-once
+   * 注入し、`/mnt/memory` 非依存の読み方を agent に伝える。
+   */
+  memoryBootstrap?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +290,11 @@ function buildRosterSegment(roster: string | undefined): string {
   return r ? r : '';
 }
 
+function buildMemoryBootstrapSegment(memoryBootstrap: string | undefined): string {
+  const block = (memoryBootstrap || '').trim();
+  return block ? block : '';
+}
+
 /**
  * body 部分 (history + mention header + body or recovery prompt)。
  *
@@ -330,6 +340,7 @@ function buildBodySegment(
  *   <response_budget (only if low-information and no heavy signal)>
  *   <speaker context>
  *   <roster (if opts.roster)>
+ *   <memory bootstrap (if opts.memoryBootstrap)>
  *   <user_message body or recovery prompt>
  *   ```
  *
@@ -377,6 +388,11 @@ export function buildUserMessageEnvelope(
   const rosterSeg = buildRosterSegment(opts.roster);
   if (rosterSeg) {
     segments.push(rosterSeg);
+  }
+
+  const memoryBootstrapSeg = buildMemoryBootstrapSegment(opts.memoryBootstrap);
+  if (memoryBootstrapSeg) {
+    segments.push(memoryBootstrapSeg);
   }
 
   // 6. body / recovery (Python l.4195 byte 等価)

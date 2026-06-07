@@ -194,6 +194,8 @@ declare namespace Cloudflare {
      * Cloudflare KV. Default off. Enable only while observing an incident.
      */
     CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;
+    /** Feature flag for Issue #314 memory wrapper PoC custom tools + bootstrap. */
+    CMA_MEMORY_WRAPPER_POC_ENABLED?: string;
     /** Optional TTL in days for Cloudflare payload audit KV rows. */
     CMA_AUDIT_TTL_DAYS?: string;
     /** Optional max chars per string in Cloudflare payload audit records. */
