@@ -86,44 +86,6 @@ const SESSION_STREAM_TIMEOUT_MS = 110_000;
 const DEFAULT_SESSION_WATCHDOG_SEC = 600;
 const SESSION_TIMEOUT_RECOVERY_POLL_MS = 180_000;
 
-async function recordPromptCacheUsageFromStream(
-  env: Env,
-  input: {
-    eventKey?: string;
-    sessionId: string;
-    messageId?: string | null;
-    userSlug: string;
-    result: SendAndStreamResult;
-    recoveredFromWaitingResponse?: boolean;
-  },
-): Promise<void> {
-  if (!input.eventKey || !input.result.modelUsage) return;
-  const usage = input.result.modelUsage;
-  const cacheCreation5mInputTokens = usage.cache_creation_input_tokens;
-  const cacheReadInputTokens = usage.cache_read_input_tokens;
-  await recordRuntimeEvent(env, {
-    eventKey: input.eventKey,
-    sessionId: input.sessionId,
-    messageId: input.messageId ?? null,
-    userSlug: input.userSlug,
-    eventType: 'cma_prompt_cache_usage',
-    source: 'session-orchestrator',
-    detail: {
-      session_id: input.sessionId,
-      model_usage_span_count: input.result.modelUsageSpanCount,
-      input_tokens: usage.input_tokens,
-      output_tokens: usage.output_tokens,
-      cache_creation_5m_input_tokens: cacheCreation5mInputTokens,
-      cache_creation_input_tokens: cacheCreation5mInputTokens,
-      cache_read_input_tokens: cacheReadInputTokens,
-      prompt_cache_used:
-        cacheCreation5mInputTokens > 0 || cacheReadInputTokens > 0,
-      recovered_from_waiting_response:
-        input.recoveredFromWaitingResponse === true,
-    },
-  });
-}
-
 function parseCsvEnv(value: string | undefined): string[] {
   const unique = new Set<string>();
   for (const item of (value ?? '').split(',')) {
@@ -1006,13 +968,6 @@ export async function orchestrateChatTurn(
             sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
         },
       });
-      await recordPromptCacheUsageFromStream(input.env, {
-        eventKey: input.eventKey,
-        sessionId,
-        messageId: input.messageId ?? null,
-        userSlug: input.userMapping.user_slug,
-        result: streamResult,
-      });
     }
   } catch (err) {
     const canReplacePoisonedThreadSession =
@@ -1112,14 +1067,6 @@ export async function orchestrateChatTurn(
                 sessionWatchdogSec ?? DEFAULT_SESSION_WATCHDOG_SEC,
               recovered_from_waiting_response: true,
             },
-          });
-          await recordPromptCacheUsageFromStream(input.env, {
-            eventKey: input.eventKey,
-            sessionId,
-            messageId: input.messageId ?? null,
-            userSlug: input.userMapping.user_slug,
-            result: streamResult,
-            recoveredFromWaitingResponse: true,
           });
         }
       } catch (retryErr) {
