@@ -8,6 +8,7 @@ import {
   activeChatTurnSql,
   checkRequiredMarkers,
   collectActiveChatTurnGuard,
+  collectDeployManifestGuard,
   collectGitContext,
   collectServingLineage,
   evaluateBranchPolicy,
@@ -54,6 +55,49 @@ function git(root: string, args: string[]) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+}
+
+function writeManifest(
+  root: string,
+  input: {
+    issue?: number;
+    pr?: number;
+    base: string;
+    rollback?: string;
+    allowed?: string[];
+    blockedLabels?: string[];
+    commitLabels?: Array<{ commit: string; labels: string[] }>;
+    blockedMarkers?: string[];
+    mustPreserve?: string[];
+    blockedCommits?: Array<{ commit: string; reason?: string }>;
+  },
+) {
+  const manifestPath = path.join(root, "deploy-manifest.test.json");
+  writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      schema: 1,
+      environment: "production",
+      issue: input.issue ?? 336,
+      pr: input.pr ?? 72,
+      serving_base_commit: input.base,
+      rollback_target_commit: input.rollback ?? input.base,
+      allowed_commits: input.allowed ?? [],
+      blocked_labels: input.blockedLabels ?? ["no-prod-deploy"],
+      commit_labels: input.commitLabels ?? [],
+      blocked_markers: input.blockedMarkers ?? [],
+      must_preserve_commits: input.mustPreserve ?? [],
+      blocked_commits: input.blockedCommits ?? [],
+      state_changes: {
+        secrets: [],
+        vars: [],
+        d1_migrations: [],
+        kv_writes: [],
+        queues: [],
+      },
+    }),
+  );
+  return manifestPath;
 }
 
 function makeGitRoot() {
@@ -185,9 +229,11 @@ describe("deploy guard", () => {
   it("allows GitHub Actions deploy from main when fresh and markers exist", () => {
     const root = makeGitRoot();
     const head = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base: head });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",
@@ -222,9 +268,11 @@ describe("deploy guard", () => {
     git(root, ["branch", "-f", "origin/main", "main"]);
     git(root, ["checkout", "codex/stale-worktree"]);
     const staleHead = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base: staleHead });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         DEPLOY_GUARD_ALLOW_LOCAL_DEPLOY: "1",
         DEPLOY_GUARD_LOCAL_DEPLOY_REASON: "test stale branch local deploy",
@@ -317,9 +365,11 @@ describe("deploy guard", () => {
     git(root, ["commit", "-m", "serving hotfix"]);
     const servingHotfix = git(root, ["rev-parse", "HEAD"]);
     git(root, ["checkout", "main"]);
+    const manifestPath = writeManifest(root, { base: servingHotfix });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",
@@ -342,9 +392,11 @@ describe("deploy guard", () => {
     const mustPreserve = git(root, ["rev-parse", "HEAD"]);
     git(root, ["checkout", "main"]);
     const mainHead = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base: mainHead, mustPreserve: [mustPreserve] });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",
@@ -368,6 +420,7 @@ describe("deploy guard", () => {
     const ledgerHotfix = git(root, ["rev-parse", "HEAD"]);
     git(root, ["checkout", "main"]);
     const mainHead = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base: mainHead });
     writeFileSync(
       path.join(root, "deploy-must-preserve.json"),
       JSON.stringify({
@@ -391,6 +444,7 @@ describe("deploy guard", () => {
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",
@@ -408,6 +462,7 @@ describe("deploy guard", () => {
   it("passes serving lineage when HEAD contains the current serving commit", () => {
     const root = makeGitRoot();
     const mainHead = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base: mainHead });
 
     const lineage = collectServingLineage(root, readDeployTarget(root), {
       deployments: deploymentFor(mainHead),
@@ -427,9 +482,11 @@ describe("deploy guard", () => {
     const root = makeGitRoot();
     const head = git(root, ["rev-parse", "HEAD"]);
     const nowMs = 1_780_474_000_000;
+    const manifestPath = writeManifest(root, { base: head });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       nowMs,
       env: {
         GITHUB_ACTIONS: "true",
@@ -450,6 +507,112 @@ describe("deploy guard", () => {
     expect(result.failures).toContainEqual(
       expect.stringContaining("active Chat turn processing leases exist"),
     );
+  });
+
+  it("requires a deploy manifest for production deploys", () => {
+    const root = makeGitRoot();
+    const head = git(root, ["rev-parse", "HEAD"]);
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(head),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.deployManifest.failures).toContainEqual(
+      expect.stringContaining("deploy manifest is required"),
+    );
+  });
+
+  it("blocks deploy range commits that are outside the manifest allowlist", () => {
+    const root = makeGitRoot();
+    const base = git(root, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(root, "feature-a.txt"), "allowed\n");
+    git(root, ["add", "feature-a.txt"]);
+    git(root, ["commit", "-m", "allowed feature"]);
+    const allowed = git(root, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(root, "feature-b.txt"), "not listed\n");
+    git(root, ["add", "feature-b.txt"]);
+    git(root, ["commit", "-m", "unlisted feature"]);
+    const head = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, { base, allowed: [allowed] });
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      manifestPath,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(base),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.deployManifest.range).toContain(head);
+    expect(result.failures).toContainEqual(
+      expect.stringContaining("is not listed in deploy manifest allowed_commits"),
+    );
+  });
+
+  it("blocks manifest commits carrying no-prod-deploy labels", () => {
+    const root = makeGitRoot();
+    const base = git(root, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(root, "poc.txt"), "memory wrapper PoC\n");
+    git(root, ["add", "poc.txt"]);
+    git(root, ["commit", "-m", "memory wrapper PoC"]);
+    const poc = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, {
+      base,
+      allowed: [poc],
+      commitLabels: [{ commit: poc, labels: ["no-prod-deploy"] }],
+    });
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      manifestPath,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: deploymentFor(base),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.deployManifest.blockedLabels[0].matches).toContain("no-prod-deploy");
+  });
+
+  it("blocks deploy range commits with blocked markers", () => {
+    const root = makeGitRoot();
+    const base = git(root, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(root, "prompt-cache.txt"), "cache_control 400 repro\n");
+    git(root, ["add", "prompt-cache.txt"]);
+    git(root, ["commit", "-m", "prompt cache no-prod-deploy"]);
+    const commit = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, {
+      base,
+      allowed: [commit],
+      blockedMarkers: ["no-prod-deploy"],
+    });
+
+    const guard = collectDeployManifestGuard(
+      root,
+      {
+        head: commit,
+      },
+      {
+        effective: {
+          commit: base,
+        },
+      },
+      { manifestPath },
+    );
+
+    expect(guard.ok).toBe(false);
+    expect(guard.blockedMarkers[0].matches).toContain("no-prod-deploy");
   });
 
   it("allows an explicit active Chat turn guard override with a reason", () => {
@@ -482,9 +645,11 @@ describe("deploy guard", () => {
     git(root, ["commit", "-m", "serving hotfix"]);
     const servingHotfix = git(root, ["rev-parse", "HEAD"]);
     git(root, ["checkout", "main"]);
+    const manifestPath = writeManifest(root, { base: servingHotfix });
 
     const result = evaluateDeployGuard(root, {
       fetchRemote: false,
+      manifestPath,
       env: {
         GITHUB_ACTIONS: "true",
         GITHUB_REF_NAME: "main",

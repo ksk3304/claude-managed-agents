@@ -20,6 +20,7 @@ export const REQUIRED_MARKERS = [
 export const PRODUCTION_BRANCHES = ['main', 'master'];
 export const MUST_PRESERVE_FILE = 'deploy-must-preserve.json';
 export const ACTIVE_CHAT_TURN_LIMIT = 5;
+export const DEFAULT_BLOCKED_LABELS = ['no-prod-deploy', 'no-deploy', 'poc', 'proof-of-concept'];
 
 function readText(file) {
   return readFileSync(file, 'utf8');
@@ -55,6 +56,28 @@ function splitCommitList(value = '') {
     .split(/[\s,]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeCommitEntry(entry) {
+  if (typeof entry === 'string') return { commit: entry, issue: '', pr: '', reason: '' };
+  return {
+    commit: String(entry?.commit ?? ''),
+    issue: String(entry?.issue ?? ''),
+    pr: String(entry?.pr ?? ''),
+    reason: String(entry?.reason ?? ''),
+  };
+}
+
+function normalizeLabel(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean))];
 }
 
 export function extractCfRepoCommit(message = '') {
@@ -391,6 +414,215 @@ function commitIsAncestor(root, commit, descendant = 'HEAD') {
   }
 }
 
+function revParseCommit(root, commit) {
+  if (!commit) return '';
+  return tryGit(root, ['rev-parse', '--verify', `${commit}^{commit}`]);
+}
+
+function commitsInRange(root, base, head = 'HEAD') {
+  if (!base) return [];
+  const raw = tryGit(root, ['rev-list', '--reverse', `${base}..${head}`]);
+  return raw ? raw.split('\n').filter(Boolean) : [];
+}
+
+function commitMessage(root, commit) {
+  return tryGit(root, ['log', '-1', '--format=%B', commit]);
+}
+
+export function readDeployManifest(root, options = {}) {
+  const env = options.env ?? process.env;
+  const manifestPath = options.manifestPath ?? env.DEPLOY_GUARD_MANIFEST ?? '';
+  if (!manifestPath) {
+    return {
+      ok: false,
+      required: true,
+      path: '',
+      manifest: null,
+      failures: ['deploy manifest is required for production deploys; pass --manifest <path> or set DEPLOY_GUARD_MANIFEST'],
+    };
+  }
+
+  const absPath = path.isAbsolute(manifestPath) ? manifestPath : path.join(root, manifestPath);
+  try {
+    const manifest = JSON.parse(readText(absPath));
+    return {
+      ok: true,
+      required: true,
+      path: absPath,
+      manifest,
+      failures: [],
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      required: true,
+      path: absPath,
+      manifest: null,
+      failures: [`could not read deploy manifest ${absPath}: ${err instanceof Error ? err.message : String(err)}`],
+    };
+  }
+}
+
+function manifestCommitEntries(manifest, key) {
+  return asArray(manifest?.[key]).map(normalizeCommitEntry).filter((entry) => entry.commit);
+}
+
+function manifestLabelsByCommit(manifest) {
+  const map = new Map();
+  for (const entry of asArray(manifest?.commit_labels)) {
+    const commit = String(entry?.commit ?? '');
+    if (!commit) continue;
+    map.set(commit, asArray(entry?.labels).map(normalizeLabel).filter(Boolean));
+  }
+  return map;
+}
+
+function stateChangeSummary(manifest) {
+  const state = manifest?.state_changes ?? {};
+  return {
+    secrets: asArray(state.secrets).length,
+    vars: asArray(state.vars).length,
+    d1Migrations: asArray(state.d1_migrations).length,
+    kvWrites: asArray(state.kv_writes).length,
+    queues: asArray(state.queues).length,
+  };
+}
+
+export function collectDeployManifestGuard(root, git, servingLineage, options = {}) {
+  const read = readDeployManifest(root, options);
+  const failures = [...read.failures];
+  const manifest = read.manifest;
+  const range = [];
+  const allowedCommits = new Set();
+  const blockedCommits = [];
+  const blockedLabels = [];
+  const blockedMarkers = [];
+  const mustPreserveChecks = [];
+  const requiredFields = ['environment', 'issue', 'pr', 'serving_base_commit', 'rollback_target_commit', 'state_changes'];
+
+  if (!manifest) {
+    return {
+      ok: false,
+      path: read.path,
+      manifest: null,
+      range,
+      allowedCommits: [],
+      blockedCommits,
+      blockedLabels,
+      blockedMarkers,
+      mustPreserveChecks,
+      stateChanges: stateChangeSummary(null),
+      failures,
+    };
+  }
+
+  for (const field of requiredFields) {
+    if (manifest[field] === undefined || manifest[field] === null || manifest[field] === '') {
+      failures.push(`deploy manifest missing required field: ${field}`);
+    }
+  }
+  if (manifest.environment && manifest.environment !== 'production') {
+    failures.push(`deploy manifest environment must be production, got ${manifest.environment}`);
+  }
+
+  const servingBase = String(manifest.serving_base_commit ?? servingLineage?.effective?.commit ?? '');
+  const rollbackTarget = String(manifest.rollback_target_commit ?? '');
+  if (servingBase && !revParseCommit(root, servingBase)) {
+    failures.push(`deploy manifest serving_base_commit not found locally: ${servingBase}`);
+  }
+  if (rollbackTarget && !revParseCommit(root, rollbackTarget)) {
+    failures.push(`deploy manifest rollback_target_commit not found locally: ${rollbackTarget}`);
+  }
+  if (servingLineage?.effective?.commit && servingBase && shortCommit(servingLineage.effective.commit) !== shortCommit(revParseCommit(root, servingBase) || servingBase)) {
+    failures.push(
+      `deploy manifest serving_base_commit ${shortCommit(servingBase)} does not match current serving cf-repo ${shortCommit(servingLineage.effective.commit)}`,
+    );
+  }
+
+  if (servingBase && revParseCommit(root, servingBase)) {
+    range.push(...commitsInRange(root, servingBase, git.head));
+  }
+
+  for (const entry of manifestCommitEntries(manifest, 'allowed_commits')) {
+    const resolved = revParseCommit(root, entry.commit);
+    if (!resolved) {
+      failures.push(`deploy manifest allowed commit not found locally: ${entry.commit}`);
+    } else {
+      allowedCommits.add(resolved);
+    }
+  }
+  for (const commit of range) {
+    if (!allowedCommits.has(commit)) {
+      failures.push(`deploy range commit ${shortCommit(commit)} is not listed in deploy manifest allowed_commits`);
+    }
+  }
+
+  for (const entry of manifestCommitEntries(manifest, 'blocked_commits')) {
+    const resolved = revParseCommit(root, entry.commit);
+    const inRange = resolved && range.includes(resolved);
+    const check = { ...entry, commit: resolved || entry.commit, inRange };
+    blockedCommits.push(check);
+    if (inRange) {
+      failures.push(`deploy range contains blocked commit ${shortCommit(check.commit)}${entry.reason ? ` (${entry.reason})` : ''}`);
+    }
+  }
+
+  const labelsByCommit = manifestLabelsByCommit(manifest);
+  const blockedLabelSet = new Set(
+    uniqueStrings([
+      ...DEFAULT_BLOCKED_LABELS,
+      ...asArray(manifest.blocked_labels).map(normalizeLabel),
+    ]),
+  );
+  for (const commit of range) {
+    const labels = asArray(labelsByCommit.get(commit) ?? labelsByCommit.get(shortCommit(commit))).map(normalizeLabel);
+    const matches = labels.filter((label) => blockedLabelSet.has(label));
+    if (matches.length > 0) {
+      const check = { commit, labels, matches };
+      blockedLabels.push(check);
+      failures.push(`deploy range commit ${shortCommit(commit)} has blocked label(s): ${matches.join(', ')}`);
+    }
+  }
+
+  const markerList = asArray(manifest.blocked_markers).map(String).filter(Boolean);
+  for (const commit of range) {
+    const message = commitMessage(root, commit);
+    const matches = markerList.filter((marker) => message.includes(marker));
+    if (matches.length > 0) {
+      const check = { commit, matches };
+      blockedMarkers.push(check);
+      failures.push(`deploy range commit ${shortCommit(commit)} contains blocked marker(s): ${matches.join(', ')}`);
+    }
+  }
+
+  for (const entry of manifestCommitEntries(manifest, 'must_preserve_commits')) {
+    const check = commitIsAncestor(root, entry.commit, git.head);
+    const result = { ...entry, ok: check.ok, error: check.error };
+    mustPreserveChecks.push(result);
+    if (!check.ok) {
+      const detail = [entry.issue, entry.reason].filter(Boolean).join(' ');
+      failures.push(
+        `deploy manifest must-preserve commit ${shortCommit(entry.commit)} is not contained in HEAD` +
+          (detail ? ` (${detail})` : ''),
+      );
+    }
+  }
+
+  return {
+    ok: failures.length === 0,
+    path: read.path,
+    manifest,
+    range,
+    allowedCommits: [...allowedCommits],
+    blockedCommits,
+    blockedLabels,
+    blockedMarkers,
+    mustPreserveChecks,
+    stateChanges: stateChangeSummary(manifest),
+    failures,
+  };
+}
+
 export function collectServingLineage(root, target, options = {}) {
   const env = options.env ?? process.env;
   let deployments = null;
@@ -547,6 +779,7 @@ export function evaluateDeployGuard(root, options = {}) {
   const runContextPolicy = evaluateRunContextPolicy(env);
   const markerChecks = checkRequiredMarkers(root, options.requirements ?? REQUIRED_MARKERS);
   const servingLineage = collectServingLineage(root, target, options);
+  const deployManifest = collectDeployManifestGuard(root, git, servingLineage, options);
   const activeChatTurns = collectActiveChatTurnGuard(root, options);
   const failures = [];
 
@@ -574,6 +807,7 @@ export function evaluateDeployGuard(root, options = {}) {
     }
   }
   failures.push(...servingLineage.failures);
+  failures.push(...deployManifest.failures);
   failures.push(...activeChatTurns.failures);
 
   return {
@@ -584,6 +818,7 @@ export function evaluateDeployGuard(root, options = {}) {
     runContextPolicy,
     markerChecks,
     servingLineage,
+    deployManifest,
     activeChatTurns,
     failures,
   };
@@ -665,6 +900,41 @@ export function renderReport(result) {
       );
     }
   }
+  if (result.deployManifest) {
+    const manifest = result.deployManifest;
+    lines.push(
+      `[deploy-guard] manifest=${manifest.path || '(missing)'} ` +
+        `range_commits=${manifest.range.length} allowed_commits=${manifest.allowedCommits.length}`,
+    );
+    if (manifest.manifest) {
+      lines.push(
+        `[deploy-guard] manifest_issue=${manifest.manifest.issue ?? '(missing)'} ` +
+          `pr=${manifest.manifest.pr ?? '(missing)'} rollback=${shortCommit(String(manifest.manifest.rollback_target_commit ?? '')) || '(missing)'}`,
+      );
+      const state = manifest.stateChanges;
+      lines.push(
+        `[deploy-guard] state_changes secrets=${state.secrets} vars=${state.vars} d1_migrations=${state.d1Migrations} kv_writes=${state.kvWrites} queues=${state.queues}`,
+      );
+    }
+    for (const check of manifest.blockedCommits ?? []) {
+      if (check.inRange) {
+        lines.push(`[deploy-guard] BLOCK manifest blocked commit ${shortCommit(check.commit)}${check.reason ? ` ${check.reason}` : ''}`);
+      }
+    }
+    for (const check of manifest.blockedLabels ?? []) {
+      lines.push(`[deploy-guard] BLOCK manifest blocked label ${shortCommit(check.commit)} ${check.matches.join(', ')}`);
+    }
+    for (const check of manifest.blockedMarkers ?? []) {
+      lines.push(`[deploy-guard] BLOCK manifest blocked marker ${shortCommit(check.commit)} ${check.matches.join(', ')}`);
+    }
+    for (const check of manifest.mustPreserveChecks ?? []) {
+      const detail = [check.issue, check.reason].filter(Boolean).join(' ');
+      lines.push(
+        `[deploy-guard] ${check.ok ? 'OK' : 'BLOCK'} manifest must-preserve ${shortCommit(check.commit)}` +
+          (detail ? ` ${detail}` : ''),
+      );
+    }
+  }
   const chatTurns = result.activeChatTurns;
   if (chatTurns) {
     lines.push(
@@ -697,7 +967,13 @@ export function renderReport(result) {
 function main() {
   const root = process.cwd();
   const noFetch = process.env.DEPLOY_GUARD_SKIP_FETCH === '1' || process.argv.includes('--no-fetch');
-  const result = evaluateDeployGuard(root, { fetchRemote: !noFetch });
+  const manifestIndex = process.argv.indexOf('--manifest');
+  const manifestPath = manifestIndex >= 0 ? process.argv[manifestIndex + 1] : undefined;
+  if (manifestIndex >= 0 && !manifestPath) {
+    process.stderr.write('ERROR: --manifest requires a path\n');
+    process.exit(2);
+  }
+  const result = evaluateDeployGuard(root, { fetchRemote: !noFetch, manifestPath });
   const output = renderReport(result);
   const stream = result.ok ? process.stdout : process.stderr;
   stream.write(`${output}\n`);

@@ -13,11 +13,12 @@ claude-managed-agents-control-plane
 `npm run deploy` therefore runs `scripts/deploy-guard.mjs` before build or
 Wrangler deployment. The guard fails closed when it cannot prove the worktree is
 fresh enough, when it is not running from the approved deployment runner, or
-when known required fix markers are missing.
+when known required fix markers are missing, or when the production deploy
+manifest does not explicitly allow the commit range.
 
 ## Adopted Operating Level
 
-Current level: **3.7. Serving lineage guard + must-preserve ledger**.
+Current level: **3.8. Serving lineage + manifest allowlist**.
 
 | Level | Safety | Downsides | Migration cost |
 | --- | --- | --- | --- |
@@ -25,14 +26,14 @@ Current level: **3.7. Serving lineage guard + must-preserve ledger**.
 | 3. PR + deploy guard + `main`/`master` only | Forces normal production deploys to happen after PR merge, from the canonical branch. Prevents old or experimental worktrees from deploying even when rebased. | Emergency branch deploys need an explicit override. Direct `wrangler deploy` still bypasses npm lifecycle hooks. | Low to medium. Implemented in this repo by branch policy in `scripts/deploy-guard.mjs`. |
 | 3.5. GitHub Actions normal deploy + guarded emergency local deploy | Normal deploy source is GitHub Actions on `main`/`master`, with tests/typecheck before deploy and a single deploy concurrency group. Local npm deploy requires explicit emergency env + reason. | Direct `wrangler deploy` still bypasses npm lifecycle hooks. Local credentials remain available for emergency use. | Medium. Implemented by `.github/workflows/deploy-production.yml` plus deploy runner policy. |
 | 3.7. Serving lineage guard + must-preserve ledger | Blocks deploys that do not contain the currently serving `cf-repo` commit or active must-preserve hotfix commits. This closes the #226/#233/#264 class where a branch was fresh against `origin/main` but still dropped a production hotfix. | Requires Cloudflare deployment metadata readback. Unmarked/secret-triggered deployments use the previous marked code deployment as effective code lineage; no marked lineage fails closed. | Medium. Implemented by serving lineage checks in `scripts/deploy-guard.mjs`. |
+| 3.8. Manifest allowlist + staging-first workflow | Production deploy needs a JSON manifest that lists the allowed commit range, serving base, rollback target, must-preserve commits, blocked labels/markers, and state changes. PR branches can deploy to env.staging first. | Manifest creation is explicit and slightly heavier. Direct `wrangler deploy` remains a residual bypass risk. | Medium. Implemented by `scripts/deploy-guard.mjs`, `deploy-manifests/`, and `scripts/deploy-staging.mjs`. |
 | 4. GitHub Actions only + local token removal | Best protection against stale local worktrees and direct Wrangler deploys. Deploy source becomes auditable in GitHub. | Requires repository secrets, branch protection, incident fallback, and Cloudflare token rotation/removal from laptops. Secrets outage can block urgent deploys. | Medium to high. Not adopted yet. |
 
-Level 3.7 is the current default because #226's Level 3.5 guard was not enough:
-it proved the candidate contained `origin/main`, but did not prove the candidate
-contained the code already serving production. Issue #233 and the 2026-06-02
-`656a5eb` incident showed that this is an old recurring deploy-clobber problem,
-not a fresh isolated bug. Level 4 remains the next migration once local token
-removal, break-glass ownership, and secret rotation are ready.
+Level 3.8 is the current default because Level 3.7 still allowed "merged to
+main but not approved for production" changes to ride the next deploy. Issue
+#314's no-deploy memory wrapper PoC and #323's prompt-cache regression are the
+model failures this level blocks. Level 4 remains the next migration once local
+token removal, break-glass ownership, and secret rotation are ready.
 
 ## What It Reports
 
@@ -49,6 +50,8 @@ The guard prints:
 - required marker checks
 - current serving `cf-repo` read from Cloudflare deployment metadata
 - active must-preserve commits
+- deploy manifest path, range size, state-change summary, blocked labels/markers, and manifest must-preserve checks
+- active Chat turn lease readback status
 
 Dirty working trees are reported but not blocked, because the existing prebuild
 flow can patch `wrangler.jsonc` with account-local resource IDs.
@@ -65,6 +68,11 @@ Production deploy is blocked when:
 - Cloudflare deployment metadata cannot identify the current serving code line
 - `HEAD` does not contain the current serving `cf-repo` commit
 - `HEAD` does not contain an active must-preserve commit
+- no deploy manifest is supplied
+- a commit in `serving_base_commit..HEAD` is missing from manifest `allowed_commits`
+- a range commit is listed in manifest `blocked_commits`, has a manifest label matching `blocked_labels`, or contains a `blocked_markers` string in its commit message
+- a manifest `must_preserve_commits` entry is not contained in `HEAD`
+- active Chat turn-processing leases are present or D1 readback cannot be verified
 
 In GitHub Actions detached checkout, `GITHUB_REF_NAME` is treated as the
 effective deploy branch.
@@ -141,6 +149,56 @@ commit was merged, cherry-picked, or intentionally superseded. `DEPLOY_GUARD_MUS
 can add temporary space/comma-separated commits for incident work, but permanent
 records belong in the ledger file.
 
+## Deploy Manifest
+
+Pass a manifest to production deploys:
+
+```sh
+DEPLOY_GUARD_MANIFEST=deploy-manifests/issue-336.json npm run predeploy -- --no-fetch
+DEPLOY_GUARD_MANIFEST=deploy-manifests/issue-336.json npm run deploy
+```
+
+`deploy-manifests/README.md` documents the JSON schema. The manifest must
+include:
+
+- `issue` and `pr`
+- `serving_base_commit`
+- `rollback_target_commit`
+- `allowed_commits`
+- `blocked_labels` / `blocked_markers` / optional `commit_labels`
+- `must_preserve_commits`
+- `state_changes` with explicit `secrets`, `vars`, `d1_migrations`, `kv_writes`, and `queues` arrays
+
+Every commit in `serving_base_commit..HEAD` must be allowlisted. A commit
+carrying `no-prod-deploy`, `no-deploy`, `poc`, or `proof-of-concept` blocks
+production unless it is removed from the range. This is the guard for #314-style
+no-deploy PoC and #323-style prompt-cache regressions riding a later deploy.
+
+Cloudflare Worker versions/deployments track code/config deployments. KV
+values, D1 data, Queue content, and secret/value changes are operational state
+changes, so record them in `state_changes` and get separate approval before
+applying them.
+
+## Staging Deploy
+
+Use staging before production when a PR branch needs real-device Google Chat
+testing:
+
+```sh
+npm run deploy:staging:dry-run
+npm run deploy:staging -- --yes
+```
+
+The staging wrapper runs `scripts/check-staging-safety.mjs` and `npm run build`
+before any deploy. `--yes` is required for the actual
+`wrangler deploy --env staging --strict`. D1 remote migrations are skipped
+unless `--migrate --yes` is also supplied.
+
+Staging uses `env.staging` in `wrangler.jsonc`, with a separate Worker name, D1,
+KV, Queues, and disabled external side effects for the initial phase. Use
+`npm run check:staging-chat-smoke-ready` before connecting a real staging Google
+Chat app.
+
 ## Normal Deploy
 
 Use the `deploy-production` GitHub Actions workflow from `main` or `master`
@@ -191,15 +249,16 @@ npm run deploy
 ```
 
 Overrides only bypass their matching runner/branch rules. Freshness, required
-marker, serving-lineage, and must-preserve checks still fail closed. Record the
-incident and follow up with a PR merge back to `main`.
+marker, serving-lineage, manifest, active Chat turn, and must-preserve checks
+still fail closed. Record the incident and follow up with a PR merge back to
+`main`.
 
 ## Dry Run
 
 For local guard-only checks:
 
 ```sh
-npm run predeploy -- --no-fetch
+DEPLOY_GUARD_MANIFEST=deploy-manifests/issue-336.json npm run predeploy -- --no-fetch
 ```
 
 `--no-fetch` skips network refresh and uses local refs only. Do not use it as a
