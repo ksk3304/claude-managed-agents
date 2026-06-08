@@ -92,10 +92,6 @@ declare namespace Cloudflare {
     CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
     /** Reactive Chat stream timeout override in milliseconds. Unset = 110000. */
     CMA_REACTIVE_STREAM_TIMEOUT_MS?: string;
-    /** Prompt cache switch for reactive Chat stable-prefix blocks. Default unset/on. */
-    CMA_PROMPT_CACHE_ENABLED?: string;
-    /** Prompt cache TTL. Only 5m is used by this Worker path. */
-    CMA_PROMPT_CACHE_TTL?: string;
     /** Anthropic custom Skill id for outbound mail composition. */
     MAIL_SEND_SKILL_ID?: string;
     /** Optional pinned version for MAIL_SEND_SKILL_ID. */

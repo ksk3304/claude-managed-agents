@@ -168,43 +168,6 @@ const AUTONOMOUS_EVENT_KEY_PREFIX = 'scheduled:';
 const AUTONOMOUS_LONG_REPLY_THRESHOLD_CHARS = 320;
 const AUTONOMOUS_REPLY_TITLE_MAX_CHARS = 34;
 const CHAT_DM_SPACE_KV_PREFIX = 'chat_dm_space:';
-
-function safeTokenCount(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
-    ? Math.trunc(value)
-    : 0;
-}
-
-function promptCacheUsageDetail(
-  usageSnapshot: Awaited<ReturnType<typeof retrieveSessionUsageSnapshot>>,
-): Record<string, unknown> | null {
-  const usage = usageSnapshot?.usage;
-  if (!usage) return null;
-  const cacheCreation = usage.cache_creation;
-  const nestedCacheCreation =
-    cacheCreation && typeof cacheCreation === 'object'
-      ? (cacheCreation as Record<string, unknown>)
-      : null;
-  const cacheCreation5mInputTokens =
-    nestedCacheCreation !== null
-      ? safeTokenCount(nestedCacheCreation.ephemeral_5m_input_tokens)
-      : safeTokenCount(usage.cache_creation_input_tokens);
-  const cacheCreation1hInputTokens =
-    nestedCacheCreation !== null
-      ? safeTokenCount(nestedCacheCreation.ephemeral_1h_input_tokens)
-      : 0;
-  const cacheReadInputTokens = safeTokenCount(usage.cache_read_input_tokens);
-  return {
-    model: usageSnapshot.model ?? null,
-    cache_creation_5m_input_tokens: cacheCreation5mInputTokens,
-    cache_creation_1h_input_tokens: cacheCreation1hInputTokens,
-    cache_read_input_tokens: cacheReadInputTokens,
-    input_tokens: safeTokenCount(usage.input_tokens),
-    output_tokens: safeTokenCount(usage.output_tokens),
-    prompt_cache_used:
-      cacheCreation5mInputTokens + cacheCreation1hInputTokens + cacheReadInputTokens > 0,
-  };
-}
 /**
  * 最小 SkillsData = Python `scripts/cma_skills.json` の `attach_memory:
  * false` skill 集合を TS 側で持つ subset (Issue #186 既知 #4 intent-detector
@@ -1509,18 +1472,6 @@ export async function handleChatEvent(
 
       const usageSnapshot = await retrieveSessionUsageSnapshot(client, sessionId);
       if (usageSnapshot) {
-        const cacheUsage = promptCacheUsageDetail(usageSnapshot);
-        if (cacheUsage) {
-          await recordRuntimeEvent(env, {
-            eventKey,
-            sessionId,
-            messageId: message.name,
-            userSlug: userMapping.user_slug,
-            eventType: 'cma_prompt_cache_usage',
-            source: 'chat-event-handler',
-            detail: cacheUsage,
-          });
-        }
         const costPrompt = await evaluateSessionCostAfterTurn(
           {
             kv: env.MAKOTO_KV,

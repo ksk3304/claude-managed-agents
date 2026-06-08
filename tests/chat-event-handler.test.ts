@@ -1571,15 +1571,6 @@ describe('handleChatEvent', () => {
     installFakeAnthropic({
       sessionId: 'sesn_speaker_context',
       sendCapturePayloads: payloads,
-      retrieveUsage: {
-        input_tokens: 1200,
-        output_tokens: 80,
-        cache_creation: {
-          ephemeral_5m_input_tokens: 512,
-          ephemeral_1h_input_tokens: 0,
-        },
-        cache_read_input_tokens: 256,
-      },
       events: [
         { type: 'agent.message.text', text: '話者情報を受け取りました。' },
         { type: 'session.status_idle' },
@@ -1601,18 +1592,6 @@ describe('handleChatEvent', () => {
       expect(payloadText).toContain('発話者 user_id: users/U1');
       expect(payloadText).not.toContain('このスペースの在籍者');
       expect(payloadText).not.toContain('users/U2');
-      const firstPayload = payloads[0] as {
-        events: Array<{ content: Array<Record<string, unknown>> }>;
-      };
-      const content = firstPayload.events[0]!.content;
-      expect(content[0]).toMatchObject({
-        type: 'text',
-        cache_control: { type: 'ephemeral' },
-      });
-      expect(String(content[0]!.text)).toContain('<prompt_cache_prefix>');
-      expect(String(content[0]!.text)).toContain('agent_id=agent_001');
-      expect(String(content[1]!.text)).toContain('発話者 displayName: Alice');
-      expect(content[1]!.cache_control).toBeUndefined();
 
       const promptEvent = runtimeEvents(env).find(
         (row) => row.event_type === 'prompt_envelope_built',
@@ -1620,21 +1599,6 @@ describe('handleChatEvent', () => {
       const promptDetail = JSON.parse(String(promptEvent?.detail_json));
       expect(promptDetail.speaker_context_chars).toBeGreaterThan(0);
       expect(promptDetail.roster_chars).toBe(0);
-      expect(promptDetail.prompt_cache_enabled).toBe(true);
-      expect(promptDetail.prompt_cache_ttl).toBe('5m');
-      expect(promptDetail.cacheable_prefix_chars).toBeGreaterThan(0);
-
-      const cacheUsageEvent = runtimeEvents(env).find(
-        (row) => row.event_type === 'cma_prompt_cache_usage',
-      );
-      const cacheUsageDetail = JSON.parse(String(cacheUsageEvent?.detail_json));
-      expect(cacheUsageDetail).toMatchObject({
-        model: 'claude-opus-4-7',
-        cache_creation_5m_input_tokens: 512,
-        cache_creation_1h_input_tokens: 0,
-        cache_read_input_tokens: 256,
-        prompt_cache_used: true,
-      });
 
       const speakerEvent = runtimeEvents(env).find(
         (row) => row.event_type === 'chat_speaker_context_built',
@@ -1654,49 +1618,6 @@ describe('handleChatEvent', () => {
     } finally {
       globalThis.fetch = origFetch;
     }
-  });
-
-  it('CMA_PROMPT_CACHE_ENABLED=0 keeps the legacy single text block', async () => {
-    const env = buildEnv({
-      envOverrides: {
-        CMA_PROMPT_CACHE_ENABLED: '0',
-      },
-    });
-    const msg = buildQueueMsg({ text: 'キャッシュ無効テスト' });
-    await preClaim(env, msg.eventKey, msg.claim.owner);
-    await putMapping(env, 'alice@example.com');
-
-    const payloads: unknown[] = [];
-    installFakeAnthropic({
-      sessionId: 'sesn_prompt_cache_off',
-      sendCapturePayloads: payloads,
-      events: [
-        { type: 'agent.message.text', text: '了解です。' },
-        { type: 'session.status_idle' },
-      ],
-    });
-
-    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
-    expect(result.kind).toBe('committed');
-    expect(payloads).toHaveLength(1);
-    const firstPayload = payloads[0] as {
-      events: Array<{ content: Array<Record<string, unknown>> }>;
-    };
-    const content = firstPayload.events[0]!.content;
-    expect(content).toHaveLength(1);
-    expect(content[0]!.cache_control).toBeUndefined();
-    expect(String(content[0]!.text)).not.toContain('<prompt_cache_prefix>');
-
-    const promptEvent = runtimeEvents(env).find(
-      (row) => row.event_type === 'prompt_envelope_built',
-    );
-    const promptDetail = JSON.parse(String(promptEvent?.detail_json));
-    expect(promptDetail).toMatchObject({
-      prompt_cache_enabled: false,
-      prompt_cache_ttl: '5m',
-      prompt_cache_reason: 'env_disabled',
-      cacheable_prefix_chars: 0,
-    });
   });
 
   it('uploads session output xlsx to Drive and removes sandbox path from Chat reply', async () => {

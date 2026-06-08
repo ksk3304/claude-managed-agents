@@ -253,13 +253,8 @@ describe('orchestrateChatTurn', () => {
       toolDispatcher: async () => ({ ok: true, payload: null }),
     });
 
-    const firstPayload = sendPayloads[0] as {
-      events: Array<{ content: Array<{ text?: string; cache_control?: unknown }> }>;
-    };
-    const prefixText = firstPayload.events[0]!.content[0]!.text ?? '';
-    expect(prefixText).toContain('<prompt_cache_prefix>');
-    expect(firstPayload.events[0]!.content[0]!.cache_control).toEqual({ type: 'ephemeral' });
-    const text = firstPayload.events[0]!.content[1]!.text ?? '';
+    const firstPayload = sendPayloads[0] as { events: Array<{ content: Array<{ text?: string }> }> };
+    const text = firstPayload.events[0]!.content[0]!.text ?? '';
     expect(text).toContain('<memory_bootstrap>');
     expect(text).toContain('memory_manifest');
     expect(text).toContain('/mnt/memory is unavailable');

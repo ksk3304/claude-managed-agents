@@ -50,7 +50,6 @@ import {
   buildAnthropicClient,
   createSessionWithResources,
   sendAndStreamWithToolDispatch,
-  type PromptCacheOptions,
   type SendAndStreamResult,
   type ToolDispatcher,
   type UserMessageContentBlock,
@@ -497,50 +496,6 @@ export function resolveReactiveSessionWatchdogSec(
   return parsed;
 }
 
-export interface PromptCacheRuntimePolicy extends PromptCacheOptions {
-  reason: 'default' | 'env_enabled' | 'env_disabled' | 'ttl_fallback';
-}
-
-export function resolvePromptCachePolicy(env: Env): PromptCacheRuntimePolicy {
-  const rawEnabled = (env.CMA_PROMPT_CACHE_ENABLED ?? '').trim().toLowerCase();
-  if (['0', 'false', 'off', 'no', 'disabled'].includes(rawEnabled)) {
-    return { enabled: false, ttl: '5m', reason: 'env_disabled' };
-  }
-  const rawTtl = (env.CMA_PROMPT_CACHE_TTL ?? '').trim().toLowerCase();
-  if (rawTtl && rawTtl !== '5m') {
-    console.warn(
-      `[chat-event] unsupported CMA_PROMPT_CACHE_TTL=${JSON.stringify(rawTtl)}; using 5m`,
-    );
-    return { enabled: true, ttl: '5m', reason: 'ttl_fallback' };
-  }
-  return {
-    enabled: true,
-    ttl: '5m',
-    reason: rawEnabled ? 'env_enabled' : 'default',
-  };
-}
-
-function buildPromptCachePrefix(input: {
-  agentId: string;
-  systemPromptInfo: SystemPromptResult;
-  capabilitySessionKey: string;
-  memoryResourcesHash: string;
-  memoryWrapperEnabled: boolean;
-}): string {
-  return [
-    '<prompt_cache_prefix>',
-    'This block is stable internal metadata for Anthropic prompt caching.',
-    'It is not a user request. Do not answer it directly.',
-    `agent_id=${input.agentId}`,
-    `persona_sha256=${input.systemPromptInfo.personaSha256}`,
-    `tools_sha256=${input.systemPromptInfo.toolsSha256}`,
-    `capability_key=${input.capabilitySessionKey}`,
-    `memory_resources_hash=${input.memoryResourcesHash}`,
-    `memory_wrapper_enabled=${input.memoryWrapperEnabled ? '1' : '0'}`,
-    '</prompt_cache_prefix>',
-  ].join('\n');
-}
-
 /**
  * 1 reactive turn を駆動する。
  *
@@ -906,16 +861,6 @@ export async function orchestrateChatTurn(
   if (memoryBootstrapBlock) envelopeOpts.memoryBootstrap = memoryBootstrapBlock;
   if (input.cap) envelopeOpts.cap = input.cap;
   const userMessageText = buildUserMessageEnvelope(input.bodyText, envelopeOpts);
-  const promptCachePolicy = resolvePromptCachePolicy(input.env);
-  const promptCachePrefix = promptCachePolicy.enabled
-    ? buildPromptCachePrefix({
-        agentId: input.userMapping.agent_id,
-        systemPromptInfo,
-        capabilitySessionKey,
-        memoryResourcesHash,
-        memoryWrapperEnabled,
-      })
-    : '';
 
   // 添付処理 (Issue #186 既知 #1 + O) で組み立てた image / document / text blocks
   // があれば text の後ろに連結する。Cloud Run `cma_gchat_bot.py` では
@@ -923,15 +868,9 @@ export async function orchestrateChatTurn(
   // と並ぶ形式を取っており、Workers 側も同じ並び順を踏襲する (= 文書内容を
   // 読ませる前に user 意図 text を提示)。
   const userMessage: string | UserMessageContentBlock[] =
-    promptCachePolicy.enabled
-      ? [
-          { type: 'text', text: promptCachePrefix },
-          { type: 'text', text: userMessageText },
-          ...extraBlocks,
-        ]
-      : extraBlocks.length === 0
-        ? userMessageText
-        : [{ type: 'text', text: userMessageText }, ...extraBlocks];
+    extraBlocks.length === 0
+      ? userMessageText
+      : [{ type: 'text', text: userMessageText }, ...extraBlocks];
 
   if (input.eventKey) {
     const session_key_hash = sessionKeyHash(
@@ -954,10 +893,6 @@ export async function orchestrateChatTurn(
         extra_content_blocks: extraBlocks.length,
         envelope_chars: userMessageText.length,
         has_intent: Boolean(input.intent),
-        prompt_cache_enabled: promptCachePolicy.enabled,
-        prompt_cache_ttl: promptCachePolicy.ttl,
-        prompt_cache_reason: promptCachePolicy.reason,
-        cacheable_prefix_chars: promptCachePrefix.length,
       },
     });
     await recordPayloadAudit(input.env, {
@@ -974,8 +909,6 @@ export async function orchestrateChatTurn(
           speaker_context_chars: input.speakerContextBlock?.length ?? 0,
           envelope_chars: userMessageText.length,
           extra_content_blocks: extraBlocks.length,
-          prompt_cache_enabled: promptCachePolicy.enabled,
-          cacheable_prefix_chars: promptCachePrefix.length,
         },
       },
     });
@@ -999,9 +932,6 @@ export async function orchestrateChatTurn(
           ? 0
           : SESSION_TIMEOUT_RECOVERY_POLL_MS),
       sessionWatchdogSec,
-      promptCache: promptCachePolicy.enabled
-        ? { enabled: true, ttl: promptCachePolicy.ttl }
-        : undefined,
       payloadAudit: {
         kv,
         enabled: input.env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
