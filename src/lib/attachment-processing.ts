@@ -836,7 +836,7 @@ function estimatePdfTokensAndCost(
   };
 }
 
-function buildPdfPreflightReport(
+export function buildPdfPreflightReport(
   pdfs: DownloadedPdf[],
   options: PdfPreflightOptions = {},
   initialReasons: string[] = [],
@@ -929,7 +929,7 @@ function formatIntRange(low: number | null, high: number | null): string {
   return `${low.toLocaleString('ja-JP')}-${high.toLocaleString('ja-JP')}`;
 }
 
-function buildPdfDeterministicReply(report: PdfPreflightReport): string | null {
+export function buildPdfDeterministicReply(report: PdfPreflightReport): string | null {
   if (report.result === 'allow') return null;
   if (report.result === 'confirm') {
     return [
@@ -1643,7 +1643,7 @@ export async function buildOfficeTextBlocks(
  * Uint8Array → base64 string。大きい buffer でも `String.fromCharCode.apply`
  * の引数 stack overflow を避けるため chunk 単位で encode する。
  */
-function uint8ToBase64(data: Uint8Array): string {
+export function uint8ToBase64(data: Uint8Array): string {
   const CHUNK = 0x8000;
   let s = '';
   for (let i = 0; i < data.length; i += CHUNK) {

@@ -61,4 +61,49 @@ describe('saveUserMessagePayloadAudit', () => {
     expect(text).not.toContain('alice@example.com');
     expect(text).not.toContain('sk-ant-1234567890abcdef');
   });
+
+  it('redacts attachment block payloads and extracted attachment text', async () => {
+    const kv = makeKv();
+    const saved = await saveUserMessagePayloadAudit(
+      'sesn_attachment',
+      [
+        {
+          type: 'user.message',
+          content: [
+            {
+              type: 'text',
+              text: '[添付ファイル由来の未検証データ]\nsecret attachment body',
+            },
+            {
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: 'application/pdf',
+                data: 'BASE64PDFDATA',
+              },
+            },
+            {
+              type: 'image',
+              source: {
+                type: 'file',
+                file_id: 'file_abc123',
+              },
+            },
+          ],
+        },
+      ],
+      { kv, enabled: '1', mode: 'agentmail' },
+    );
+
+    expect(saved).toBe(true);
+    const listed = await kv.list({ prefix: 'cma_payload_audit:sesn_attachment:' });
+    const raw = await kv.get(listed.keys[0]!.name);
+    const text = raw ?? '';
+    expect(text).toContain('[REDACTED_ATTACHMENT_TEXT');
+    expect(text).toContain('[REDACTED_ATTACHMENT_DATA]');
+    expect(text).toContain('[REDACTED_ATTACHMENT_FILE_ID]');
+    expect(text).not.toContain('secret attachment body');
+    expect(text).not.toContain('BASE64PDFDATA');
+    expect(text).not.toContain('file_abc123');
+  });
 });
