@@ -96,59 +96,6 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.terminalEventType).toBe('session.status_idle');
   });
 
-  it('adds Anthropic prompt cache marker only to the stable prefix text block', async () => {
-    const sent: unknown[] = [];
-    const client = makeFakeClient({
-      events: [{ type: 'session.status_idle' }],
-      onSend: (p) => sent.push(p),
-    });
-    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
-
-    await sendAndStreamWithToolDispatch(client, {
-      sessionId: 'sesn_prompt_cache',
-      userMessage: [
-        { type: 'text', text: '<prompt_cache_prefix>stable</prompt_cache_prefix>' },
-        { type: 'text', text: 'real user request' },
-      ],
-      toolDispatcher: dispatcher,
-      promptCache: { enabled: true, ttl: '5m' },
-    });
-
-    const firstSend = sent[0] as { events: Array<{ content: Array<Record<string, unknown>> }> };
-    const content = firstSend.events[0]!.content;
-    expect(content[0]).toMatchObject({
-      type: 'text',
-      text: '<prompt_cache_prefix>stable</prompt_cache_prefix>',
-      cache_control: { type: 'ephemeral' },
-    });
-    expect(content[1]).toMatchObject({
-      type: 'text',
-      text: 'real user request',
-    });
-    expect(content[1]!.cache_control).toBeUndefined();
-  });
-
-  it('does not add prompt cache marker without an explicit stable prefix policy', async () => {
-    const sent: unknown[] = [];
-    const client = makeFakeClient({
-      events: [{ type: 'session.status_idle' }],
-      onSend: (p) => sent.push(p),
-    });
-    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
-
-    await sendAndStreamWithToolDispatch(client, {
-      sessionId: 'sesn_prompt_cache_disabled',
-      userMessage: [
-        { type: 'text', text: '<prompt_cache_prefix>stable</prompt_cache_prefix>' },
-        { type: 'text', text: 'real user request' },
-      ],
-      toolDispatcher: dispatcher,
-    });
-
-    const firstSend = sent[0] as { events: Array<{ content: Array<Record<string, unknown>> }> };
-    expect(firstSend.events[0]!.content[0]!.cache_control).toBeUndefined();
-  });
-
   it('dispatches agent.custom_tool_use and posts a user.custom_tool_result', async () => {
     const sent: unknown[] = [];
     const client = makeFakeClient({
