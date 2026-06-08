@@ -96,6 +96,48 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.terminalEventType).toBe('session.status_idle');
   });
 
+  it('collects Managed Agents model usage spans for prompt cache measurement', async () => {
+    const client = makeFakeClient({
+      events: [
+        { type: 'agent.message.text_delta', text: 'ok' },
+        {
+          type: 'span.model_request_end',
+          model_usage: {
+            input_tokens: 1000,
+            output_tokens: 20,
+            cache_creation_input_tokens: 800,
+            cache_read_input_tokens: 0,
+          },
+        },
+        {
+          type: 'span.model_request_end',
+          model_usage: {
+            input_tokens: 200,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 750,
+          },
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
+
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_usage',
+      userMessage: 'hi',
+      toolDispatcher: dispatcher,
+    });
+
+    expect(r.modelUsageSpanCount).toBe(2);
+    expect(r.modelUsage).toEqual({
+      input_tokens: 1200,
+      output_tokens: 30,
+      cache_creation_input_tokens: 800,
+      cache_read_input_tokens: 750,
+    });
+  });
+
   it('dispatches agent.custom_tool_use and posts a user.custom_tool_result', async () => {
     const sent: unknown[] = [];
     const client = makeFakeClient({

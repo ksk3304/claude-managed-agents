@@ -406,6 +406,8 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
         stopReason: 'attachment_deterministic_reply',
         toolUseCount: 0,
         toolUseNames: [],
+        modelUsage: null,
+        modelUsageSpanCount: 0,
       };
     } else {
       streamResult = await sendAndStreamWithToolDispatch(client, {
