@@ -3142,6 +3142,71 @@ describe('handleChatEvent', () => {
     expect(chatApiMock.posts).toHaveLength(0);
   });
 
+  it('staging safety: external side effects disabled gates EMAIL_SEND and SCHEDULE_ACTION', async () => {
+    const env = buildEnv({
+      envOverrides: {
+        MAKOTO_EXTERNAL_SIDE_EFFECTS_DISABLED: '1',
+        GCP_SCHEDULER_PROJECT: 'prod-like-project',
+        GCP_SCHEDULER_LOCATION: 'asia-northeast1',
+        SCHEDULER_TOPIC_NAME: 'cma-scheduled-jobs',
+        COST_GUARD_OPERATOR_SPACE: 'spaces/PROD_OPS',
+      } as Partial<Env>,
+    });
+    const msg = buildQueueMsg({});
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_staging_guard',
+      events: [
+        {
+          type: 'agent.message.text',
+          text:
+            'staging確認です。\n' +
+            'EMAIL_SEND:{"to":"alice@example.com","subject":"Re","body":"返信本文"}\n' +
+            'SCHEDULE_ACTION:{"action":"list"}',
+        },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 500 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+      expect(result.kind).toBe('committed');
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(schedulerMock.capturedCalls).toHaveLength(0);
+      expect(chatApiMock.patches).toHaveLength(1);
+      expect(chatApiMock.patches[0]!.text).toContain('staging確認です');
+      expect(chatApiMock.patches[0]!.text).toContain(
+        'staging 環境ではメール送信を実行しません',
+      );
+      expect(chatApiMock.patches[0]!.text).toContain(
+        'staging 環境では予定作成・定期実行登録を実行しません',
+      );
+      expect(chatApiMock.patches[0]!.text).not.toContain('EMAIL_SEND:');
+      expect(chatApiMock.patches[0]!.text).not.toContain('SCHEDULE_ACTION:');
+
+      const runtimeEvents = (env.DB as unknown as {
+        _tables: { cma_worker_runtime_events: Array<Record<string, unknown>> };
+      })._tables.cma_worker_runtime_events;
+      const gated = runtimeEvents
+        .filter((row) => row.event_type === 'external_tool_gated')
+        .map((row) => JSON.parse(String(row.detail_json)));
+      expect(gated.map((row) => row.tool_family).sort()).toEqual([
+        'EMAIL_SEND',
+        'SCHEDULE_ACTION',
+      ]);
+      expect(gated.every((row) => row.reason === 'external_side_effects_disabled')).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('SCHEDULE_ACTION marker: env (GCP_SCHEDULER_PROJECT) 設定済 → manager.create_job が呼ばれ "予定登録" 結果が current space に流れる', async () => {
     const env = buildEnv({
       envOverrides: {

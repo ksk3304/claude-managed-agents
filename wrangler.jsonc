@@ -149,4 +149,71 @@
       },
     ],
   },
+  "env": {
+    // Staging keeps runtime resources separate from production and disables
+    // external side effects until staging-specific secrets are provisioned.
+    "staging": {
+      "workers_dev": true,
+      "vars": {
+        "MAKOTO_CHAT_QUEUE_NAME": "makoto-chat-queue-stg",
+        "MAKOTO_EXTERNAL_SIDE_EFFECTS_DISABLED": "1",
+      },
+      "kv_namespaces": [
+        {
+          "binding": "MAKOTO_KV",
+          "id": "1dd413d61dd74774a3a68ccfdd349bda",
+        },
+      ],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "claude-managed-agents-db-stg",
+          "database_id": "e0227287-eb14-42e0-8672-0bdaa9a4f1e1",
+          "migrations_dir": "./migrations",
+        },
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "class_name": "ThreadLock",
+            "name": "MAKOTO_THREAD_LOCK",
+          },
+          {
+            "class_name": "OAuthLease",
+            "name": "MAKOTO_OAUTH_LEASE",
+          },
+        ],
+      },
+      "triggers": {
+        "crons": [],
+      },
+      "queues": {
+        "producers": [
+          {
+            "binding": "MAKOTO_QUEUE",
+            "queue": "makoto-agentmail-events-stg",
+          },
+          {
+            "binding": "MAKOTO_CHAT_QUEUE",
+            "queue": "makoto-chat-queue-stg",
+          },
+        ],
+        "consumers": [
+          {
+            "queue": "makoto-agentmail-events-stg",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+          },
+          {
+            "queue": "makoto-chat-queue-stg",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 3,
+            "dead_letter_queue": "makoto-chat-queue-dlq-stg",
+          },
+        ],
+      },
+    },
+  },
 }

@@ -80,6 +80,12 @@ declare namespace Cloudflare {
      * implemented by a follow-up subagent (#186 #5 Phase B).
      */
     MAKOTO_CHAT_QUEUE: Queue<import('../webhooks/google-chat').ChatQueueMessage>;
+    /** Exact Chat queue name used by `src/index.ts` queue dispatch. */
+    MAKOTO_CHAT_QUEUE_NAME?: string;
+    /** Comma-separated Chat queue names for staging / transition windows. */
+    MAKOTO_CHAT_QUEUE_NAMES?: string;
+    /** `"1"`/`true` disables Chat reactive mail, scheduler, and operator-notify side effects. */
+    MAKOTO_EXTERNAL_SIDE_EFFECTS_DISABLED?: string;
     /**
      * Google Chat reactive bot displayName (= bot account 表示名)。shared
      * space で `@<displayName>` mention 検知の **displayName-based 簡易**

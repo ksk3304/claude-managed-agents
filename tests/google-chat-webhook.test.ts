@@ -253,6 +253,43 @@ describe('google-chat webhook handler', () => {
     expect(sent[0]!.placeholderName).toBe('spaces/DM_X/messages/placeholder_1');
   });
 
+  it('copies Workspace Add-on chat.user.email onto message.sender.email', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const env = envWith();
+    const jwt = await signJwt(fixture);
+    const body = JSON.stringify({
+      chat: {
+        user: {
+          name: 'users/USER_X',
+          displayName: 'Test User',
+          email: 'test@example.com',
+        },
+        eventTime: '2026-05-26T10:00:00Z',
+        messagePayload: {
+          space: { name: 'spaces/DM_X', type: 'DM', displayName: 'DM' },
+          message: {
+            name: 'spaces/DM_X/messages/M_EMAIL',
+            sender: {
+              name: 'users/USER_X',
+              displayName: 'Test User',
+            },
+            text: 'こんにちは',
+            thread: { name: 'spaces/DM_X/threads/THREAD_X' },
+          },
+        },
+      },
+    });
+    const req = buildRequest(body, `Bearer ${jwt}`);
+
+    const resp = await handleGoogleChatWebhook(req, env);
+    expect(resp.status).toBe(200);
+
+    const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.payload.message!.sender.email).toBe('test@example.com');
+  });
+
   it('200 + skipped on non-MESSAGE event (ADDED_TO_SPACE)', async () => {
     const fixture = await makeKeyFixture('k1');
     globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
@@ -337,6 +374,24 @@ describe('google-chat webhook handler', () => {
       env,
     );
     expect(resp.status).toBe(401);
+  });
+
+  it('accepts HTTP endpoint URL audience when the UI has no Authentication Audience field', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const env = envWith();
+    const endpointUrl = 'https://test.workers.dev/webhooks/google-chat';
+    const jwt = await signJwt(fixture, { aud: endpointUrl });
+    const body = JSON.stringify(makeMessageEvent('spaces/A/messages/M_ENDPOINT_AUD'));
+    const resp = await handleGoogleChatWebhook(
+      buildRequest(body, `Bearer ${jwt}`),
+      env,
+    );
+
+    expect(resp.status).toBe(200);
+    const sent = (env.MAKOTO_CHAT_QUEUE as unknown as { _sent: ChatQueueMessage[] })._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.eventKey).toBe('chat:msgname:spaces/A/messages/M_ENDPOINT_AUD');
   });
 
   it('401 on issuer mismatch', async () => {
@@ -527,6 +582,16 @@ describe('verifyGoogleChatJwt (unit)', () => {
     expect(claims).not.toBeNull();
     expect(claims!.iss).toBe(ISSUER);
     expect(claims!.aud).toBe(PROJECT_NUMBER);
+  });
+
+  it('returns the decoded payload when any expected audience matches', async () => {
+    const fixture = await makeKeyFixture('k1');
+    globalThis.fetch = makePublicKeyFetchMock([fixture]) as unknown as typeof fetch;
+    const endpointUrl = 'https://example.test/webhooks/google-chat';
+    const jwt = await signJwt(fixture, { aud: endpointUrl });
+    const claims = await verifyGoogleChatJwt(jwt, [PROJECT_NUMBER, endpointUrl]);
+    expect(claims).not.toBeNull();
+    expect(claims!.aud).toBe(endpointUrl);
   });
 
   it('returns null for a non-JWT string', async () => {

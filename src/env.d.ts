@@ -83,6 +83,12 @@ declare namespace Cloudflare {
      * `newClaimOwner('')` falls back to a UUID-only owner.
      */
     WORKER_INSTANCE_ID?: string;
+    /** Optional exact Chat queue name for environment-specific queue dispatch. */
+    MAKOTO_CHAT_QUEUE_NAME?: string;
+    /** Optional comma-separated Chat queue names for transitional deployments. */
+    MAKOTO_CHAT_QUEUE_NAMES?: string;
+    /** When enabled, Chat reactive mail/scheduler/operator side effects are no-op gated. */
+    MAKOTO_EXTERNAL_SIDE_EFFECTS_DISABLED?: string;
 
     /** Incident/debug-only payload audit switch. Normal operation leaves this unset/off. */
     CMA_AUDIT_USER_MESSAGE_PAYLOADS?: string;

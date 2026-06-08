@@ -155,6 +155,7 @@ import { isMentioningBot, stripMentions } from '../lib/mention-detection';
 import type { EmailSendMarker } from '../types/agentmail';
 import { recordRuntimeEvent, stableHash } from '../lib/observability';
 import { postChatPlaceholderResult } from '../lib/chat-placeholder';
+import { externalSideEffectsDisabled } from '../lib/staging-safety';
 
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
@@ -534,7 +535,7 @@ export async function handleChatEvent(
         guardDeps: {
           db: env.DB,
           kv: env.MAKOTO_KV,
-          operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+          operatorSpace: externalSideEffectsDisabled(env) ? undefined : env.COST_GUARD_OPERATOR_SPACE,
           enabledEnv: env.COST_GUARD_ENABLED,
         },
       },
@@ -2080,6 +2081,28 @@ async function dispatchEmailMarkers(
       reason: '外部連携操作は登録済みユーザーの現在発話でのみ実行します',
     }));
   }
+  if (externalSideEffectsDisabled(env)) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: gate.messageId,
+      userSlug: gate.userSlug,
+      eventType: 'external_tool_gated',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        tool_family: 'EMAIL_SEND',
+        marker_count: markers.length,
+        reason: 'external_side_effects_disabled',
+      },
+    });
+    return markers.map((m) => ({
+      status: 'failed',
+      to: m.to,
+      subject: m.subject,
+      reason: 'staging 環境ではメール送信を実行しません',
+    }));
+  }
   const summaries: EmailDispatchSummary[] = [];
   const apiKey = env.AGENTMAIL_API_KEY;
   const inboxId = env.AGENTMAIL_DEFAULT_INBOX_ID;
@@ -2702,7 +2725,9 @@ async function dispatchChatPostMarkers(
             await recordChatPost({
               db: env.DB,
               kv: env.MAKOTO_KV,
-              operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+              operatorSpace: externalSideEffectsDisabled(env)
+                ? undefined
+                : env.COST_GUARD_OPERATOR_SPACE,
               enabledEnv: env.COST_GUARD_ENABLED,
             });
             console.log(
@@ -2790,6 +2815,25 @@ async function dispatchScheduleActionMarkers(
     });
     const prefix = stripScheduleActionMarkers(inputText).trim();
     const notice = '外部連携操作は登録済みユーザーの現在発話でのみ実行します。';
+    return { cleanedText: prefix ? `${prefix}\n${notice}` : notice };
+  }
+  const sideEffectMarkers = parseScheduleActionMarkers(inputText);
+  if (externalSideEffectsDisabled(env) && sideEffectMarkers.length > 0) {
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: gate.messageId,
+      userSlug: gate.userSlug,
+      eventType: 'external_tool_gated',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: {
+        tool_family: 'SCHEDULE_ACTION',
+        marker_count: sideEffectMarkers.length,
+        reason: 'external_side_effects_disabled',
+      },
+    });
+    const prefix = stripScheduleActionMarkers(inputText).trim();
+    const notice = 'staging 環境では予定作成・定期実行登録を実行しません。';
     return { cleanedText: prefix ? `${prefix}\n${notice}` : notice };
   }
   const saKey = env.CHAT_SA_KEY_JSON;
@@ -3402,7 +3446,7 @@ async function safePost(
     await recordChatPost({
       db: env.DB,
       kv: env.MAKOTO_KV,
-      operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+      operatorSpace: externalSideEffectsDisabled(env) ? undefined : env.COST_GUARD_OPERATOR_SPACE,
       enabledEnv: env.COST_GUARD_ENABLED,
     });
     return result;
@@ -3459,7 +3503,7 @@ async function safeUpdateOrPost(
     await recordChatPost({
       db: env.DB,
       kv: env.MAKOTO_KV,
-      operatorSpace: env.COST_GUARD_OPERATOR_SPACE,
+      operatorSpace: externalSideEffectsDisabled(env) ? undefined : env.COST_GUARD_OPERATOR_SPACE,
       enabledEnv: env.COST_GUARD_ENABLED,
     });
     return;
