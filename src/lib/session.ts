@@ -140,6 +140,11 @@ export async function retrieveSessionUsageSnapshot(
  */
 export type UserMessageContentBlock = Record<string, unknown> & { type: string };
 
+export interface PromptCacheOptions {
+  enabled: boolean;
+  ttl: '5m';
+}
+
 export interface SendAndStreamInput {
   sessionId: string;
   /**
@@ -150,6 +155,8 @@ export interface SendAndStreamInput {
   userMessage: string | UserMessageContentBlock[];
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional prompt-cache marker for a caller-provided stable prefix block. */
+  promptCache?: PromptCacheOptions;
   /** Optional short-lived audit of the exact user.message payload. */
   payloadAudit?: PayloadAuditConfig;
 }
@@ -226,7 +233,7 @@ export async function sendAndStream(
   const userMessageEvents = [
     {
       type: 'user.message',
-      content: toUserMessageContent(input.userMessage),
+      content: toUserMessageContent(input.userMessage, input.promptCache),
     },
   ];
   await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);
@@ -293,11 +300,38 @@ export async function sendAndStream(
  */
 function toUserMessageContent(
   userMessage: string | UserMessageContentBlock[],
+  promptCache?: PromptCacheOptions,
 ): UserMessageContentBlock[] {
-  if (typeof userMessage === 'string') {
-    return [{ type: 'text', text: userMessage }];
+  const content =
+    typeof userMessage === 'string'
+      ? [{ type: 'text', text: userMessage }]
+      : userMessage;
+  return applyPromptCacheToFirstTextBlock(content, promptCache);
+}
+
+function applyPromptCacheToFirstTextBlock(
+  content: UserMessageContentBlock[],
+  promptCache?: PromptCacheOptions,
+): UserMessageContentBlock[] {
+  if (!promptCache?.enabled) return content;
+  if (content.length < 2) return content;
+  const [first, ...rest] = content;
+  if (
+    !first ||
+    first.type !== 'text' ||
+    typeof first.text !== 'string' ||
+    first.text.length === 0 ||
+    first.cache_control !== undefined
+  ) {
+    return content;
   }
-  return userMessage;
+  return [
+    {
+      ...first,
+      cache_control: { type: 'ephemeral' },
+    },
+    ...rest,
+  ];
 }
 
 function pickString(ev: Record<string, unknown>, key: string): string | undefined {
@@ -421,6 +455,8 @@ export interface SendAndStreamWithToolDispatchInput {
   payloadAudit?: PayloadAuditConfig;
   /** Hard cap on wall time the event loop is willing to wait. */
   timeoutMs?: number;
+  /** Optional prompt-cache marker for a caller-provided stable prefix block. */
+  promptCache?: PromptCacheOptions;
   /**
    * After the live stream timeout fires, poll session history for a final
    * assistant answer before surfacing `stream_failed`. Zero disables this.
@@ -532,7 +568,7 @@ export async function sendAndStreamWithToolDispatch(
   const userMessageEvents = [
     {
       type: 'user.message',
-      content: toUserMessageContent(input.userMessage),
+      content: toUserMessageContent(input.userMessage, input.promptCache),
     },
   ];
   await saveUserMessagePayloadAudit(input.sessionId, userMessageEvents, input.payloadAudit);

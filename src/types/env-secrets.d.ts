@@ -189,6 +189,10 @@ declare namespace Cloudflare {
     CMA_REACTIVE_SESSION_WATCHDOG_SEC?: string;
     /** Reactive Chat stream timeout override in milliseconds. Unset = 110000. */
     CMA_REACTIVE_STREAM_TIMEOUT_MS?: string;
+    /** Prompt cache switch for reactive Chat stable-prefix blocks. Default unset/on. */
+    CMA_PROMPT_CACHE_ENABLED?: string;
+    /** Prompt cache TTL. Only 5m is used by this Worker path. */
+    CMA_PROMPT_CACHE_TTL?: string;
     /**
      * Explicit opt-in for short-lived `user.message` payload audit in
      * Cloudflare KV. Default off. Enable only while observing an incident.
