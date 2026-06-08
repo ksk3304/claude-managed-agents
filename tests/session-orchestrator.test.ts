@@ -8,6 +8,7 @@ import {
   resolveReactiveSessionWatchdogSec,
 } from '../src/lib/session-orchestrator';
 import { makeKv } from './helpers';
+import { makeMakotoDb } from './makoto-helpers';
 
 interface MakeClientOpts {
   streamEvents?: Array<Record<string, unknown>>;
@@ -368,5 +369,113 @@ describe('orchestrateChatTurn', () => {
     expect(await kv.get(sessionKey!)).toBe('sesn_replacement');
     expect(resolvedSessionIds).toEqual(['sesn_poisoned', 'sesn_replacement']);
     expect(calls).toEqual(['events.send', 'sessions.create', 'events.send', 'events.stream']);
+  });
+
+  it('does not report prompt_cache_used for cache writes without cache reads', async () => {
+    const calls: string[] = [];
+    const db = makeMakotoDb();
+    const client = makeClient(calls, {
+      streamEvents: [
+        { type: 'agent.message', content: [{ type: 'text', text: 'ok' }] },
+        {
+          type: 'span.model_request_end',
+          model_usage: {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 1200,
+            cache_read_input_tokens: 0,
+          },
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    await orchestrateChatTurn({
+      env: {
+        DB: db,
+        ENVIRONMENT_ID: 'env_employee',
+        MAKOTO_KV: makeKv(),
+      } as Env,
+      client,
+      senderEmail: 'alice@example.com',
+      spaceName: 'spaces/AAA',
+      spaceType: 'DM',
+      threadName: 'spaces/AAA/threads/T5',
+      bodyText: 'cache write probe',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [],
+      },
+      personaSpec: 'persona',
+      toolsSpec: 'tools',
+      eventKey: 'chat:msgname:cache-write',
+      toolDispatcher: async () => ({ ok: true, payload: null }),
+    });
+
+    const row = db._tables.cma_worker_runtime_events.find(
+      (event) => event.event_type === 'cma_prompt_cache_usage',
+    );
+    expect(row).toBeDefined();
+    const detail = JSON.parse(String(row!.detail_json));
+    expect(detail.cache_creation_5m_input_tokens).toBe(1200);
+    expect(detail.cache_read_input_tokens).toBe(0);
+    expect(detail.prompt_cache_write_observed).toBe(true);
+    expect(detail.prompt_cache_read_observed).toBe(false);
+    expect(detail.prompt_cache_used).toBe(false);
+  });
+
+  it('reports prompt_cache_used only when cache read tokens are observed', async () => {
+    const calls: string[] = [];
+    const db = makeMakotoDb();
+    const client = makeClient(calls, {
+      streamEvents: [
+        { type: 'agent.message', content: [{ type: 'text', text: 'ok' }] },
+        {
+          type: 'span.model_request_end',
+          model_usage: {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1200,
+          },
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    await orchestrateChatTurn({
+      env: {
+        DB: db,
+        ENVIRONMENT_ID: 'env_employee',
+        MAKOTO_KV: makeKv(),
+      } as Env,
+      client,
+      senderEmail: 'alice@example.com',
+      spaceName: 'spaces/AAA',
+      spaceType: 'DM',
+      threadName: 'spaces/AAA/threads/T6',
+      bodyText: 'cache read probe',
+      userMapping: {
+        user_slug: 'alice',
+        agent_id: 'agent_employee',
+        memory_attachments: [],
+      },
+      personaSpec: 'persona',
+      toolsSpec: 'tools',
+      eventKey: 'chat:msgname:cache-read',
+      toolDispatcher: async () => ({ ok: true, payload: null }),
+    });
+
+    const row = db._tables.cma_worker_runtime_events.find(
+      (event) => event.event_type === 'cma_prompt_cache_usage',
+    );
+    expect(row).toBeDefined();
+    const detail = JSON.parse(String(row!.detail_json));
+    expect(detail.cache_creation_5m_input_tokens).toBe(0);
+    expect(detail.cache_read_input_tokens).toBe(1200);
+    expect(detail.prompt_cache_write_observed).toBe(false);
+    expect(detail.prompt_cache_read_observed).toBe(true);
+    expect(detail.prompt_cache_used).toBe(true);
   });
 });

@@ -116,8 +116,9 @@ async function recordPromptCacheUsageFromStream(
       cache_creation_5m_input_tokens: cacheCreation5mInputTokens,
       cache_creation_input_tokens: cacheCreation5mInputTokens,
       cache_read_input_tokens: cacheReadInputTokens,
-      prompt_cache_used:
-        cacheCreation5mInputTokens > 0 || cacheReadInputTokens > 0,
+      prompt_cache_write_observed: cacheCreation5mInputTokens > 0,
+      prompt_cache_read_observed: cacheReadInputTokens > 0,
+      prompt_cache_used: cacheReadInputTokens > 0,
       recovered_from_waiting_response:
         input.recoveredFromWaitingResponse === true,
     },
