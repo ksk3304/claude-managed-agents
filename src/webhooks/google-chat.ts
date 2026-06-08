@@ -235,7 +235,7 @@ export function _resetPublicKeyCacheForTesting(): void {
  */
 export async function verifyGoogleChatJwt(
   jwt: string,
-  expectedAudience: string,
+  expectedAudience: string | string[],
 ): Promise<JWTPayload | null> {
   // kid を header から取り出して、該当する公開鍵を選別する。
   let kid: string | undefined;
@@ -352,6 +352,14 @@ function normalizeChatEventPayload(raw: unknown): ChatEventPayload | null {
         | Record<string, unknown>
         | undefined;
       const message = mp?.message as ChatEventPayload['message'] | undefined;
+      if (
+        message?.sender &&
+        !message.sender.email &&
+        typeof user?.email === 'string' &&
+        user.email.trim()
+      ) {
+        message.sender = { ...message.sender, email: user.email.trim() };
+      }
       const space = pickSpace(mp);
       const result: ChatEventPayload = { type: 'MESSAGE' };
       if (eventTime) result.eventTime = eventTime;
@@ -447,7 +455,10 @@ export async function handleGoogleChatWebhook(
     return Response.json({ error: 'empty bearer token' }, { status: 401 });
   }
 
-  // ---- 2. project number (audience) ----
+  // ---- 2. request audience candidates ----
+  // Google Chat の Console UI は世代差があり、Authentication Audience 欄が
+  // 出る環境では Project Number を選べる。一方、欄が出ない HTTP endpoint
+  // URL UI では aud が endpoint URL になる。実機設定画面に合わせ両方許可。
   const projectNumber = env.GCP_BOT_PROJECT_NUMBER;
   if (!projectNumber || typeof projectNumber !== 'string') {
     console.error(
@@ -458,11 +469,12 @@ export async function handleGoogleChatWebhook(
       { status: 500 },
     );
   }
+  const audienceCandidates = [projectNumber, request.url];
 
   // ---- 3. JWT verify ----
   let claims: JWTPayload | null;
   try {
-    claims = await verifyGoogleChatJwt(jwt, projectNumber);
+    claims = await verifyGoogleChatJwt(jwt, audienceCandidates);
   } catch (err) {
     // 公開鍵 fetch 失敗 = 一過性の障害として 500 を返し Google Chat の
     // retry に任せる。

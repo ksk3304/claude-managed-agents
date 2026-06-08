@@ -51,6 +51,7 @@ import {
   recordRuntimeEvent,
   pruneObservability,
 } from "./lib/observability";
+import { isChatQueueName } from "./lib/staging-safety";
 
 // `ThreadLock` is the per-RFC-822-message exclusion DO that the
 // AgentMail Queue consumer takes before any `sessions.create` /
@@ -222,7 +223,7 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    if (batch.queue === "makoto-chat-queue") {
+    if (isChatQueueName(batch.queue, env)) {
       // Phase B (= sessions.create + tool dispatch + 各 marker 解析 +
       // current space 投稿 + session-log + commitDone) を委譲する。
       // `handleChatQueue` 内で msg.ack / msg.retry を判定するので

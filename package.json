@@ -19,6 +19,9 @@
     "typecheck": "tsc --noEmit && tsc -p frontend/tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:staging-safety": "node scripts/check-staging-safety.mjs",
+    "check:staging-secrets-base": "node scripts/check-staging-safety.mjs --check-secrets",
+    "check:staging-chat-smoke-ready": "node scripts/check-staging-safety.mjs --check-secrets --phase=chat-smoke",
     "db:migrate": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote"
   },
