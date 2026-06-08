@@ -71,6 +71,10 @@ import {
   buildContinuationPrompt,
   CONTINUATION_REPLY_SYSTEM_ADDENDUM,
 } from '../lib/continuation';
+import {
+  buildAllAgentMailAttachmentBlocks,
+  renderAgentMailAttachmentContext,
+} from '../lib/agentmail-attachment-processing';
 import { extractBody, extractThreadRefs, reChainDepth } from '../lib/email-thread';
 import { parseAssistantText } from '../lib/email-send-marker';
 import { fetchMailThreadMessages } from '../lib/mail-history';
@@ -109,6 +113,15 @@ import type {
 
 /** Soft cap on `sendAndStreamWithToolDispatch` wall time. */
 const SESSION_STREAM_TIMEOUT_MS = 110_000;
+
+const EMPTY_ATTACHMENT_BLOCKS = {
+  extraBlocks: [],
+  notice: null,
+  uploadedFileIds: [],
+  pdfPreflight: null,
+  deterministicReply: null,
+  cleanup: async () => undefined,
+} as const;
 
 /**
  * Layer-7 dispatcher. Bound from `src/index.ts` as
@@ -157,6 +170,18 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     typeof message.thread_id === 'string' && message.thread_id.length > 0
       ? message.thread_id
       : '';
+  const amClientOpts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
+  const amClient = env.AGENTMAIL_API_KEY
+    ? new AgentMailClient(env.AGENTMAIL_API_KEY, amClientOpts)
+    : null;
+  const inboundMessage = shouldHydrateInboundMessage(message)
+    ? await hydrateInboundMessage(
+        amClient,
+        inboxIdForThread,
+        message,
+        eventKey,
+      )
+    : message;
 
   // 4. Continuation vs first-contact branch.
   // SignalB: when RFC 822 headers do not map to D1 but the AgentMail
@@ -190,7 +215,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     }
   }
   const isContinuation =
-    sessionId !== null || signalBHasSelf || reChainDepth(message.subject) >= 1;
+    sessionId !== null || signalBHasSelf || reChainDepth(inboundMessage.subject) >= 1;
 
   // 4a. Cold inbound notify-only path (Issue #186 #2). When the
   // operator has wired a notify space + Chat SA key, defer cold
@@ -208,7 +233,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     env.MAKOTO_NOTIFY_SPACE &&
     env.CHAT_SA_KEY_JSON
   ) {
-    await tryNotifyInbound(env, message, false, eventKey);
+    await tryNotifyInbound(env, inboundMessage, false, eventKey);
     return { kind: 'committed' };
   }
 
@@ -284,9 +309,9 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       }
     }
     if (isContinuation) {
-      userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, signalBHistory)}`;
+      userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(inboundMessage, signalBHistory)}`;
     } else {
-      userMessage = buildInitialUserMessage(message, false);
+      userMessage = buildInitialUserMessage(inboundMessage, false);
     }
   } else {
     // Existing session — fetch prior thread messages so the
@@ -323,7 +348,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
         }`,
       );
     }
-    userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(message, history)}`;
+    userMessage = `${CONTINUATION_REPLY_SYSTEM_ADDENDUM}\n\n${buildContinuationPrompt(inboundMessage, history)}`;
     console.log(
       `[agentmail-dispatch] continuing session=${sessionId} agent=${agentId} user=${userSlug} eventKey=${eventKey} history=${history.length}`,
     );
@@ -343,37 +368,75 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     }
   }
 
-  // 5. Drive the SDK event loop.
-  let streamResult;
+  const attachmentBlocks =
+    amClient && inboxIdForThread
+      ? await buildAllAgentMailAttachmentBlocks(
+          {
+            anthropic: client,
+            agentmail: amClient,
+          },
+          inboxIdForThread,
+          inboundMessage,
+        )
+      : EMPTY_ATTACHMENT_BLOCKS;
+  const attachmentContext = renderAgentMailAttachmentContext(
+    inboundMessage,
+    attachmentBlocks.notice,
+    { attachedReadableBlocks: attachmentBlocks.extraBlocks.length > 0 },
+  );
+
+  userMessage = appendAttachmentContext(userMessage, attachmentContext);
+  const userMessageContent =
+    attachmentBlocks.extraBlocks.length > 0
+      ? [
+          { type: 'text', text: userMessage },
+          ...attachmentBlocks.extraBlocks,
+        ]
+      : userMessage;
+
+  // 5. Drive the SDK event loop, unless attachment processing already
+  // produced a deterministic fail-closed response (large/blocked PDF).
+  let streamResult: Awaited<ReturnType<typeof sendAndStreamWithToolDispatch>>;
   try {
-    streamResult = await sendAndStreamWithToolDispatch(client, {
-      sessionId,
-      userMessage,
-      toolDispatcher: (toolName, toolInput) =>
-        dispatchMakotoTool(toolName, toolInput, {
-          env,
-          userSlug,
-          boundMessageId: rfc822MsgId,
-          callerSessionId: sessionId!,
-          anthropic: client,
-          memoryAttachments,
-          eventKey,
-        }),
-      timeoutMs: SESSION_STREAM_TIMEOUT_MS,
-      payloadAudit: {
-        kv: env.MAKOTO_KV,
-        enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
-        ttlDays: env.CMA_AUDIT_TTL_DAYS,
-        maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
-        mode: 'agentmail',
-        context: {
-          event_key: eventKey,
-          sender_email: sender,
-          user_slug: userSlug,
-          agent_id: agentId,
+    if (attachmentBlocks.deterministicReply) {
+      streamResult = {
+        assistantText: attachmentBlocks.deterministicReply,
+        emailSendMarkers: [],
+        terminalEventType: 'attachment.deterministic_reply',
+        stopReason: 'attachment_deterministic_reply',
+        toolUseCount: 0,
+        toolUseNames: [],
+      };
+    } else {
+      streamResult = await sendAndStreamWithToolDispatch(client, {
+        sessionId,
+        userMessage: userMessageContent,
+        toolDispatcher: (toolName, toolInput) =>
+          dispatchMakotoTool(toolName, toolInput, {
+            env,
+            userSlug,
+            boundMessageId: rfc822MsgId,
+            callerSessionId: sessionId!,
+            anthropic: client,
+            memoryAttachments,
+            eventKey,
+          }),
+        timeoutMs: SESSION_STREAM_TIMEOUT_MS,
+        payloadAudit: {
+          kv: env.MAKOTO_KV,
+          enabled: env.CMA_AUDIT_USER_MESSAGE_PAYLOADS,
+          ttlDays: env.CMA_AUDIT_TTL_DAYS,
+          maxTextChars: env.CMA_AUDIT_MAX_TEXT_CHARS,
+          mode: 'agentmail',
+          context: {
+            event_key: eventKey,
+            sender_email: sender,
+            user_slug: userSlug,
+            agent_id: agentId,
+          },
         },
-      },
-    });
+      });
+    }
   } catch (err) {
     console.error(
       `[agentmail-dispatch] stream failed eventKey=${eventKey} session=${sessionId}: ${
@@ -383,6 +446,18 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     // Stream timeout / SDK error → let the queue retry. Successor
     // (TAKEOVER) will pick up after our lease expires.
     return { kind: 'release_and_retry', reason: 'stream_failed' };
+  } finally {
+    if (attachmentBlocks.uploadedFileIds.length > 0) {
+      try {
+        await attachmentBlocks.cleanup();
+      } catch (cleanupErr) {
+        console.warn(
+          `[agentmail-dispatch] attachment cleanup failed eventKey=${eventKey}: ${
+            cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+          }`,
+        );
+      }
+    }
   }
 
   // 6. Parse EMAIL_SEND markers + log any failures.
@@ -396,8 +471,12 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
       );
     }
   }
-  if (markers.length === 0 && isContinuation && cleanedText.trim().length > 0) {
-    const continuationReply = buildContinuationReplyMarker(message, cleanedText);
+  if (
+    markers.length === 0 &&
+    (isContinuation || Boolean(attachmentBlocks.deterministicReply)) &&
+    cleanedText.trim().length > 0
+  ) {
+    const continuationReply = buildContinuationReplyMarker(inboundMessage, cleanedText);
     if (continuationReply) {
       markers = [continuationReply];
     }
@@ -440,13 +519,11 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     );
     return { kind: 'skipped', reason: 'no_agentmail_api_key' };
   }
-  const amClientOpts = env.AGENTMAIL_API_BASE_URL ? { baseUrl: env.AGENTMAIL_API_BASE_URL } : {};
-  const amClient = new AgentMailClient(env.AGENTMAIL_API_KEY, amClientOpts);
   const parentMessageId =
-    typeof message.id === 'string' && message.id.length > 0
-      ? message.id
-      : typeof message.message_id === 'string' && message.message_id.length > 0
-        ? message.message_id
+    typeof inboundMessage.id === 'string' && inboundMessage.id.length > 0
+      ? inboundMessage.id
+      : typeof inboundMessage.message_id === 'string' && inboundMessage.message_id.length > 0
+        ? inboundMessage.message_id
         : '';
 
   const successfullySentBodies: string[] = [];
@@ -466,7 +543,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
         kind: 'email_send',
         target: emTarget,
         sendFn: async () =>
-          await deliverMarker(amClient, m, {
+          await deliverMarker(amClient!, m, {
             inboxId,
             parentMessageIdFallback: parentMessageId,
             agentId,
@@ -556,7 +633,7 @@ export const agentmailDispatch: AgentMailDispatcher = async (context) => {
     const replyTextForNotify = successfullySentBodies.join('\n---\n');
     await tryNotifyAutoreplyForInbound(
       env,
-      message,
+      inboundMessage,
       replyTextForNotify,
       eventKey,
     );
@@ -641,6 +718,11 @@ function buildInitialUserMessage(msg: AgentMailMessage, isContinuationByDepth: b
   ].join('\n');
 }
 
+function appendAttachmentContext(base: string, attachmentContext: string): string {
+  if (!attachmentContext.trim()) return base;
+  return `${base}\n\n## 添付情報\n${attachmentContext}`;
+}
+
 function buildContinuationReplyMarker(
   msg: AgentMailMessage,
   body: string,
@@ -692,6 +774,85 @@ function extractInboxId(event: AgentMailDispatchContext['event']): string {
     if (typeof v === 'string' && v.length > 0) return v;
   }
   return '';
+}
+
+async function hydrateInboundMessage(
+  client: AgentMailClient | null,
+  inboxId: string,
+  message: AgentMailMessage,
+  eventKey: string,
+): Promise<AgentMailMessage> {
+  if (!client || !inboxId) return message;
+  const candidates = messageIdCandidates(message);
+  for (const candidate of candidates) {
+    try {
+      return await client.getMessage(inboxId, candidate);
+    } catch (err) {
+      if (err instanceof AgentMailError && err.status === 404) continue;
+      console.warn(
+        `[agentmail-dispatch] inbound hydrate failed eventKey=${eventKey} message_id=${redactPiiInText(candidate)}: ${
+          err instanceof Error ? redactPiiInText(err.message) : redactPiiInText(String(err))
+        }`,
+      );
+      return message;
+    }
+  }
+  const threadId =
+    typeof message.thread_id === 'string' && message.thread_id.length > 0
+      ? message.thread_id
+      : '';
+  if (threadId) {
+    try {
+      const thread = await client.getThread(inboxId, threadId);
+      const matched = findMessageInHydratedThread(message, thread.messages ?? []);
+      if (matched) return matched;
+    } catch (err) {
+      console.warn(
+        `[agentmail-dispatch] inbound hydrate thread fallback failed eventKey=${eventKey} thread_id=${redactPiiInText(threadId)}: ${
+          err instanceof Error ? redactPiiInText(err.message) : redactPiiInText(String(err))
+        }`,
+      );
+    }
+  }
+  return message;
+}
+
+function messageIdCandidates(message: AgentMailMessage): string[] {
+  const raw = [
+    typeof message.id === 'string' ? message.id.trim() : '',
+    typeof message.message_id === 'string' ? message.message_id.trim() : '',
+    typeof message.rfc822_message_id === 'string' ? message.rfc822_message_id.trim() : '',
+  ].filter((value) => value.length > 0);
+  const out: string[] = [];
+  for (const candidate of raw) {
+    if (!out.includes(candidate)) out.push(candidate);
+    if (/^[^<>\s@]+@[^<>\s@]+$/.test(candidate)) {
+      const bracketed = `<${candidate}>`;
+      if (!out.includes(bracketed)) out.push(bracketed);
+    }
+  }
+  return out;
+}
+
+function shouldHydrateInboundMessage(message: AgentMailMessage): boolean {
+  if (extractBody(message).trim().length === 0) return true;
+  const attachments = message.attachments ?? [];
+  if (attachments.length === 0) return false;
+  return typeof message.id !== 'string' || message.id.trim().length === 0;
+}
+
+function findMessageInHydratedThread(
+  original: AgentMailMessage,
+  messages: AgentMailMessage[],
+): AgentMailMessage | null {
+  const originalIds = new Set(messageIdCandidates(original).map(envNormalizeMessageId));
+  for (const candidate of messages) {
+    const candidateIds = messageIdCandidates(candidate).map(envNormalizeMessageId);
+    if (candidateIds.some((id) => id && originalIds.has(id))) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 async function fetchAgentMailThread(

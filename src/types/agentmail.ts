@@ -123,6 +123,9 @@ export interface AgentMailMessage {
   extracted_html?: string;
   html?: string;
 
+  /** Inbound attachment metadata surfaced by AgentMail. */
+  attachments?: AgentMailAttachment[];
+
   // ---- thread refs ----
   /** RFC 822 `In-Reply-To` (raw value, may include angle brackets). */
   in_reply_to?: string;
@@ -140,6 +143,21 @@ export interface AgentMailMessage {
   headers?: Record<string, string | string[]>;
 
   /** Arbitrary fields not covered above — keep raw for forward-compat. */
+  [extra: string]: unknown;
+}
+
+export interface AgentMailAttachment {
+  attachment_id?: string;
+  attachmentId?: string;
+  id?: string;
+  filename?: string;
+  file_name?: string;
+  name?: string;
+  content_type?: string;
+  contentType?: string;
+  mime_type?: string;
+  size?: number;
+  inline?: boolean;
   [extra: string]: unknown;
 }
 

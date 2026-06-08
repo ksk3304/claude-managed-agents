@@ -86,6 +86,8 @@ function redactForAudit(value: unknown, maxTextChars: number): unknown {
     return value.map((v) => redactForAudit(v, maxTextChars));
   }
   if (value && typeof value === 'object') {
+    const redactedBlock = redactContentBlockForAudit(value as Record<string, unknown>, maxTextChars);
+    if (redactedBlock) return redactedBlock;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       out[k] = redactForAudit(v, maxTextChars);
@@ -93,6 +95,45 @@ function redactForAudit(value: unknown, maxTextChars: number): unknown {
     return out;
   }
   return value;
+}
+
+function redactContentBlockForAudit(
+  value: Record<string, unknown>,
+  maxTextChars: number,
+): Record<string, unknown> | null {
+  const type = typeof value.type === 'string' ? value.type : '';
+  if (type === 'image' || type === 'document') {
+    return {
+      ...value,
+      source: redactAttachmentSource(value.source, maxTextChars),
+    };
+  }
+  if (
+    type === 'text' &&
+    typeof value.text === 'string' &&
+    value.text.includes('[添付ファイル由来の未検証データ')
+  ) {
+    return {
+      ...value,
+      text: `[REDACTED_ATTACHMENT_TEXT:${Math.min(value.text.length, maxTextChars)} chars]`,
+    };
+  }
+  return null;
+}
+
+function redactAttachmentSource(source: unknown, maxTextChars: number): unknown {
+  if (!source || typeof source !== 'object') return source;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(source as Record<string, unknown>)) {
+    if (k === 'data') {
+      out[k] = '[REDACTED_ATTACHMENT_DATA]';
+    } else if (k === 'file_id') {
+      out[k] = '[REDACTED_ATTACHMENT_FILE_ID]';
+    } else {
+      out[k] = redactForAudit(v, maxTextChars);
+    }
+  }
+  return out;
 }
 
 function redactText(text: string): string {

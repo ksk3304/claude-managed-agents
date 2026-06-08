@@ -145,6 +145,25 @@ describe('AgentMailClient.getMessage', () => {
   });
 });
 
+describe('AgentMailClient.getMessageAttachment', () => {
+  it('rejects oversized downloads using Content-Length before reading the body', async () => {
+    const fetchMock = makeFetchMock(async () =>
+      new Response('too large', {
+        status: 200,
+        headers: { 'content-length': '1024' },
+      }),
+    );
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+
+    await expect(
+      client.getMessageAttachment(INBOX, 'msg_x', 'att_x', { maxBytes: 10 }),
+    ).rejects.toMatchObject({
+      status: 413,
+      transient: false,
+    });
+  });
+});
+
 describe('AgentMailClient.getThread', () => {
   it('GETs the thread and returns messages', async () => {
     const fetchMock = makeFetchMock(async (url, init) => {

@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import { strToU8, zipSync } from 'fflate';
 import { agentmailDispatch } from '../src/queue/agentmail-dispatch';
 import type {
   AgentMailDispatchContext,
@@ -42,6 +43,8 @@ interface FakeAnthOpts {
   createCapture?: Array<unknown>;
   /** Pre-allocated session id `sessions.create` returns. */
   sessionId?: string;
+  /** Optional sessions.create failure for pre-stream failure tests. */
+  createError?: Error;
   /** Memory list items by memory_store_id for bootstrap tests. */
   memoryListItems?: Record<string, Array<Record<string, unknown>>>;
 }
@@ -62,6 +65,7 @@ function makeFakeAnthropic(opts: FakeAnthOpts): Anthropic {
       sessions: {
         async create(_args: unknown) {
           opts.createCapture?.push(_args);
+          if (opts.createError) throw opts.createError;
           return { id: opts.sessionId ?? 'sesn_new' };
         },
         events: {
@@ -309,6 +313,299 @@ describe('agentmailDispatch', () => {
 
     const result = await agentmailDispatch(ctx);
     expect(result.kind).toBe('committed');
+  });
+
+  it('hydrates full message and passes docx attachment text to the session', async () => {
+    const sendCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        extracted_text: '',
+        text: '',
+      },
+      event: {
+        id: 'evt_attachment',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          extracted_text: '',
+          text: '',
+          inbox_id: 'inbox_main',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    const docx = zipSync({
+      'word/document.xml': strToU8(
+        '<?xml version="1.0"?><w:document xmlns:w="x"><w:body>' +
+          '<w:p><w:r><w:t>添付の成果物です。</w:t></w:r></w:p>' +
+          '<w:p><w:r><w:t>確認してください。</w:t></w:r></w:p>' +
+          '</w:body></w:document>',
+      ),
+    });
+
+    installFakeAnthropic({
+      sendCapture,
+      events: [
+        { type: 'agent.message.text', text: '内部確認のみ' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url) => {
+      if (url.includes('/messages/msg_inbound/attachments/att_docx_1')) {
+        return new Response(docx, {
+          status: 200,
+          headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+        });
+      }
+      if (url.includes('/messages/msg_inbound')) {
+        return new Response(
+          JSON.stringify({
+            ...INBOUND_MSG,
+            inbox_id: 'inbox_main',
+            text: '本文は短いです。',
+            attachments: [
+              {
+                attachment_id: 'att_docx_1',
+                filename: '成果物.docx',
+                content_type:
+                  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                size: docx.byteLength,
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response('unexpected', { status: 500 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      const payload = sendCapture[0] as {
+        events?: Array<{ content?: Array<Record<string, unknown>> }>;
+      };
+      const content = payload.events?.[0]?.content ?? [];
+      const textBlocks = content
+        .filter((block) => block.type === 'text')
+        .map((block) => String(block.text ?? ''));
+      expect(textBlocks.join('\n')).toContain('添付ファイル:');
+      expect(textBlocks.join('\n')).toContain('成果物.docx');
+      expect(textBlocks.join('\n')).toContain('添付の成果物です。');
+      expect(textBlocks.join('\n')).toContain('確認してください。');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('does not download attachments when session creation fails before streaming', async () => {
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        text: '本文あり',
+        attachments: [
+          {
+            attachment_id: 'att_docx_1',
+            filename: '成果物.docx',
+            content_type:
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            size: 123,
+          },
+        ],
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    installFakeAnthropic({
+      createError: new Error('create boom'),
+      events: [],
+    });
+
+    let fetchCalled = false;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async () => {
+      fetchCalled = true;
+      return new Response('unexpected', { status: 500 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('release_and_retry');
+      expect(fetchCalled).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('uses deterministic PDF preflight reply without sending attachment to the session', async () => {
+    const sendCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        text: '添付PDFを確認してください。',
+        attachments: [
+          {
+            attachment_id: 'att_pdf_1',
+            filename: 'large.pdf',
+            content_type: 'application/pdf',
+            size: 16,
+          },
+        ],
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    installFakeAnthropic({
+      sendCapture,
+      events: [{ type: 'session.status_idle' }],
+    });
+
+    const calls: Array<{ url: string; body: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url, init) => {
+      calls.push({ url, body: String(init.body ?? '') });
+      if (url.includes('/attachments/att_pdf_1')) {
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { 'content-type': 'application/pdf' },
+        });
+      }
+      return new Response(
+        JSON.stringify({ message_id: 'msg_pdf_reply', rfc822_message_id: '<pdf-reply@example.com>' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      expect(sendCapture).toHaveLength(0);
+      const reply = calls.find((c) => c.url.includes('/messages/msg_inbound/reply'));
+      expect(reply).toBeTruthy();
+      expect(JSON.parse(reply!.body).text).toContain('このPDFは直接添付としては大きすぎます');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('hydrates attachments via thread fallback when message get by RFC822 id misses', async () => {
+    const sendCapture: unknown[] = [];
+    const ctx = makeDispatchContext({
+      message: {
+        ...INBOUND_MSG,
+        id: undefined,
+        message_id: '<inbound-1@example.com>',
+        extracted_text: '',
+        text: '',
+        thread_id: 'thread_with_attachment',
+      },
+      event: {
+        id: 'evt_attachment_thread',
+        event_type: 'message.received',
+        timestamp: 'x',
+        message: {
+          ...INBOUND_MSG,
+          id: undefined,
+          message_id: '<inbound-1@example.com>',
+          extracted_text: '',
+          text: '',
+          thread_id: 'thread_with_attachment',
+          inbox_id: 'inbox_main',
+        },
+      },
+    });
+    await ctx.env.MAKOTO_KV.put(
+      'user_mapping:alice@example.com',
+      JSON.stringify({ user_slug: 'alice', agent_id: 'agent_001', memory_attachments: [] }),
+    );
+    await preClaim(ctx.env, ctx.eventKey, ctx.claim.owner);
+
+    const docx = zipSync({
+      'word/document.xml': strToU8(
+        '<?xml version="1.0"?><w:document xmlns:w="x"><w:body>' +
+          '<w:p><w:r><w:t>thread fallback docx</w:t></w:r></w:p>' +
+          '</w:body></w:document>',
+      ),
+    });
+
+    installFakeAnthropic({
+      sendCapture,
+      events: [
+        { type: 'agent.message.text', text: '内部確認のみ' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = makeFetchMock(async (url) => {
+      if (url.includes('/messages/msg_threaded/attachments/att_docx_thread')) {
+        return new Response(docx, {
+          status: 200,
+          headers: { 'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+        });
+      }
+      if (url.includes('/threads/thread_with_attachment')) {
+        return new Response(
+          JSON.stringify({
+            messages: [
+              {
+                ...INBOUND_MSG,
+                id: 'msg_threaded',
+                message_id: '<inbound-1@example.com>',
+                text: 'thread body',
+                attachments: [
+                  {
+                    attachment_id: 'att_docx_thread',
+                    filename: 'thread.docx',
+                    content_type:
+                      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    size: docx.byteLength,
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.includes('/messages/%3Cinbound-1%40example.com%3E')) {
+        return new Response('not found', { status: 404 });
+      }
+      return new Response('unexpected', { status: 500 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const result = await agentmailDispatch(ctx);
+      expect(result.kind).toBe('committed');
+      const payload = sendCapture[0] as {
+        events?: Array<{ content?: Array<Record<string, unknown>> }>;
+      };
+      const text = (payload.events?.[0]?.content ?? [])
+        .filter((block) => block.type === 'text')
+        .map((block) => String(block.text ?? ''))
+        .join('\n');
+      expect(text).toContain('thread.docx');
+      expect(text).toContain('thread fallback docx');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   it('lost claim before send → skipped (no AgentMail call)', async () => {

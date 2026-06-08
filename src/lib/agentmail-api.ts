@@ -85,6 +85,11 @@ export interface ReplyMessageInput extends SendMessageInput {
   parentMessageId: string;
 }
 
+export interface BinaryRequestOptions {
+  /** Abort body accumulation once this many bytes is exceeded. */
+  maxBytes?: number;
+}
+
 export interface SendMessageResult {
   /** AgentMail-opaque message id. Empty string if 2xx but no id returned. */
   message_id: string;
@@ -148,6 +153,22 @@ export class AgentMailClient {
     const path = `/inboxes/${encodeURIComponent(inboxId)}/messages/${encodeURIComponent(messageId)}`;
     const r = await this.request<AgentMailMessage>('GET', path);
     return r;
+  }
+
+  /**
+   * `GET /inboxes/{inboxId}/messages/{messageId}/attachments/{attachmentId}` —
+   * fetch one attachment as raw bytes.
+   */
+  async getMessageAttachment(
+    inboxId: string,
+    messageId: string,
+    attachmentId: string,
+    options: BinaryRequestOptions = {},
+  ): Promise<Uint8Array> {
+    const path = `/inboxes/${encodeURIComponent(inboxId)}/messages/${encodeURIComponent(
+      messageId,
+    )}/attachments/${encodeURIComponent(attachmentId)}`;
+    return await this.requestBinary('GET', path, options);
   }
 
   /**
@@ -299,4 +320,117 @@ export class AgentMailClient {
       }
     }
   }
+
+  private async requestBinary(
+    method: string,
+    path: string,
+    options: BinaryRequestOptions = {},
+  ): Promise<Uint8Array> {
+    const url = `${this.baseUrl}${path}`;
+    assertBridgeEgressAllowed(url, 'agentmail-api:requestBinary');
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const resp = await this.fetchImpl(url, {
+          method,
+          headers: {
+            'authorization': `Bearer ${this.apiKey}`,
+            'accept': '*/*',
+          },
+          signal: controller.signal,
+        });
+        if (resp.ok) {
+          const data = await readBinaryResponse(resp, options.maxBytes);
+          clearTimeout(timer);
+          return data;
+        }
+        const text = await resp.text();
+        clearTimeout(timer);
+        const transient = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
+        if (transient && attempt < this.maxRetries) {
+          const backoffMs = Math.min(2_000 * attempt, 10_000);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        throw new AgentMailError(
+          `AgentMail ${method} ${path} failed: ${resp.status}`,
+          resp.status,
+          transient,
+          text.slice(0, 2048),
+        );
+      } catch (err) {
+        clearTimeout(timer);
+        if (err instanceof AgentMailError) throw err;
+        if (attempt < this.maxRetries) {
+          const backoffMs = Math.min(2_000 * attempt, 10_000);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        throw new AgentMailError(`AgentMail ${method} ${path} network error: ${message}`, 0, true);
+      }
+    }
+  }
+}
+
+async function readBinaryResponse(resp: Response, maxBytes?: number): Promise<Uint8Array> {
+  const contentLength = parseContentLength(resp.headers.get('content-length'));
+  if (typeof maxBytes === 'number' && contentLength !== null && contentLength > maxBytes) {
+    throw new AgentMailError(
+      `AgentMail attachment too large: Content-Length ${contentLength} > cap ${maxBytes}`,
+      413,
+      false,
+    );
+  }
+
+  if (!resp.body) {
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    if (typeof maxBytes === 'number' && buf.byteLength > maxBytes) {
+      throw new AgentMailError(
+        `AgentMail attachment too large: body size ${buf.byteLength} > cap ${maxBytes}`,
+        413,
+        false,
+      );
+    }
+    return buf;
+  }
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (typeof maxBytes === 'number' && total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Best-effort cancellation only; caller receives the size error.
+      }
+      throw new AgentMailError(
+        `AgentMail attachment too large: streamed size ${total} > cap ${maxBytes}`,
+        413,
+        false,
+      );
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function parseContentLength(raw: string | null): number | null {
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
 }
