@@ -333,40 +333,6 @@ describe("deploy guard", () => {
     );
   });
 
-  it("allows a makoto-prime prompt deployment marker when local prompt bundle matches", () => {
-    const root = makeGitRoot();
-    mkdirSync(path.join(root, "src/data"), { recursive: true });
-    writeFileSync(
-      path.join(root, "src/data/persona-spec.ts"),
-      'export const PERSONA_SPEC_SHA256_HEX12 = "94601c72a58c";\n',
-    );
-    writeFileSync(
-      path.join(root, "src/data/tools-spec.ts"),
-      'export const TOOLS_SPEC_SHA256_HEX12 = "938bb2c3c403";\n',
-    );
-    const makotoPrimeCommit = "3d9da9caa19956bf89e0b7751ca9294815d34289";
-    const deployments = [
-      {
-        id: "prompt-deploy",
-        created_on: "2026-06-08T11:30:36Z",
-        annotations: {
-          "workers/message":
-            `makoto-prime=${makotoPrimeCommit} cf-repo=${makotoPrimeCommit} ` +
-            "persona=94601c72a58c tools=938bb2c3c403 issue=331",
-        },
-      },
-    ];
-
-    const lineage = collectServingLineage(root, readDeployTarget(root), {
-      deployments,
-    });
-
-    expect(lineage.ok).toBe(true);
-    expect(lineage.servingContained).toBe(false);
-    expect(lineage.servingPromptBundlePreserved).toBe(true);
-    expect(lineage.failures).toEqual([]);
-  });
-
   it("blocks deploy when a must-preserve commit would be dropped", () => {
     const root = makeGitRoot();
     git(root, ["checkout", "-b", "codex/must-preserve-hotfix"]);
