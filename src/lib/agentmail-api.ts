@@ -26,11 +26,16 @@ import type {
   AgentMailMessage,
   EmailSendAttachment,
 } from '../types/agentmail';
-import { assertBridgeEgressAllowed } from './egress-guard';
+import {
+  assertAgentMailAttachmentDownloadAllowed,
+  assertBridgeEgressAllowed,
+  BridgeEgressDeniedError,
+} from './egress-guard';
 
 const DEFAULT_BASE_URL = 'https://api.agentmail.to/v0';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const MAX_ATTACHMENT_DESCRIPTOR_BYTES = 1024 * 1024;
 
 /**
  * Lightweight error wrapper. `status` is the HTTP status (or 0 for
@@ -310,6 +315,7 @@ export class AgentMailClient {
       } catch (err) {
         clearTimeout(timer);
         if (err instanceof AgentMailError) throw err;
+        if (err instanceof BridgeEgressDeniedError) throw err;
         if (attempt < this.maxRetries) {
           const backoffMs = Math.min(2_000 * attempt, 10_000);
           await new Promise((r) => setTimeout(r, backoffMs));
@@ -343,6 +349,19 @@ export class AgentMailClient {
           signal: controller.signal,
         });
         if (resp.ok) {
+          if (isJsonContentType(resp.headers.get('content-type'))) {
+            const descriptor = await readJsonResponse(resp, MAX_ATTACHMENT_DESCRIPTOR_BYTES);
+            const downloadUrl = attachmentDownloadUrl(descriptor);
+            if (!downloadUrl) {
+              throw new AgentMailError(
+                `AgentMail ${method} ${path} attachment descriptor missing download_url`,
+                502,
+                true,
+              );
+            }
+            clearTimeout(timer);
+            return await this.requestSignedBinary(downloadUrl, options);
+          }
           const data = await readBinaryResponse(resp, options.maxBytes);
           clearTimeout(timer);
           return data;
@@ -364,6 +383,7 @@ export class AgentMailClient {
       } catch (err) {
         clearTimeout(timer);
         if (err instanceof AgentMailError) throw err;
+        if (err instanceof BridgeEgressDeniedError) throw err;
         if (attempt < this.maxRetries) {
           const backoffMs = Math.min(2_000 * attempt, 10_000);
           await new Promise((r) => setTimeout(r, backoffMs));
@@ -374,6 +394,71 @@ export class AgentMailClient {
       }
     }
   }
+
+  private async requestSignedBinary(
+    url: string,
+    options: BinaryRequestOptions = {},
+  ): Promise<Uint8Array> {
+    assertAgentMailAttachmentDownloadAllowed(url, 'agentmail-api:attachmentDownload');
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const resp = await this.fetchImpl(url, {
+          method: 'GET',
+          headers: { 'accept': '*/*' },
+          signal: controller.signal,
+        });
+        if (resp.ok) {
+          const data = await readBinaryResponse(resp, options.maxBytes);
+          clearTimeout(timer);
+          return data;
+        }
+        const text = await resp.text();
+        clearTimeout(timer);
+        const transient = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
+        if (transient && attempt < this.maxRetries) {
+          const backoffMs = Math.min(2_000 * attempt, 10_000);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        throw new AgentMailError(
+          `AgentMail attachment download failed: ${resp.status}`,
+          resp.status,
+          transient,
+          text.slice(0, 2048),
+        );
+      } catch (err) {
+        clearTimeout(timer);
+        if (err instanceof AgentMailError) throw err;
+        if (attempt < this.maxRetries) {
+          const backoffMs = Math.min(2_000 * attempt, 10_000);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        throw new AgentMailError(`AgentMail attachment download network error: ${message}`, 0, true);
+      }
+    }
+  }
+}
+
+function isJsonContentType(raw: string | null): boolean {
+  return /\bjson\b/i.test(raw ?? '');
+}
+
+function attachmentDownloadUrl(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = (value as { download_url?: unknown }).download_url;
+  return typeof raw === 'string' && raw.length > 0 ? raw : null;
+}
+
+async function readJsonResponse(resp: Response, maxBytes: number): Promise<unknown> {
+  const data = await readBinaryResponse(resp, maxBytes);
+  const text = new TextDecoder().decode(data);
+  return JSON.parse(text) as unknown;
 }
 
 async function readBinaryResponse(resp: Response, maxBytes?: number): Promise<Uint8Array> {

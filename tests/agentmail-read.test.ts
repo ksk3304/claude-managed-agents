@@ -200,6 +200,18 @@ describe('agentmailRead get', () => {
         });
       }
       if (url.endsWith('/messages/msg_1/attachments/att_docx')) {
+        return jsonResponse(200, {
+          attachment_id: 'att_docx',
+          download_url: 'https://agentmail-signed.test/download/att_docx',
+        });
+      }
+      if (url.endsWith('/messages/msg_1/attachments/att_xlsx')) {
+        return jsonResponse(200, {
+          attachment_id: 'att_xlsx',
+          download_url: 'https://agentmail-signed.test/download/att_xlsx',
+        });
+      }
+      if (url === 'https://agentmail-signed.test/download/att_docx') {
         return new Response(docx, {
           status: 200,
           headers: {
@@ -208,7 +220,7 @@ describe('agentmailRead get', () => {
           },
         });
       }
-      if (url.endsWith('/messages/msg_1/attachments/att_xlsx')) {
+      if (url === 'https://agentmail-signed.test/download/att_xlsx') {
         return new Response(xlsx, {
           status: 200,
           headers: {
@@ -228,7 +240,9 @@ describe('agentmailRead get', () => {
     expect(urls).toEqual([
       'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1',
       'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1/attachments/att_docx',
+      'https://agentmail-signed.test/download/att_docx',
       'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1/attachments/att_xlsx',
+      'https://agentmail-signed.test/download/att_xlsx',
     ]);
     const message = res.message as Record<string, unknown>;
     const attachmentText = message.attachment_text as {

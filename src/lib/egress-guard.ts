@@ -103,3 +103,25 @@ export function assertBridgeEgressAllowed(url: string, callerHint?: string): voi
     throw new BridgeEgressDeniedError(host, callerHint);
   }
 }
+
+/**
+ * AgentMail's attachment endpoint may return a short-lived `download_url`
+ * instead of the raw file bytes. The host for that signed URL is provider
+ * controlled and not a stable API hostname, so this narrower guard accepts
+ * HTTPS-only attachment downloads while the caller sends no Authorization
+ * header and still enforces byte caps while reading the body.
+ */
+export function assertAgentMailAttachmentDownloadAllowed(
+  url: string,
+  callerHint?: string,
+): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new BridgeEgressDeniedError(`<unparseable:${url.slice(0, 80)}>`, callerHint);
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new BridgeEgressDeniedError(parsed.hostname.toLowerCase(), callerHint);
+  }
+}
