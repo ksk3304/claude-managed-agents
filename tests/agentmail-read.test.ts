@@ -61,6 +61,9 @@ function markZipEncrypted(zip: Uint8Array): Uint8Array {
   return out;
 }
 
+const ZIP_P_PASSWORD_GLAVIS0603_BASE64 =
+  'UEsDBBQACQAIAElsyVyt7ci+BAQAAIYEAAAbABwAMzIyLXBhc3N3b3JkLXppcC1pbm5lci5kb2N4VVQJAAPJlydqyZcnanV4CwABBPUBAAAEAAAAAC+aJoxdvQejKmmV01PS+1J/yD7TcM2hA/WNLIwOF/Mzm8D6nhzsRr52BHzdjafRZPCgcmk9i+YT6nPDsbu9hUDRec707xzpfum8Abo9j8eSHMkgJjpRgNW11IwYj13F68AI04vVBA+PREL4Hvnt5QgtH0ie9Zvp0hZ5+Q4xxgX+qV9oqVj1R7awM7XZaDCQvzxStPQv3y4UK3gyiehWfw7gG/DcTkfPjH09I4aMiIGee4iezyjok9CDTokL6YcpadDzBsq7nWgJyn8MIQZ6xP4/qX4DVi5+CQHTS463zUJVu3K2WMT323zdBXDPyOz6f4DGRY+Md3q8a7AVj19wV1jcG2P6OUuwUpRwrWu0Pzi7FqRY95DSluPVUYyPzyo34m47FjHCB4Bfy7I1gPrV816yizU4425tv33qYz7uAl/NA7w7CwVZLbVoHv7bQwRrxth4WhoWDgHjFGiECk5FjhXrVzD95GWcnwPOOYF0LbJfyCZEfU2cIbHPJ/CmzjUCZ/PvP9YtJR986WU7mSpX+lA4McRyV0LteZqWoJ94SqphqCbNBD2a5ty2MHvL2+jSEhkpwlc7gIWsGAV8m/OrNbbXFlQ6kcnsOjCXZAWTj/jw6haDkAByNhFD1qxHjLDCS5c+5R+SkfWdUKLru2oATy2o0Uve7RZGX01VzOPtkhYxv6VesP+Yx+c0JAjsOF109WcLw4cElDYpUSFkpCZCcHfglCYrR4EXoBcBv/S2XH4mQCR43JKjE0uwVcRKYtXsOYlacy23pftaIyKQrB2lJeyMxSdDrG15o5kPvnve4jcY+fUbv+NfsODrJ0eWUOe+L7mB00qPDFxq637nXTgfln+4F+PEjxY7dO8/Co0QO+E2tg5RFvZeI03JGEPzuoUmivjQ3tPelh1TsZcD2p/bl3wUT+/kD01iHaj8tI2OvGWosZCHZDCqaJQuAz+V5H0+UQ7gTdmy5f096p0i59O8AGLhRCmvznRkaXkSCoZXrWTKlRH+VctqdVZo1+fD7QJOQvrFo1GRgBV6IFBJne4nFuAOjxiZsxDdwgcru4aTQZfxeMO1x57wJba5d9opkjcLElkopkWrxtAoWmZoTRGjIvFvaqty81wWEAsd/IHXBbkJKPdceAI8XrACda97l5mIGaBsda6AJaSvR2hZyWBKo+T5Swk6BMybG/PQj+zs+Ws2lqfwY6haAalI4gObCouy6Mdlka3MWH67OWcSdb2ztV3aoKbw/NogHfoSanN4ZUSladD1ONEZBLpXoeqnuOgQafPNpiBBesQBz0fxFhTdXupzPZHWtKI3iusPvLoLg7mTgQ14rb0sskg4+hXRaziSYlubRU312/pw6vDhqONRm4pVS8JbUEsHCK3tyL4EBAAAhgQAAFBLAQIeAxQACQAIAElsyVyt7ci+BAQAAIYEAAAbABgAAAAAAAAAAACkgQAAAAAzMjItcGFzc3dvcmQtemlwLWlubmVyLmRvY3hVVAUAA8mXJ2p1eAsAAQT1AQAABAAAAABQSwUGAAAAAAEAAQBhAAAAaQQAAAAA';
+
 async function makeEncryptedZip(
   entries: Record<string, Uint8Array>,
   password: string,
@@ -433,6 +436,156 @@ describe('agentmailRead get', () => {
     expect(attachmentText.items[0]?.filename).toBe('password-protected.zip/contract.docx');
     expect(String(attachmentText.items[0]?.text)).toContain('PW付きZIP内DOCX読取成功');
     expect(String(attachmentText.items[0]?.text)).toContain('ぺんぎん-322-pwzip');
+  });
+
+  it('uses an explicit zip_passwords argument to extract encrypted ZIP Office files', async () => {
+    const encryptedZip = await makeEncryptedZip(
+      { 'contract.docx': makeDocx('Chat指示PWでZIP内DOCX読取成功 きりん-322-pwarg') },
+      'glavis0603',
+    );
+    const fetcher = makeFetchMock(async (url) => {
+      if (url.endsWith('/messages/msg_pw_arg')) {
+        return jsonResponse(200, {
+          id: 'msg_pw_arg',
+          subject: 'PW付きZIP',
+          text: '添付ZIPをご確認ください。',
+          attachments: [
+            {
+              attachment_id: 'att_zip',
+              filename: 'password-protected.zip',
+              content_type: 'application/zip',
+              size: encryptedZip.byteLength,
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/messages/msg_pw_arg/attachments/att_zip')) {
+        return new Response(encryptedZip, {
+          status: 200,
+          headers: { 'content-type': 'application/zip' },
+        });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+
+    const res = await agentmailRead(
+      { action: 'get', message_id: 'msg_pw_arg', zip_passwords: ['glavis0603'] },
+      { ...DEPS, fetcher },
+    );
+
+    const message = res.message as Record<string, unknown>;
+    const attachmentText = message.attachment_text as {
+      items: Array<Record<string, unknown>>;
+      notice: string | null;
+    };
+    expect(attachmentText.notice).toBeNull();
+    expect(String(attachmentText.items[0]?.text)).toContain('きりん-322-pwarg');
+  });
+
+  it('uses a password candidate embedded in the ZIP filename for a zip -P fixture', async () => {
+    const encryptedZip = Uint8Array.from(
+      Buffer.from(ZIP_P_PASSWORD_GLAVIS0603_BASE64, 'base64'),
+    );
+    const fetcher = makeFetchMock(async (url) => {
+      if (url.endsWith('/messages/msg_pw_filename')) {
+        return jsonResponse(200, {
+          id: 'msg_pw_filename',
+          subject: 'PW付きZIP',
+          text: '添付ZIPをご確認ください。',
+          attachments: [
+            {
+              attachment_id: 'att_zip',
+              filename: '322-password-office-files-password-glavis0603.zip',
+              content_type: 'application/zip',
+              size: encryptedZip.byteLength,
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/messages/msg_pw_filename/attachments/att_zip')) {
+        return new Response(encryptedZip, {
+          status: 200,
+          headers: { 'content-type': 'application/zip' },
+        });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+
+    const res = await agentmailRead(
+      { action: 'get', message_id: 'msg_pw_filename' },
+      { ...DEPS, fetcher },
+    );
+
+    const message = res.message as Record<string, unknown>;
+    const attachmentText = message.attachment_text as {
+      items: Array<Record<string, unknown>>;
+      notice: string | null;
+    };
+    expect(attachmentText.notice).toBeNull();
+    expect(attachmentText.items[0]?.filename).toBe(
+      '322-password-office-files-password-glavis0603.zip/322-password-zip-inner.docx',
+    );
+    expect(String(attachmentText.items[0]?.text)).toContain('ふくろう森-322-pwzip');
+    expect(String(attachmentText.items[0]?.text)).toContain('PW付きZIP内DOCX読取成功');
+  });
+
+  it('extracts text attachments and uses them as ZIP password sources', async () => {
+    const encryptedZip = await makeEncryptedZip(
+      { 'contract.docx': makeDocx('README内PWでZIP内DOCX読取成功 こあら-322-readme-pw') },
+      'glavis0603',
+    );
+    const fetcher = makeFetchMock(async (url) => {
+      if (url.endsWith('/messages/msg_pw_readme')) {
+        return jsonResponse(200, {
+          id: 'msg_pw_readme',
+          subject: 'PW付きZIP',
+          text: '添付ZIPをご確認ください。',
+          attachments: [
+            {
+              attachment_id: 'att_readme',
+              filename: 'README-実機テスト手順.txt',
+              content_type: 'text/plain',
+              size: 100,
+            },
+            {
+              attachment_id: 'att_zip',
+              filename: 'password-protected.zip',
+              content_type: 'application/zip',
+              size: encryptedZip.byteLength,
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/messages/msg_pw_readme/attachments/att_readme')) {
+        return new Response('PW付きZIPのパスワードは glavis0603 です。', {
+          status: 200,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      }
+      if (url.endsWith('/messages/msg_pw_readme/attachments/att_zip')) {
+        return new Response(encryptedZip, {
+          status: 200,
+          headers: { 'content-type': 'application/zip' },
+        });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+
+    const res = await agentmailRead(
+      { action: 'get', message_id: 'msg_pw_readme' },
+      { ...DEPS, fetcher },
+    );
+
+    const message = res.message as Record<string, unknown>;
+    const attachmentText = message.attachment_text as {
+      items: Array<Record<string, unknown>>;
+      notice: string | null;
+    };
+    expect(attachmentText.notice).toBeNull();
+    expect(attachmentText.items[0]?.filename).toBe('README-実機テスト手順.txt');
+    expect(String(attachmentText.items[0]?.text)).toContain('パスワードは [REDACTED_SECRET]');
+    expect(attachmentText.items[1]?.filename).toBe('password-protected.zip/contract.docx');
+    expect(String(attachmentText.items[1]?.text)).toContain('こあら-322-readme-pw');
   });
 
   it('retries RFC822 message_id with brackets when the first get 404s', async () => {
