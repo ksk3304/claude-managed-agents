@@ -1327,7 +1327,7 @@ function iterTableCells(row: string): string[] {
 }
 
 function* iterRows(sheetXml: string): IterableIterator<string> {
-  const re = /<row[\s>][\s\S]*?<\/row>/g;
+  const re = /<(?:\w+:)?row(?:\s|>)[\s\S]*?<\/(?:\w+:)?row>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(xml(sheetXml))) !== null) yield m[0];
 }
@@ -1343,7 +1343,7 @@ function xml(s: string): string {
  */
 function extractRowCells(row: string, sharedStrings: string[]): string[] {
   const cells: string[] = [];
-  const cellRe = /<c\b([^>]*)>([\s\S]*?)<\/c>|<c\b([^>]*)\/>/g;
+  const cellRe = /<(?:\w+:)?c([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>|<(?:\w+:)?c([^>]*)\/>/g;
   let m: RegExpExecArray | null;
   while ((m = cellRe.exec(row)) !== null) {
     const attrs = (m[1] || m[3] || '').trim();
@@ -1352,19 +1352,22 @@ function extractRowCells(row: string, sharedStrings: string[]): string[] {
     const typ = tMatch ? tMatch[1] : '';
     if (typ === 's') {
       // sharedStrings 参照
-      const idxMatch = inner.match(/<v>([^<]*)<\/v>/);
+      const idxMatch = inner.match(/<(?:\w+:)?v>([^<]*)<\/(?:\w+:)?v>/);
       if (idxMatch) {
         const idx = parseInt(idxMatch[1]!, 10);
         cells.push(sharedStrings[idx] || '');
       } else {
         cells.push('');
       }
-    } else if (typ === 'inlineStr' || typ === 'str') {
+    } else if (typ === 'inlineStr') {
       const t = extractOoxmlTextRuns(inner, 't');
       cells.push(t);
+    } else if (typ === 'str') {
+      const valMatch = inner.match(/<(?:\w+:)?v>([\s\S]*?)<\/(?:\w+:)?v>/);
+      cells.push(valMatch ? decodeXmlEntities(valMatch[1]!) : extractOoxmlTextRuns(inner, 't'));
     } else {
       // 数値 / boolean / date 等
-      const valMatch = inner.match(/<v>([\s\S]*?)<\/v>/);
+      const valMatch = inner.match(/<(?:\w+:)?v>([\s\S]*?)<\/(?:\w+:)?v>/);
       cells.push(valMatch ? decodeXmlEntities(valMatch[1]!) : '');
     }
   }
