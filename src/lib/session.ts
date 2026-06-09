@@ -93,13 +93,6 @@ export interface ManagedSessionUsageSnapshot {
   model?: string | null;
 }
 
-export interface ManagedAgentsModelUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-}
-
 export async function retrieveSessionUsageSnapshot(
   client: Anthropic,
   sessionId: string,
@@ -194,10 +187,6 @@ export interface SendAndStreamResult {
   toolUseNames: string[];
   /** True when live stream timed out but final text was recovered via events.list. */
   recoveredFromStreamTimeout?: boolean;
-  /** Per-turn sum of Managed Agents span.model_request_end token usage. */
-  modelUsage: ManagedAgentsModelUsage | null;
-  /** Number of model request usage spans included in modelUsage. */
-  modelUsageSpanCount: number;
 }
 
 const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
@@ -257,17 +246,10 @@ export async function sendAndStream(
   let terminalEventType: string | undefined;
   let toolUseCount = 0;
   const toolUseNames: string[] = [];
-  const modelUsage = emptyModelUsage();
-  let modelUsageSpanCount = 0;
 
   const drain = (async () => {
     for await (const ev of stream as unknown as AsyncIterable<Record<string, unknown>>) {
       const evType = typeof ev.type === 'string' ? ev.type : '';
-      const usage = modelUsageFromSessionEvent(ev);
-      if (usage) {
-        addModelUsage(modelUsage, usage);
-        modelUsageSpanCount += 1;
-      }
       if (isToolUseEventType(evType)) {
         toolUseCount += 1;
         const name = toolNameFromSessionEvent(ev);
@@ -299,8 +281,6 @@ export async function sendAndStream(
     terminalEventType,
     toolUseCount,
     toolUseNames,
-    modelUsage: modelUsageSpanCount > 0 ? modelUsage : null,
-    modelUsageSpanCount,
   };
 }
 
@@ -357,6 +337,7 @@ function toolNameFromSessionEvent(ev: Record<string, unknown>): string | undefin
 }
 
 function userMessageContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const block of content) {
@@ -591,8 +572,6 @@ export async function sendAndStreamWithToolDispatch(
   let sentCustomToolResult = false;
   let recoveredToolUseCount: number | undefined;
   let recoveredToolUseNames: string[] | undefined;
-  const modelUsage = emptyModelUsage();
-  let modelUsageSpanCount = 0;
 
   const sendPendingCustomToolTimeoutResults = async (): Promise<boolean> => {
     const unresolved = new Map([
@@ -658,11 +637,6 @@ export async function sendAndStreamWithToolDispatch(
       }
 
       const evType = typeof ev.type === 'string' ? ev.type : '';
-      const usage = modelUsageFromSessionEvent(ev);
-      if (usage) {
-        addModelUsage(modelUsage, usage);
-        modelUsageSpanCount += 1;
-      }
       if (!seenUserMessageEcho) {
         if (
           evType === 'user.message' &&
@@ -920,7 +894,8 @@ export async function sendAndStreamWithToolDispatch(
   if (
     !timedOut &&
     (stopReason === 'requires_action' ||
-      (sentCustomToolResult && !hasFinalStopReason && assistantText.trim().length === 0))
+      (sentCustomToolResult && !hasFinalStopReason && assistantText.trim().length === 0) ||
+      (!terminalEventType && !stopReason && assistantText.trim().length === 0))
   ) {
     const resumed = await resumeTurnFromSessionEvents(client, {
       sessionId: input.sessionId,
@@ -947,50 +922,7 @@ export async function sendAndStreamWithToolDispatch(
     toolUseCount: Math.max(builtinToolCalls + toolCalls, recoveredToolUseCount ?? 0),
     toolUseNames: recoveredToolUseNames ?? toolUseNames,
     ...(recoveredFromStreamTimeout ? { recoveredFromStreamTimeout } : {}),
-    modelUsage: modelUsageSpanCount > 0 ? modelUsage : null,
-    modelUsageSpanCount,
   };
-}
-
-function emptyModelUsage(): ManagedAgentsModelUsage {
-  return {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-  };
-}
-
-function addModelUsage(total: ManagedAgentsModelUsage, next: ManagedAgentsModelUsage): void {
-  total.input_tokens += next.input_tokens;
-  total.output_tokens += next.output_tokens;
-  total.cache_creation_input_tokens += next.cache_creation_input_tokens;
-  total.cache_read_input_tokens += next.cache_read_input_tokens;
-}
-
-function modelUsageFromSessionEvent(ev: Record<string, unknown>): ManagedAgentsModelUsage | null {
-  const evType = typeof ev.type === 'string' ? ev.type : '';
-  if (evType !== 'span.model_request_end' && evType !== 'span.outcome_evaluation_end') {
-    return null;
-  }
-  const raw =
-    evType === 'span.model_request_end'
-      ? (ev as { model_usage?: unknown }).model_usage
-      : (ev as { usage?: unknown }).usage;
-  if (!raw || typeof raw !== 'object') return null;
-  const usage = raw as Record<string, unknown>;
-  return {
-    input_tokens: tokenCount(usage.input_tokens),
-    output_tokens: tokenCount(usage.output_tokens),
-    cache_creation_input_tokens: tokenCount(usage.cache_creation_input_tokens),
-    cache_read_input_tokens: tokenCount(usage.cache_read_input_tokens),
-  };
-}
-
-function tokenCount(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-    ? Math.trunc(value)
-    : 0;
 }
 
 interface TimeoutRecoveryInput {
@@ -1022,8 +954,6 @@ interface SessionTurnAnalysis {
   toolUseCount: number;
   toolUseNames: string[];
   pendingCustomToolUses: Array<{ id: string; name: string; input: unknown }>;
-  modelUsage: ManagedAgentsModelUsage | null;
-  modelUsageSpanCount: number;
 }
 
 async function recoverCompletedTurnAfterStreamTimeout(
@@ -1162,8 +1092,6 @@ export async function resumeTurnFromSessionEvents(
           stopReason: analysis.stopReason,
           toolUseCount: analysis.toolUseCount,
           toolUseNames: analysis.toolUseNames,
-          modelUsage: analysis.modelUsage,
-          modelUsageSpanCount: analysis.modelUsageSpanCount,
         };
       }
 
@@ -1285,16 +1213,9 @@ function analyzeLatestTurnFromSessionEvents(
   const answeredCustomToolUseIds = new Set<string>();
   let toolUseCount = 0;
   const toolUseNames: string[] = [];
-  const modelUsage = emptyModelUsage();
-  let modelUsageSpanCount = 0;
 
   for (const ev of events.slice(turnStart + 1)) {
     const evType = typeof ev.type === 'string' ? ev.type : '';
-    const usage = modelUsageFromSessionEvent(ev);
-    if (usage) {
-      addModelUsage(modelUsage, usage);
-      modelUsageSpanCount += 1;
-    }
     const text = textFromSessionEvent(ev);
     if (text) assistantText += text;
 
@@ -1355,8 +1276,6 @@ function analyzeLatestTurnFromSessionEvents(
     toolUseCount,
     toolUseNames,
     pendingCustomToolUses,
-    modelUsage: modelUsageSpanCount > 0 ? modelUsage : null,
-    modelUsageSpanCount,
   };
 }
 

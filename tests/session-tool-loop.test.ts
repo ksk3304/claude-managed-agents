@@ -96,48 +96,6 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.terminalEventType).toBe('session.status_idle');
   });
 
-  it('collects Managed Agents model usage spans for prompt cache measurement', async () => {
-    const client = makeFakeClient({
-      events: [
-        { type: 'agent.message.text_delta', text: 'ok' },
-        {
-          type: 'span.model_request_end',
-          model_usage: {
-            input_tokens: 1000,
-            output_tokens: 20,
-            cache_creation_input_tokens: 800,
-            cache_read_input_tokens: 0,
-          },
-        },
-        {
-          type: 'span.model_request_end',
-          model_usage: {
-            input_tokens: 200,
-            output_tokens: 10,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 750,
-          },
-        },
-        { type: 'session.status_idle', stop_reason: 'end_turn' },
-      ],
-    });
-    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: null });
-
-    const r = await sendAndStreamWithToolDispatch(client, {
-      sessionId: 'sesn_usage',
-      userMessage: 'hi',
-      toolDispatcher: dispatcher,
-    });
-
-    expect(r.modelUsageSpanCount).toBe(2);
-    expect(r.modelUsage).toEqual({
-      input_tokens: 1200,
-      output_tokens: 30,
-      cache_creation_input_tokens: 800,
-      cache_read_input_tokens: 750,
-    });
-  });
-
   it('dispatches agent.custom_tool_use and posts a user.custom_tool_result', async () => {
     const sent: unknown[] = [];
     const client = makeFakeClient({
@@ -383,6 +341,118 @@ describe('sendAndStreamWithToolDispatch', () => {
     expect(r.assistantText).toBe('recovered text');
     expect(r.assistantText).not.toContain('previous text');
     expect(r.terminalEventType).toBe('session.status_idle');
+    expect(r.stopReason).toBe('end_turn');
+  });
+
+  it('recognizes string user.message echoes before dispatching custom tools', async () => {
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    const client = makeFakeClient({
+      events: [
+        { type: 'session.status_running' },
+        { type: 'session.thread_status_running' },
+        {
+          type: 'user.message',
+          content: 'find',
+        },
+        {
+          type: 'agent.custom_tool_use',
+          id: 'tu_1',
+          name: 'drive_search',
+          input: { query: 'x' },
+        },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_1'] },
+        },
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: 'found' }],
+        },
+        { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+      ],
+      onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+    });
+    const dispatched: { name: string; input: unknown }[] = [];
+    const dispatcher: ToolDispatcher = async (name, input) => {
+      dispatched.push({ name, input });
+      return { ok: true, payload: { files: [] } };
+    };
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_string_echo',
+      userMessage: 'find',
+      toolDispatcher: dispatcher,
+      startAfterUserMessageEcho: true,
+    });
+
+    expect(dispatched).toEqual([{ name: 'drive_search', input: { query: 'x' } }]);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.events[0]!.type).toBe('user.custom_tool_result');
+    expect(r.assistantText).toBe('found');
+    expect(r.stopReason).toBe('end_turn');
+  });
+
+  it('recovers pending custom tools when the live stream misses the user.message echo', async () => {
+    const listedEvents: FakeEvent[] = [
+      {
+        type: 'user.message',
+        content: [{ type: 'text', text: 'brief' }],
+      },
+      {
+        type: 'agent.custom_tool_use',
+        id: 'tu_1',
+        name: 'drive_search',
+        input: { query: 'x' },
+      },
+      {
+        type: 'session.status_idle',
+        stop_reason: { type: 'requires_action', event_ids: ['tu_1'] },
+      },
+    ];
+    const sent: Array<{ events: Array<Record<string, unknown>> }> = [];
+    const client = makeFakeClient({
+      events: [
+        {
+          type: 'agent.custom_tool_use',
+          id: 'tu_1',
+          name: 'drive_search',
+          input: { query: 'x' },
+        },
+        {
+          type: 'session.status_idle',
+          stop_reason: { type: 'requires_action', event_ids: ['tu_1'] },
+        },
+      ],
+      listEvents: listedEvents,
+      onSend: (p) => sent.push(p as { events: Array<Record<string, unknown>> }),
+      sendImpl: async (_sessionId, payload) => {
+        const events = (payload as { events?: Array<Record<string, unknown>> }).events ?? [];
+        for (const ev of events) {
+          if (ev.type !== 'user.custom_tool_result') continue;
+          listedEvents.push(
+            ev as FakeEvent,
+            {
+              type: 'agent.message',
+              content: [{ type: 'text', text: 'brief ready' }],
+            },
+            { type: 'session.status_idle', stop_reason: { type: 'end_turn' } },
+          );
+        }
+      },
+    });
+    const dispatcher: ToolDispatcher = async () => ({ ok: true, payload: { files: [] } });
+
+    const r = await sendAndStreamWithToolDispatch(client, {
+      sessionId: 'sesn_missed_echo',
+      userMessage: 'brief',
+      toolDispatcher: dispatcher,
+      startAfterUserMessageEcho: true,
+      timeoutRecoveryMs: 1,
+    });
+
+    expect(sent.some((payload) => payload.events[0]!.type === 'user.custom_tool_result')).toBe(
+      true,
+    );
+    expect(r.assistantText).toBe('brief ready');
     expect(r.stopReason).toBe('end_turn');
   });
 

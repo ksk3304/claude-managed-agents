@@ -7,6 +7,17 @@
  */
 
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
+import {
+  extractDocxText,
+  extractPptxText,
+  extractXlsxText,
+  isOfficeZipSafe,
+  LEGACY_OFFICE_MIME,
+  MAX_OFFICE_ATTACHMENT_BYTES,
+  MAX_OFFICE_TEXT_CHARS,
+  MAX_OFFICE_TOTAL_TEXT_CHARS,
+  SUPPORTED_OFFICE_MIME,
+} from '../lib/attachment-processing';
 import { extractBody } from '../lib/email-thread';
 import type { AgentMailMessage } from '../types/agentmail';
 import {
@@ -15,10 +26,26 @@ import {
   requirePositiveIntInRange,
 } from './tool-common';
 
+type AgentMailAttachment = Record<string, unknown> & {
+  attachment_id?: string;
+  attachmentId?: string;
+  content_type?: string;
+  contentType?: string;
+  file_name?: string;
+  filename?: string;
+  id?: string;
+  mime_type?: string;
+  name?: string;
+  size?: number;
+};
+
 const TOOL_NAME = 'agentmail_read';
 const SEARCH_LIMIT_MAX = 20;
 const GET_MAX_CHARS_DEFAULT = 4000;
 const GET_MAX_CHARS_MAX = 12000;
+const ATTACHMENT_TEXT_MAX_CHARS_DEFAULT = 60000;
+const ATTACHMENT_TEXT_MAX_CHARS_MAX = 120000;
+const ATTACHMENT_TEXT_COUNT_MAX = 10;
 
 const KNOWN_KEYS = new Set([
   'action',
@@ -33,6 +60,8 @@ const KNOWN_KEYS = new Set([
   'page_token',
   'limit',
   'max_chars',
+  'include_attachment_text',
+  'max_attachment_chars',
   'include_spam',
   'include_blocked',
   'include_unauthenticated',
@@ -173,6 +202,18 @@ async function getMessage(
     GET_MAX_CHARS_MAX,
     GET_MAX_CHARS_DEFAULT,
   );
+  const includeAttachmentText =
+    input.include_attachment_text === undefined
+      ? true
+      : optionalBoolean(input.include_attachment_text, 'include_attachment_text');
+  const maxAttachmentChars = requirePositiveIntInRange(
+    input.max_attachment_chars,
+    'max_attachment_chars',
+    TOOL_NAME,
+    1,
+    ATTACHMENT_TEXT_MAX_CHARS_MAX,
+    ATTACHMENT_TEXT_MAX_CHARS_DEFAULT,
+  );
   let msg: AgentMailMessage;
   if (messageId) {
     try {
@@ -183,7 +224,11 @@ async function getMessage(
         if (bracketed && bracketed !== messageId) {
           try {
             msg = await client.getMessage(inboxId, bracketed);
-            return formatMessageForGet(msg, maxChars);
+            return await formatMessageForGet(
+              msg,
+              maxChars,
+              includeAttachmentText ? { client, inboxId, maxAttachmentChars } : null,
+            );
           } catch (retryErr) {
             if (
               (!(retryErr instanceof AgentMailError) || retryErr.status !== 404) &&
@@ -208,7 +253,11 @@ async function getMessage(
   } else {
     msg = await getMessageFromThread(input, inboxId, client, threadId);
   }
-  return formatMessageForGet(msg, maxChars);
+  return await formatMessageForGet(
+    msg,
+    maxChars,
+    includeAttachmentText ? { client, inboxId, maxAttachmentChars } : null,
+  );
 }
 
 async function getMessageFromThread(
@@ -233,10 +282,21 @@ async function getMessageFromThread(
   return matching.at(-1) ?? messages.at(-1)!;
 }
 
-function formatMessageForGet(msg: AgentMailMessage, maxChars: number): Record<string, unknown> {
+async function formatMessageForGet(
+  msg: AgentMailMessage,
+  maxChars: number,
+  attachmentOptions: {
+    client: AgentMailClient;
+    inboxId: string;
+    maxAttachmentChars: number;
+  } | null = null,
+): Promise<Record<string, unknown>> {
   const rawBody = extractBody(msg);
   const redacted = redactSecrets(rawBody);
   const clipped = redacted.length > maxChars;
+  const attachmentText = attachmentOptions
+    ? await extractReadableAttachmentText(msg, attachmentOptions)
+    : null;
   return {
     action: 'get',
     message: {
@@ -244,6 +304,7 @@ function formatMessageForGet(msg: AgentMailMessage, maxChars: number): Record<st
       body: clipped ? redacted.slice(0, maxChars) : redacted,
       body_truncated: clipped,
       attachments: summarizeAttachments(msg),
+      ...(attachmentText ? { attachment_text: attachmentText } : {}),
     },
   };
 }
@@ -274,11 +335,203 @@ function summarizeAttachments(msg: AgentMailMessage): Array<Record<string, unkno
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((item): item is Record<string, unknown> => item !== null && typeof item === 'object')
-    .map((item) => ({
-      filename: stringField(item.filename ?? item.name),
-      content_type: stringField(item.content_type ?? item.mime_type),
-      size: typeof item.size === 'number' ? item.size : null,
-    }));
+    .map((item) => {
+      const id = stringField(item.attachment_id ?? item.id ?? item.attachmentId);
+      return {
+        ...(id ? { id } : {}),
+        filename: stringField(item.filename ?? item.name),
+        content_type: stringField(item.content_type ?? item.mime_type),
+        size: typeof item.size === 'number' ? item.size : null,
+      };
+    });
+}
+
+async function extractReadableAttachmentText(
+  msg: AgentMailMessage,
+  options: {
+    client: AgentMailClient;
+    inboxId: string;
+    maxAttachmentChars: number;
+  },
+): Promise<{
+  items: Array<Record<string, unknown>>;
+  notice: string | null;
+  truncated: boolean;
+}> {
+  const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const messageId = attachmentMessageId(msg);
+  const items: Array<Record<string, unknown>> = [];
+  const noticeParts: string[] = [];
+  let totalChars = 0;
+  let truncated = false;
+  let unsupported = 0;
+  let legacy = 0;
+  let missingId = 0;
+  let sizeOver = 0;
+  let unsafeZip = 0;
+  let downloadFailed = 0;
+  let extractFailed = 0;
+  let countOverflow = 0;
+  let totalOverflow = 0;
+
+  if (!messageId && attachments.length > 0) {
+    return {
+      items,
+      notice: '添付ファイルはありますが、AgentMail message id が無いため本体を取得できませんでした。',
+      truncated: false,
+    };
+  }
+
+  for (const att of attachments) {
+    const ctype = attachmentContentType(att).toLowerCase();
+    const filename = attachmentName(att);
+    const attachmentId = attachmentIdValue(att);
+    if (LEGACY_OFFICE_MIME.includes(ctype)) {
+      legacy += 1;
+      continue;
+    }
+    if (!SUPPORTED_OFFICE_MIME.includes(ctype)) {
+      unsupported += 1;
+      continue;
+    }
+    if (items.length >= ATTACHMENT_TEXT_COUNT_MAX) {
+      countOverflow += 1;
+      continue;
+    }
+    if (!attachmentId) {
+      missingId += 1;
+      continue;
+    }
+    if (typeof att.size === 'number' && att.size > MAX_OFFICE_ATTACHMENT_BYTES) {
+      sizeOver += 1;
+      continue;
+    }
+    const remainingBudget = Math.min(
+      options.maxAttachmentChars - totalChars,
+      MAX_OFFICE_TOTAL_TEXT_CHARS - totalChars,
+      MAX_OFFICE_TEXT_CHARS,
+    );
+    if (remainingBudget <= 0) {
+      totalOverflow += 1;
+      truncated = true;
+      continue;
+    }
+
+    let data: Uint8Array;
+    try {
+      data = await options.client.getMessageAttachment(
+        options.inboxId,
+        messageId,
+        attachmentId,
+        { maxBytes: MAX_OFFICE_ATTACHMENT_BYTES },
+      );
+    } catch {
+      downloadFailed += 1;
+      continue;
+    }
+    if (data.byteLength > MAX_OFFICE_ATTACHMENT_BYTES) {
+      sizeOver += 1;
+      continue;
+    }
+
+    const zipCheck = isOfficeZipSafe(data);
+    if (!zipCheck.safe) {
+      unsafeZip += 1;
+      continue;
+    }
+
+    let extracted: { text: string; truncated: boolean };
+    try {
+      extracted = extractOfficeAttachmentText(ctype, data, remainingBudget);
+    } catch {
+      extractFailed += 1;
+      continue;
+    }
+    const redacted = redactSecrets(extracted.text);
+    const itemTruncated = extracted.truncated || redacted.length > remainingBudget;
+    const text = redacted.length > remainingBudget
+      ? redacted.slice(0, remainingBudget)
+      : redacted;
+    if (itemTruncated) truncated = true;
+    totalChars += text.length;
+    items.push({
+      id: attachmentId,
+      filename,
+      content_type: ctype,
+      text,
+      truncated: itemTruncated,
+    });
+  }
+
+  if (legacy > 0) noticeParts.push(`旧Office形式 ${legacy} 件は未対応です`);
+  if (unsupported > 0) noticeParts.push(`Office以外または非対応添付 ${unsupported} 件は本文抽出対象外です`);
+  if (missingId > 0) noticeParts.push(`添付IDなし ${missingId} 件は取得できませんでした`);
+  if (sizeOver > 0) noticeParts.push(`サイズ上限超過 ${sizeOver} 件は取得しませんでした`);
+  if (unsafeZip > 0) noticeParts.push(`安全性検査で拒否 ${unsafeZip} 件`);
+  if (downloadFailed > 0) noticeParts.push(`取得失敗 ${downloadFailed} 件`);
+  if (extractFailed > 0) noticeParts.push(`抽出失敗 ${extractFailed} 件`);
+  if (countOverflow > 0) noticeParts.push(`件数上限超過 ${countOverflow} 件はスキップ`);
+  if (totalOverflow > 0) noticeParts.push(`文字数上限超過 ${totalOverflow} 件はスキップ`);
+
+  return {
+    items,
+    notice: noticeParts.length > 0 ? noticeParts.join(' / ') : null,
+    truncated,
+  };
+}
+
+function extractOfficeAttachmentText(
+  ctype: string,
+  data: Uint8Array,
+  charLimit: number,
+): { text: string; truncated: boolean } {
+  if (
+    ctype ===
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ) {
+    return extractDocxText(data, charLimit);
+  }
+  if (
+    ctype ===
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ) {
+    return extractXlsxText(data, charLimit);
+  }
+  if (
+    ctype ===
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  ) {
+    return extractPptxText(data, charLimit);
+  }
+  throw new Error(`unsupported_office_attachment:${ctype}`);
+}
+
+function attachmentMessageId(msg: AgentMailMessage): string {
+  return firstNonEmptyString(msg.id, msg.message_id, msg.rfc822_message_id);
+}
+
+function attachmentIdValue(attachment: AgentMailAttachment): string {
+  return firstNonEmptyString(
+    attachment.attachment_id,
+    attachment.id,
+    attachment.attachmentId,
+  );
+}
+
+function attachmentName(attachment: AgentMailAttachment): string {
+  return firstNonEmptyString(
+    attachment.filename,
+    attachment.name,
+    attachment.file_name,
+  );
+}
+
+function attachmentContentType(attachment: AgentMailAttachment): string {
+  return firstNonEmptyString(
+    attachment.content_type,
+    attachment.mime_type,
+    attachment.contentType,
+  );
 }
 
 function matchesSearch(

@@ -84,6 +84,11 @@ export function extractCfRepoCommit(message = '') {
   return message.match(/(?:^|\s)cf-repo=([0-9a-f]{7,40})(?:\s|$)/i)?.[1] ?? '';
 }
 
+function extractDeployMarker(message = '', key) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return message.match(new RegExp(`(?:^|\\s)${escaped}=([^\\s]+)(?:\\s|$)`, 'i'))?.[1] ?? '';
+}
+
 function annotationMessage(item) {
   return (
     item?.annotations?.['workers/message'] ??
@@ -251,23 +256,27 @@ export function findEffectiveServingCommit(deployments, versions = []) {
   const latest = ordered[0];
   const latestCommit = extractCfRepoCommit(deploymentMessage(latest, versionsById));
   if (latestCommit) {
+    const message = deploymentMessage(latest, versionsById);
     return {
       ok: true,
       latestHadCfRepo: true,
       source: 'latest_deployment',
       commit: latestCommit,
+      message,
       latestDeploymentId: latest?.id ?? '',
       codeDeploymentId: latest?.id ?? '',
     };
   }
   for (const deployment of ordered.slice(1)) {
-    const commit = extractCfRepoCommit(deploymentMessage(deployment, versionsById));
+    const message = deploymentMessage(deployment, versionsById);
+    const commit = extractCfRepoCommit(message);
     if (commit) {
       return {
         ok: true,
         latestHadCfRepo: false,
         source: 'previous_code_deployment',
         commit,
+        message,
         latestDeploymentId: latest?.id ?? '',
         codeDeploymentId: deployment?.id ?? '',
       };
@@ -412,6 +421,41 @@ function commitIsAncestor(root, commit, descendant = 'HEAD') {
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+function readGeneratedSpecHash(root, relPath, exportName) {
+  const absPath = path.join(root, relPath);
+  if (!existsSync(absPath)) return '';
+  return readText(absPath).match(new RegExp(`export const ${exportName} = "([0-9a-f]{12})"`))?.[1] ?? '';
+}
+
+function currentPromptBundlePreservesDeployment(root, message = '', servingError = '') {
+  if (!servingError.includes('commit not found locally')) {
+    return { ok: false, reason: '' };
+  }
+  const makotoPrimeCommit = extractDeployMarker(message, 'makoto-prime');
+  const personaHash = extractDeployMarker(message, 'persona');
+  const toolsHashValue = extractDeployMarker(message, 'tools');
+  if (!makotoPrimeCommit || !personaHash || !toolsHashValue) {
+    return { ok: false, reason: '' };
+  }
+  const localPersonaHash = readGeneratedSpecHash(
+    root,
+    'src/data/persona-spec.ts',
+    'PERSONA_SPEC_SHA256_HEX12',
+  );
+  const localToolsHash = readGeneratedSpecHash(
+    root,
+    'src/data/tools-spec.ts',
+    'TOOLS_SPEC_SHA256_HEX12',
+  );
+  const ok = localPersonaHash === personaHash && localToolsHash === toolsHashValue;
+  return {
+    ok,
+    reason: ok
+      ? `serving cf-repo marker is a makoto-prime prompt deployment (${shortCommit(makotoPrimeCommit)}); local prompt bundle matches persona=${personaHash} tools=${toolsHashValue}`
+      : `serving prompt bundle mismatch: local persona=${localPersonaHash || 'missing'} tools=${localToolsHash || 'missing'} vs serving persona=${personaHash} tools=${toolsHashValue}`,
+  };
 }
 
 function revParseCommit(root, commit) {
@@ -705,12 +749,24 @@ export function collectServingLineage(root, target, options = {}) {
 
   let servingContained = false;
   let servingError = '';
+  let servingPromptBundlePreserved = false;
+  let servingPromptBundleReason = '';
   if (effective.commit) {
     const check = commitIsAncestor(root, effective.commit);
     servingContained = check.ok;
     servingError = check.error;
     if (!check.ok) {
-      failures.push(`HEAD does not contain current serving cf-repo (${shortCommit(effective.commit)})`);
+      const promptPreserve = currentPromptBundlePreservesDeployment(
+        root,
+        effective.message,
+        check.error,
+      );
+      servingPromptBundlePreserved = promptPreserve.ok;
+      servingPromptBundleReason = promptPreserve.reason;
+      if (!promptPreserve.ok) {
+        failures.push(`HEAD does not contain current serving cf-repo (${shortCommit(effective.commit)})`);
+        if (promptPreserve.reason) failures.push(promptPreserve.reason);
+      }
     }
   }
 
@@ -733,6 +789,8 @@ export function collectServingLineage(root, target, options = {}) {
     effective,
     servingContained,
     servingError,
+    servingPromptBundlePreserved,
+    servingPromptBundleReason,
     mustPreserveChecks,
     failures,
   };
@@ -891,6 +949,9 @@ export function renderReport(result) {
     }
     if (lineage.servingContained) {
       lines.push('[deploy-guard] OK HEAD contains current serving cf-repo');
+    }
+    if (lineage.servingPromptBundlePreserved) {
+      lines.push(`[deploy-guard] OK current serving prompt bundle preserved: ${lineage.servingPromptBundleReason}`);
     }
     for (const check of lineage.mustPreserveChecks ?? []) {
       const detail = [check.issue, check.reason].filter(Boolean).join(' ');
