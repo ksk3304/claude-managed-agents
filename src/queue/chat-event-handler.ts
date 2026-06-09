@@ -924,8 +924,24 @@ export async function handleChatEvent(
       `[chat-event] mail confirmation approval detected eventKey=${eventKey}`,
     );
   }
+  const agentMailAttachmentReadHint = buildAgentMailAttachmentReadHint(bodyText, historyBlock);
+  if (agentMailAttachmentReadHint) {
+    bodyText = `${agentMailAttachmentReadHint}\n\n${bodyText}`;
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'agentmail_attachment_read_hint_injected',
+      source: 'chat-event-handler',
+      detail: {
+        force_fresh_session: true,
+        hint_chars: agentMailAttachmentReadHint.length,
+      },
+    });
+  }
   const forceFreshSession =
-    intent?.isActionSkill === true && intent.command !== '/mail';
+    Boolean(agentMailAttachmentReadHint) ||
+    (intent?.isActionSkill === true && intent.command !== '/mail');
   if (intent !== null) {
     if (intent.source === 'mail_intent') {
       console.log(
@@ -3289,6 +3305,43 @@ export function buildIntentPrefix(intent: ActionSkillIntent | null): string {
   if (intent.source === 'mail_intent') return `[intent: mail (implicit)]`;
   if (intent.source === 'schedule_intent') return `[intent: schedule (implicit)]`;
   return '';
+}
+
+function buildAgentMailAttachmentReadHint(
+  bodyText: string,
+  historyBlock?: string,
+): string {
+  if (!isAgentMailAttachmentReadTurn(bodyText, historyBlock)) return '';
+  return [
+    '<agentmail_attachment_read_instructions>',
+    'このターンは AgentMail 受信メールの添付ファイル本文確認依頼として扱う。',
+    '過去履歴に「添付を読めない」「sandboxに無い」とあっても古い結果の可能性があるため、現在の tool 能力で再確認する。',
+    'sandbox filesystem、/mnt/session/uploads、env、bash、curl、Python で AgentMail を探さない。',
+    '`agentmail_read` custom tool で対象メールを search し、get では `include_attachment_text:true` と `max_attachment_chars:60000` を指定する。',
+    '返り値の `message.attachment_text.items[].text` を根拠に、添付本文を読んだ上で要約・確認事項・返信草案を作る。',
+    '本当に `attachment_text` が無い、または notice が取得不能を示す場合だけ、確認した tool 結果を根拠に読めないと伝える。',
+    '</agentmail_attachment_read_instructions>',
+  ].join('\n');
+}
+
+function isAgentMailAttachmentReadTurn(
+  bodyText: string,
+  historyBlock?: string,
+): boolean {
+  const body = normalizeLoose(bodyText);
+  const history = normalizeLoose(historyBlock ?? '');
+  const combined = `${body}\n${history}`;
+  const asksAttachmentRead =
+    /(添付|word|excel|docx|xlsx|ファイル).{0,24}(読|読み|確認|見|中身|内容|返信|対応)/iu.test(body) ||
+    /(読|読み|確認|見|中身|内容|返信|対応).{0,24}(添付|word|excel|docx|xlsx|ファイル)/iu.test(body);
+  if (!asksAttachmentRead) return false;
+  return /agentmail|新規問い合わせ|cold inbound|メール|件名|本文 preview|agentmail-attachment|docx|xlsx/iu.test(
+    combined,
+  );
+}
+
+function normalizeLoose(value: string): string {
+  return (value || '').normalize('NFKC').toLowerCase();
 }
 
 interface AutonomousLongReplyDelivery {

@@ -1270,6 +1270,60 @@ describe('handleChatEvent', () => {
     }
   });
 
+  it('AgentMail attachment read request bypasses stale thread session and injects read hint', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      spaceType: 'DM',
+      spaceName: 'spaces/AAA',
+      threadName: 'spaces/AAA/threads/TAGENTMAILATT',
+      text: '添付メールのWordとExcelを読み取って',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const threadKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TAGENTMAILATT',
+    );
+    expect(threadKey).not.toBeNull();
+    await env.MAKOTO_KV.put(threadKey!, 'sesn_stale_attachment_failure');
+
+    const created: unknown[] = [];
+    const sends: string[] = [];
+    const payloads: unknown[] = [];
+    installFakeAnthropic({
+      sessionId: 'sesn_fresh_attachment_read',
+      createCapture: created,
+      sendCaptureSessionIds: sends,
+      sendCapturePayloads: payloads,
+      events: [
+        { type: 'agent.message.text', text: 'agentmail_readで再確認します。' },
+        { type: 'session.status_idle' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(created).toHaveLength(1);
+    expect(sends).toEqual(['sesn_fresh_attachment_read']);
+    expect(await env.MAKOTO_KV.get(threadKey!)).toBe('sesn_stale_attachment_failure');
+    const payloadText = JSON.stringify(payloads[0]);
+    expect(payloadText).toContain('<agentmail_attachment_read_instructions>');
+    expect(payloadText).toContain('include_attachment_text:true');
+    expect(payloadText).toContain('sandbox filesystem');
+    const sessionEvent = runtimeEvents(env).find(
+      (row) => row.event_type === 'cma_session_created',
+    );
+    const detail = JSON.parse(String(sessionEvent?.detail_json));
+    expect(detail.force_fresh_session).toBe(true);
+    expect(
+      runtimeEvents(env).some(
+        (row) => row.event_type === 'agentmail_attachment_read_hint_injected',
+      ),
+    ).toBe(true);
+  });
+
   it('DM thread history is fetched and included like shared space history', async () => {
     const env = buildEnv({
       envOverrides: {
