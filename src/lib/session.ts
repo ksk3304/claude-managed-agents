@@ -894,7 +894,8 @@ export async function sendAndStreamWithToolDispatch(
   if (
     !timedOut &&
     (stopReason === 'requires_action' ||
-      (sentCustomToolResult && !hasFinalStopReason && assistantText.trim().length === 0))
+      (sentCustomToolResult && !hasFinalStopReason && assistantText.trim().length === 0) ||
+      (!terminalEventType && !stopReason && assistantText.trim().length === 0))
   ) {
     const resumed = await resumeTurnFromSessionEvents(client, {
       sessionId: input.sessionId,
