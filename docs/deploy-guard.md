@@ -76,12 +76,21 @@ Production deploy is blocked when:
 
 ## Operating Invariants
 
-- Use one branch and one worktree per Issue.
-- Parallel Issue work is fine until PR merge.
+- Use one worktree per Issue.
+- Use one branch per Issue.
+- Merge through PR into `main` / `master`.
+- Deploy normally from `main` / `master`.
 - Before deploy, read back the current serving `cf-repo` commit from Cloudflare metadata.
-- The deploy source commit must contain that current serving commit as an ancestor.
-- If it does not, do not deploy, even with a manifest and approval log.
-- Normal production deploys happen from `main` / `master` after PR merge.
+- The deploy source commit must be at or after the current serving commit.
+- The deploy source commit must include production fixes already deployed by other Issues.
+- If those checks fail, do not deploy, even with a manifest and approval log.
+
+## Why This Was Missing Before
+
+- The previous guard treated freshness against `origin/main` as too close to a complete safety proof.
+- It did not make the live serving commit the first production deploy invariant, even though emergency hotfixes, parallel deploys, and secret-triggered Worker versions can make production differ from local assumptions.
+- Issue approval and production lineage were checked as separate facts, so "does this deploy source include other Issues already served in production?" was not explicit enough.
+- Git worktrees and branches isolate local development only. They do not isolate the single production Worker target that `wrangler deploy` overwrites.
 
 In GitHub Actions detached checkout, `GITHUB_REF_NAME` is treated as the
 effective deploy branch.
