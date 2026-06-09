@@ -74,6 +74,15 @@ Production deploy is blocked when:
 - a manifest `must_preserve_commits` entry is not contained in `HEAD`
 - active Chat turn-processing leases are present or D1 readback cannot be verified
 
+## Operating Invariants
+
+- Use one branch and one worktree per Issue.
+- Parallel Issue work is fine until PR merge.
+- Before deploy, read back the current serving `cf-repo` commit from Cloudflare metadata.
+- The deploy source commit must contain that current serving commit as an ancestor.
+- If it does not, do not deploy, even with a manifest and approval log.
+- Normal production deploys happen from `main` / `master` after PR merge.
+
 In GitHub Actions detached checkout, `GITHUB_REF_NAME` is treated as the
 effective deploy branch.
 
