@@ -337,6 +337,7 @@ function toolNameFromSessionEvent(ev: Record<string, unknown>): string | undefin
 }
 
 function userMessageContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const block of content) {
