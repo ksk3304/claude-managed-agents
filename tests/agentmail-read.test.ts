@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { strToU8, zipSync } from 'fflate';
 import { agentmailRead } from '../src/tools/agentmail-read';
 import { makeFetchMock } from './makoto-helpers';
 
@@ -15,6 +16,30 @@ function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' },
+  });
+}
+
+function makeDocx(text: string): Uint8Array {
+  return zipSync({
+    'word/document.xml': strToU8(
+      '<?xml version="1.0"?><w:document xmlns:w="x"><w:body>' +
+        `<w:p><w:r><w:t>${text}</w:t></w:r></w:p>` +
+        '</w:body></w:document>',
+    ),
+  });
+}
+
+function makeXlsx(values: string[]): Uint8Array {
+  const sharedStrings = values
+    .map((value) => `<si><t>${value}</t></si>`)
+    .join('');
+  const cells = values
+    .map((_, idx) => `<c r="A${idx + 1}" t="s"><v>${idx}</v></c>`)
+    .join('');
+  return zipSync({
+    'xl/sharedStrings.xml': strToU8(`<sst>${sharedStrings}</sst>`),
+    'xl/workbook.xml': strToU8('<workbook><sheets><sheet name="添付読取テスト"/></sheets></workbook>'),
+    'xl/worksheets/sheet1.xml': strToU8(`<worksheet><sheetData><row>${cells}</row></sheetData></worksheet>`),
   });
 }
 
@@ -141,6 +166,81 @@ describe('agentmailRead get', () => {
     expect(message.attachments).toEqual([
       { filename: 'a.pdf', content_type: 'application/pdf', size: 12 },
     ]);
+  });
+
+  it('fetches and extracts Office attachment text by default on get', async () => {
+    const docx = makeDocx('合言葉: ねこざめ-322-docx DOCX添付読取成功');
+    const xlsx = makeXlsx(['合言葉', 'くじら雲-322-xlsx', 'XLSX添付読取成功']);
+    const urls: string[] = [];
+    const fetcher = makeFetchMock(async (url, init) => {
+      expect(init.method).toBe('GET');
+      urls.push(url);
+      if (url.endsWith('/messages/msg_1')) {
+        return jsonResponse(200, {
+          id: 'msg_1',
+          from: 'alice@example.com',
+          subject: '添付確認',
+          extracted_text: '本文には合言葉を書かない',
+          attachments: [
+            {
+              attachment_id: 'att_docx',
+              filename: 'agentmail-attachment-test-doc.docx',
+              content_type:
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              size: docx.byteLength,
+            },
+            {
+              attachment_id: 'att_xlsx',
+              filename: 'agentmail-attachment-test-excel.xlsx',
+              content_type:
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              size: xlsx.byteLength,
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/messages/msg_1/attachments/att_docx')) {
+        return new Response(docx, {
+          status: 200,
+          headers: {
+            'content-type':
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          },
+        });
+      }
+      if (url.endsWith('/messages/msg_1/attachments/att_xlsx')) {
+        return new Response(xlsx, {
+          status: 200,
+          headers: {
+            'content-type':
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          },
+        });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+
+    const res = await agentmailRead(
+      { action: 'get', message_id: 'msg_1' },
+      { ...DEPS, fetcher },
+    );
+
+    expect(urls).toEqual([
+      'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1',
+      'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1/attachments/att_docx',
+      'https://api.agentmail.to/v0/inboxes/inbox_main/messages/msg_1/attachments/att_xlsx',
+    ]);
+    const message = res.message as Record<string, unknown>;
+    const attachmentText = message.attachment_text as {
+      items: Array<Record<string, unknown>>;
+      notice: string | null;
+    };
+    expect(attachmentText.notice).toBeNull();
+    const merged = attachmentText.items.map((item) => String(item.text ?? '')).join('\n');
+    expect(merged).toContain('ねこざめ-322-docx');
+    expect(merged).toContain('DOCX添付読取成功');
+    expect(merged).toContain('くじら雲-322-xlsx');
+    expect(merged).toContain('XLSX添付読取成功');
   });
 
   it('retries RFC822 message_id with brackets when the first get 404s', async () => {
