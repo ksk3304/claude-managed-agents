@@ -6,6 +6,13 @@
  * redacted message data back to the session.
  */
 
+import { unzipSync } from 'fflate';
+import {
+  type FileEntry,
+  Uint8ArrayReader,
+  Uint8ArrayWriter,
+  ZipReader,
+} from '@zip.js/zip.js';
 import { AgentMailClient, AgentMailError } from '../lib/agentmail-api';
 import {
   extractDocxText,
@@ -39,6 +46,11 @@ type AgentMailAttachment = Record<string, unknown> & {
   size?: number;
 };
 
+type AttachmentTextItem = Record<string, unknown> & {
+  text: string;
+  truncated: boolean;
+};
+
 const TOOL_NAME = 'agentmail_read';
 const SEARCH_LIMIT_MAX = 20;
 const GET_MAX_CHARS_DEFAULT = 4000;
@@ -46,6 +58,13 @@ const GET_MAX_CHARS_MAX = 12000;
 const ATTACHMENT_TEXT_MAX_CHARS_DEFAULT = 60000;
 const ATTACHMENT_TEXT_MAX_CHARS_MAX = 120000;
 const ATTACHMENT_TEXT_COUNT_MAX = 10;
+const SUPPORTED_ZIP_MIME = new Set([
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/octet-stream',
+]);
+const ZIP_INNER_OFFICE_COUNT_MAX = 10;
+const ZIP_PASSWORD_CANDIDATE_MAX = 5;
 
 const KNOWN_KEYS = new Set([
   'action',
@@ -295,7 +314,10 @@ async function formatMessageForGet(
   const redacted = redactSecrets(rawBody);
   const clipped = redacted.length > maxChars;
   const attachmentText = attachmentOptions
-    ? await extractReadableAttachmentText(msg, attachmentOptions)
+    ? await extractReadableAttachmentText(msg, {
+        ...attachmentOptions,
+        passwordCandidates: extractZipPasswordCandidates(rawBody),
+      })
     : null;
   return {
     action: 'get',
@@ -352,6 +374,7 @@ async function extractReadableAttachmentText(
     client: AgentMailClient;
     inboxId: string;
     maxAttachmentChars: number;
+    passwordCandidates?: string[];
   },
 ): Promise<{
   items: Array<Record<string, unknown>>;
@@ -369,6 +392,8 @@ async function extractReadableAttachmentText(
   let missingId = 0;
   let sizeOver = 0;
   let unsafeZip = 0;
+  let encryptedZip = 0;
+  let zipNoReadableOffice = 0;
   let downloadFailed = 0;
   let extractFailed = 0;
   let countOverflow = 0;
@@ -390,7 +415,8 @@ async function extractReadableAttachmentText(
       legacy += 1;
       continue;
     }
-    if (!SUPPORTED_OFFICE_MIME.includes(ctype)) {
+    const isZipAttachment = isZipAttachmentCandidate(ctype, filename);
+    if (!SUPPORTED_OFFICE_MIME.includes(ctype) && !isZipAttachment) {
       unsupported += 1;
       continue;
     }
@@ -434,33 +460,44 @@ async function extractReadableAttachmentText(
       continue;
     }
 
-    const zipCheck = isOfficeZipSafe(data);
-    if (!zipCheck.safe) {
-      unsafeZip += 1;
+    if (isZipAttachment && !SUPPORTED_OFFICE_MIME.includes(ctype)) {
+      const zipRead = await extractOfficeTextFromZipAttachment(data, {
+        attachmentId,
+        filename,
+        charBudget: remainingBudget,
+        remainingItemSlots: ATTACHMENT_TEXT_COUNT_MAX - items.length,
+        passwordCandidates: options.passwordCandidates ?? [],
+      });
+      unsafeZip += zipRead.unsafeZip;
+      encryptedZip += zipRead.encryptedZip;
+      extractFailed += zipRead.extractFailed;
+      countOverflow += zipRead.countOverflow;
+      if (zipRead.noReadableOffice) zipNoReadableOffice += 1;
+      for (const item of zipRead.items) {
+        const text = item.text.length > remainingBudget
+          ? item.text.slice(0, remainingBudget)
+          : item.text;
+        const itemTruncated = item.truncated || item.text.length > remainingBudget;
+        if (itemTruncated) truncated = true;
+        totalChars += text.length;
+        items.push({ ...item, text, truncated: itemTruncated });
+      }
       continue;
     }
 
-    let extracted: { text: string; truncated: boolean };
-    try {
-      extracted = extractOfficeAttachmentText(ctype, data, remainingBudget);
-    } catch {
-      extractFailed += 1;
-      continue;
-    }
-    const redacted = redactSecrets(extracted.text);
-    const itemTruncated = extracted.truncated || redacted.length > remainingBudget;
-    const text = redacted.length > remainingBudget
-      ? redacted.slice(0, remainingBudget)
-      : redacted;
-    if (itemTruncated) truncated = true;
-    totalChars += text.length;
-    items.push({
-      id: attachmentId,
+    const officeItem = extractSingleOfficeAttachment({
+      attachmentId,
       filename,
-      content_type: ctype,
-      text,
-      truncated: itemTruncated,
+      ctype,
+      data,
+      charBudget: remainingBudget,
     });
+    unsafeZip += officeItem.unsafeZip;
+    extractFailed += officeItem.extractFailed;
+    if (!officeItem.item) continue;
+    if (officeItem.item.truncated) truncated = true;
+    totalChars += String(officeItem.item.text ?? '').length;
+    items.push(officeItem.item);
   }
 
   if (legacy > 0) noticeParts.push(`旧Office形式 ${legacy} 件は未対応です`);
@@ -468,6 +505,8 @@ async function extractReadableAttachmentText(
   if (missingId > 0) noticeParts.push(`添付IDなし ${missingId} 件は取得できませんでした`);
   if (sizeOver > 0) noticeParts.push(`サイズ上限超過 ${sizeOver} 件は取得しませんでした`);
   if (unsafeZip > 0) noticeParts.push(`安全性検査で拒否 ${unsafeZip} 件`);
+  if (encryptedZip > 0) noticeParts.push(`パスワード付きまたは暗号化ZIP ${encryptedZip} 件は未対応です`);
+  if (zipNoReadableOffice > 0) noticeParts.push(`ZIP内に読取対象Officeなし ${zipNoReadableOffice} 件`);
   if (downloadFailed > 0) noticeParts.push(`取得失敗 ${downloadFailed} 件`);
   if (extractFailed > 0) noticeParts.push(`抽出失敗 ${extractFailed} 件`);
   if (countOverflow > 0) noticeParts.push(`件数上限超過 ${countOverflow} 件はスキップ`);
@@ -477,6 +516,258 @@ async function extractReadableAttachmentText(
     items,
     notice: noticeParts.length > 0 ? noticeParts.join(' / ') : null,
     truncated,
+  };
+}
+
+function extractSingleOfficeAttachment(params: {
+  attachmentId: string;
+  filename: string;
+  ctype: string;
+  data: Uint8Array;
+  charBudget: number;
+}): {
+  item: AttachmentTextItem | null;
+  unsafeZip: number;
+  extractFailed: number;
+} {
+  const zipCheck = isOfficeZipSafe(params.data);
+  if (!zipCheck.safe) {
+    return { item: null, unsafeZip: 1, extractFailed: 0 };
+  }
+
+  let extracted: { text: string; truncated: boolean };
+  try {
+    extracted = extractOfficeAttachmentText(params.ctype, params.data, params.charBudget);
+  } catch {
+    return { item: null, unsafeZip: 0, extractFailed: 1 };
+  }
+  const redacted = redactSecrets(extracted.text);
+  const text = redacted.length > params.charBudget
+    ? redacted.slice(0, params.charBudget)
+    : redacted;
+  return {
+    item: {
+      id: params.attachmentId,
+      filename: params.filename,
+      content_type: params.ctype,
+      text,
+      truncated: extracted.truncated || redacted.length > params.charBudget,
+    },
+    unsafeZip: 0,
+    extractFailed: 0,
+  };
+}
+
+async function extractOfficeTextFromZipAttachment(
+  data: Uint8Array,
+  options: {
+    attachmentId: string;
+    filename: string;
+    charBudget: number;
+    remainingItemSlots: number;
+    passwordCandidates: string[];
+  },
+): Promise<{
+  items: AttachmentTextItem[];
+  unsafeZip: number;
+  encryptedZip: number;
+  extractFailed: number;
+  countOverflow: number;
+  noReadableOffice: boolean;
+}> {
+  const safe = isOfficeZipSafe(data);
+  if (!safe.safe) {
+    return emptyZipRead({ unsafeZip: 1 });
+  }
+  const entries = inspectZipEntries(data);
+  if (entries.encrypted) {
+    if (options.passwordCandidates.length === 0) {
+      return emptyZipRead({ encryptedZip: 1 });
+    }
+    return await extractEncryptedOfficeTextFromZipAttachment(data, options);
+  }
+  const officeNames = entries.names
+    .filter((name) => inferOfficeContentTypeFromFilename(name))
+    .slice(0, ZIP_INNER_OFFICE_COUNT_MAX);
+  if (officeNames.length === 0) {
+    return emptyZipRead({ noReadableOffice: true });
+  }
+  if (options.remainingItemSlots <= 0) {
+    return emptyZipRead({ countOverflow: officeNames.length });
+  }
+
+  let unzipped: Record<string, Uint8Array>;
+  try {
+    const wanted = new Set(officeNames);
+    unzipped = unzipSync(data, { filter: (file) => wanted.has(file.name) });
+  } catch {
+    return emptyZipRead({ extractFailed: 1 });
+  }
+
+  const items: AttachmentTextItem[] = [];
+  let unsafeZip = 0;
+  let extractFailed = 0;
+  let countOverflow = 0;
+  let budgetUsed = 0;
+  for (const name of officeNames) {
+    if (items.length >= options.remainingItemSlots) {
+      countOverflow += 1;
+      continue;
+    }
+    const ctype = inferOfficeContentTypeFromFilename(name);
+    const inner = unzipped[name];
+    if (!ctype || !inner) continue;
+    const remainingBudget = options.charBudget - budgetUsed;
+    if (remainingBudget <= 0) {
+      countOverflow += 1;
+      continue;
+    }
+    const item = extractSingleOfficeAttachment({
+      attachmentId: `${options.attachmentId}:${name}`,
+      filename: `${options.filename}/${name}`,
+      ctype,
+      data: inner,
+      charBudget: remainingBudget,
+    });
+    unsafeZip += item.unsafeZip;
+    extractFailed += item.extractFailed;
+    if (!item.item) continue;
+    const text = String(item.item.text ?? '');
+    budgetUsed += text.length;
+    items.push(item.item);
+  }
+
+  return {
+    items,
+    unsafeZip,
+    encryptedZip: 0,
+    extractFailed,
+    countOverflow,
+    noReadableOffice: items.length === 0 && unsafeZip === 0 && extractFailed === 0,
+  };
+}
+
+async function extractEncryptedOfficeTextFromZipAttachment(
+  data: Uint8Array,
+  options: {
+    attachmentId: string;
+    filename: string;
+    charBudget: number;
+    remainingItemSlots: number;
+    passwordCandidates: string[];
+  },
+): Promise<{
+  items: AttachmentTextItem[];
+  unsafeZip: number;
+  encryptedZip: number;
+  extractFailed: number;
+  countOverflow: number;
+  noReadableOffice: boolean;
+}> {
+  for (const password of options.passwordCandidates.slice(0, ZIP_PASSWORD_CANDIDATE_MAX)) {
+    const result = await tryExtractEncryptedZipWithPassword(data, options, password);
+    if (result !== null) return result;
+  }
+  return emptyZipRead({ encryptedZip: 1 });
+}
+
+async function tryExtractEncryptedZipWithPassword(
+  data: Uint8Array,
+  options: {
+    attachmentId: string;
+    filename: string;
+    charBudget: number;
+    remainingItemSlots: number;
+  },
+  password: string,
+): Promise<{
+  items: AttachmentTextItem[];
+  unsafeZip: number;
+  encryptedZip: number;
+  extractFailed: number;
+  countOverflow: number;
+  noReadableOffice: boolean;
+} | null> {
+  const reader = new ZipReader(new Uint8ArrayReader(data), { useWebWorkers: false });
+  try {
+    const entries = await reader.getEntries();
+    const officeEntries = entries
+      .filter((entry): entry is FileEntry =>
+        !entry.directory && Boolean(inferOfficeContentTypeFromFilename(entry.filename)),
+      )
+      .slice(0, ZIP_INNER_OFFICE_COUNT_MAX);
+    if (officeEntries.length === 0) return emptyZipRead({ noReadableOffice: true });
+    if (options.remainingItemSlots <= 0) {
+      return emptyZipRead({ countOverflow: officeEntries.length });
+    }
+    const items: AttachmentTextItem[] = [];
+    let unsafeZip = 0;
+    let extractFailed = 0;
+    let countOverflow = 0;
+    let budgetUsed = 0;
+    for (const entry of officeEntries) {
+      if (items.length >= options.remainingItemSlots) {
+        countOverflow += 1;
+        continue;
+      }
+      const remainingBudget = options.charBudget - budgetUsed;
+      if (remainingBudget <= 0) {
+        countOverflow += 1;
+        continue;
+      }
+      const ctype = inferOfficeContentTypeFromFilename(entry.filename);
+      if (!ctype) continue;
+      let inner: Uint8Array;
+      try {
+        inner = await entry.getData(new Uint8ArrayWriter(), {
+          password,
+          useWebWorkers: false,
+        });
+      } catch {
+        return null;
+      }
+      const item = extractSingleOfficeAttachment({
+        attachmentId: `${options.attachmentId}:${entry.filename}`,
+        filename: `${options.filename}/${entry.filename}`,
+        ctype,
+        data: inner,
+        charBudget: remainingBudget,
+      });
+      unsafeZip += item.unsafeZip;
+      extractFailed += item.extractFailed;
+      if (!item.item) continue;
+      budgetUsed += item.item.text.length;
+      items.push(item.item);
+    }
+    return {
+      items,
+      unsafeZip,
+      encryptedZip: 0,
+      extractFailed,
+      countOverflow,
+      noReadableOffice: items.length === 0 && unsafeZip === 0 && extractFailed === 0,
+    };
+  } finally {
+    await reader.close();
+  }
+}
+
+function emptyZipRead(overrides: Partial<{
+  items: AttachmentTextItem[];
+  unsafeZip: number;
+  encryptedZip: number;
+  extractFailed: number;
+  countOverflow: number;
+  noReadableOffice: boolean;
+}>) {
+  return {
+    items: [],
+    unsafeZip: 0,
+    encryptedZip: 0,
+    extractFailed: 0,
+    countOverflow: 0,
+    noReadableOffice: false,
+    ...overrides,
   };
 }
 
@@ -504,6 +795,89 @@ function extractOfficeAttachmentText(
     return extractPptxText(data, charLimit);
   }
   throw new Error(`unsupported_office_attachment:${ctype}`);
+}
+
+function isZipAttachmentCandidate(ctype: string, filename: string): boolean {
+  const lowerName = filename.toLowerCase();
+  return lowerName.endsWith('.zip') || SUPPORTED_ZIP_MIME.has(ctype);
+}
+
+function inferOfficeContentTypeFromFilename(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.docx')) {
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  }
+  if (lower.endsWith('.xlsx')) {
+    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  }
+  if (lower.endsWith('.pptx')) {
+    return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  }
+  return '';
+}
+
+function inspectZipEntries(data: Uint8Array): { encrypted: boolean; names: string[] } {
+  const eocdOffset = findEocdOffset(data);
+  if (eocdOffset < 0) return { encrypted: false, names: [] };
+  const totalEntries = readUint16Le(data, eocdOffset + 10);
+  let p = readUint32Le(data, eocdOffset + 16);
+  const names: string[] = [];
+  let encrypted = false;
+  const decoder = new TextDecoder();
+  for (let i = 0; i < totalEntries; i += 1) {
+    if (p + 46 > data.length) break;
+    if (
+      !(
+        data[p] === 0x50 &&
+        data[p + 1] === 0x4b &&
+        data[p + 2] === 0x01 &&
+        data[p + 3] === 0x02
+      )
+    ) {
+      break;
+    }
+    const flags = readUint16Le(data, p + 8);
+    if ((flags & 0x01) !== 0) encrypted = true;
+    const fileNameLen = readUint16Le(data, p + 28);
+    const extraLen = readUint16Le(data, p + 30);
+    const commentLen = readUint16Le(data, p + 32);
+    const nameStart = p + 46;
+    const nameEnd = nameStart + fileNameLen;
+    if (nameEnd > data.length) break;
+    names.push(decoder.decode(data.subarray(nameStart, nameEnd)));
+    p = nameEnd + extraLen + commentLen;
+  }
+  return { encrypted, names };
+}
+
+function findEocdOffset(data: Uint8Array): number {
+  const maxScan = Math.min(data.length, 65535 + 22);
+  for (let i = data.length - 22; i >= data.length - maxScan; i -= 1) {
+    if (i < 0) break;
+    if (
+      data[i] === 0x50 &&
+      data[i + 1] === 0x4b &&
+      data[i + 2] === 0x05 &&
+      data[i + 3] === 0x06
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function readUint16Le(data: Uint8Array, offset: number): number {
+  return data[offset]! | (data[offset + 1]! << 8);
+}
+
+function readUint32Le(data: Uint8Array, offset: number): number {
+  return (
+    (data[offset]! |
+      (data[offset + 1]! << 8) |
+      (data[offset + 2]! << 16) |
+      (data[offset + 3]! * 0x1000000)) >>>
+    0
+  );
 }
 
 function attachmentMessageId(msg: AgentMailMessage): string {
@@ -611,9 +985,33 @@ function arrayField(value: unknown): string[] {
   return value.filter((v): v is string => typeof v === 'string');
 }
 
+function extractZipPasswordCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  const patterns = [
+    /(?:パスワード|暗号|解凍(?:用)?PW|PW|password|passwd|pass)\s*(?:は|:|：|=)?\s*([^\s"'`<>、。,\n\r]+)/gi,
+    /([A-Za-z0-9._!#$%&()*+\-/:;=?@[\\\]^_{|}~]{4,64})\s*(?:です|でお願いします|になります)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const candidate = sanitizePasswordCandidate(match[1] ?? '');
+      if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+      if (candidates.length >= ZIP_PASSWORD_CANDIDATE_MAX) return candidates;
+    }
+  }
+  return candidates;
+}
+
+function sanitizePasswordCandidate(value: string): string {
+  return value
+    .trim()
+    .replace(/^[「『【\[(]+/, '')
+    .replace(/[」』】\]).。、,;:：]+$/, '');
+}
+
 function redactSecrets(text: string): string {
   return text
     .replace(/(sk-[A-Za-z0-9_-]{12,})/g, '[REDACTED_SECRET]')
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[REDACTED_SECRET]')
-    .replace(/((?:password|passwd|api[_ -]?key|secret|token)\s*[:=]\s*)[^\s]+/gi, '$1[REDACTED_SECRET]');
+    .replace(/((?:password|passwd|api[_ -]?key|secret|token)\s*[:=]\s*)[^\s]+/gi, '$1[REDACTED_SECRET]')
+    .replace(/((?:パスワード|暗号|解凍(?:用)?PW|PW)\s*(?:は|:|：|=)\s*)[^\s、。,\n\r]+/gi, '$1[REDACTED_SECRET]');
 }
