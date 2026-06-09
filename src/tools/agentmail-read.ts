@@ -63,6 +63,12 @@ const SUPPORTED_ZIP_MIME = new Set([
   'application/x-zip-compressed',
   'application/octet-stream',
 ]);
+const SUPPORTED_TEXT_MIME = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+]);
 const ZIP_INNER_OFFICE_COUNT_MAX = 10;
 const ZIP_PASSWORD_CANDIDATE_MAX = 5;
 
@@ -81,6 +87,7 @@ const KNOWN_KEYS = new Set([
   'max_chars',
   'include_attachment_text',
   'max_attachment_chars',
+  'zip_passwords',
   'include_spam',
   'include_blocked',
   'include_unauthenticated',
@@ -233,6 +240,7 @@ async function getMessage(
     ATTACHMENT_TEXT_MAX_CHARS_MAX,
     ATTACHMENT_TEXT_MAX_CHARS_DEFAULT,
   );
+  const explicitZipPasswords = optionalStringArray(input.zip_passwords, 'zip_passwords');
   let msg: AgentMailMessage;
   if (messageId) {
     try {
@@ -246,7 +254,9 @@ async function getMessage(
             return await formatMessageForGet(
               msg,
               maxChars,
-              includeAttachmentText ? { client, inboxId, maxAttachmentChars } : null,
+              includeAttachmentText
+                ? { client, inboxId, maxAttachmentChars, explicitZipPasswords }
+                : null,
             );
           } catch (retryErr) {
             if (
@@ -275,7 +285,7 @@ async function getMessage(
   return await formatMessageForGet(
     msg,
     maxChars,
-    includeAttachmentText ? { client, inboxId, maxAttachmentChars } : null,
+    includeAttachmentText ? { client, inboxId, maxAttachmentChars, explicitZipPasswords } : null,
   );
 }
 
@@ -308,6 +318,7 @@ async function formatMessageForGet(
     client: AgentMailClient;
     inboxId: string;
     maxAttachmentChars: number;
+    explicitZipPasswords?: string[];
   } | null = null,
 ): Promise<Record<string, unknown>> {
   const rawBody = extractBody(msg);
@@ -316,7 +327,11 @@ async function formatMessageForGet(
   const attachmentText = attachmentOptions
     ? await extractReadableAttachmentText(msg, {
         ...attachmentOptions,
-        passwordCandidates: extractZipPasswordCandidates(rawBody),
+        passwordCandidates: collectZipPasswordCandidates(
+          rawBody,
+          msg,
+          attachmentOptions.explicitZipPasswords ?? [],
+        ),
       })
     : null;
   return {
@@ -398,6 +413,7 @@ async function extractReadableAttachmentText(
   let extractFailed = 0;
   let countOverflow = 0;
   let totalOverflow = 0;
+  const passwordCandidates = [...(options.passwordCandidates ?? [])];
 
   if (!messageId && attachments.length > 0) {
     return {
@@ -416,7 +432,8 @@ async function extractReadableAttachmentText(
       continue;
     }
     const isZipAttachment = isZipAttachmentCandidate(ctype, filename);
-    if (!SUPPORTED_OFFICE_MIME.includes(ctype) && !isZipAttachment) {
+    const isTextAttachment = isTextAttachmentCandidate(ctype, filename);
+    if (!SUPPORTED_OFFICE_MIME.includes(ctype) && !isZipAttachment && !isTextAttachment) {
       unsupported += 1;
       continue;
     }
@@ -460,13 +477,33 @@ async function extractReadableAttachmentText(
       continue;
     }
 
+    if (isTextAttachment) {
+      const decoded = new TextDecoder().decode(data);
+      appendPasswordCandidates(passwordCandidates, extractZipPasswordCandidates(decoded));
+      const redacted = redactSecrets(decoded);
+      const text = redacted.length > remainingBudget
+        ? redacted.slice(0, remainingBudget)
+        : redacted;
+      const itemTruncated = redacted.length > remainingBudget;
+      if (itemTruncated) truncated = true;
+      totalChars += text.length;
+      items.push({
+        id: attachmentId,
+        filename,
+        content_type: ctype || 'text/plain',
+        text,
+        truncated: itemTruncated,
+      });
+      continue;
+    }
+
     if (isZipAttachment && !SUPPORTED_OFFICE_MIME.includes(ctype)) {
       const zipRead = await extractOfficeTextFromZipAttachment(data, {
         attachmentId,
         filename,
         charBudget: remainingBudget,
         remainingItemSlots: ATTACHMENT_TEXT_COUNT_MAX - items.length,
-        passwordCandidates: options.passwordCandidates ?? [],
+        passwordCandidates,
       });
       unsafeZip += zipRead.unsafeZip;
       encryptedZip += zipRead.encryptedZip;
@@ -501,7 +538,7 @@ async function extractReadableAttachmentText(
   }
 
   if (legacy > 0) noticeParts.push(`旧Office形式 ${legacy} 件は未対応です`);
-  if (unsupported > 0) noticeParts.push(`Office以外または非対応添付 ${unsupported} 件は本文抽出対象外です`);
+  if (unsupported > 0) noticeParts.push(`Office/Text以外または非対応添付 ${unsupported} 件は本文抽出対象外です`);
   if (missingId > 0) noticeParts.push(`添付IDなし ${missingId} 件は取得できませんでした`);
   if (sizeOver > 0) noticeParts.push(`サイズ上限超過 ${sizeOver} 件は取得しませんでした`);
   if (unsafeZip > 0) noticeParts.push(`安全性検査で拒否 ${unsafeZip} 件`);
@@ -802,6 +839,11 @@ function isZipAttachmentCandidate(ctype: string, filename: string): boolean {
   return lowerName.endsWith('.zip') || SUPPORTED_ZIP_MIME.has(ctype);
 }
 
+function isTextAttachmentCandidate(ctype: string, filename: string): boolean {
+  const lowerName = filename.toLowerCase();
+  return lowerName.endsWith('.txt') || lowerName.endsWith('.md') || SUPPORTED_TEXT_MIME.has(ctype);
+}
+
 function inferOfficeContentTypeFromFilename(filename: string): string {
   const lower = filename.toLowerCase();
   if (lower.endsWith('.docx')) {
@@ -985,10 +1027,35 @@ function arrayField(value: unknown): string[] {
   return value.filter((v): v is string => typeof v === 'string');
 }
 
+function collectZipPasswordCandidates(
+  body: string,
+  msg: AgentMailMessage,
+  explicitPasswords: string[],
+): string[] {
+  const candidates: string[] = [];
+  appendPasswordCandidates(candidates, explicitPasswords);
+  appendPasswordCandidates(candidates, extractZipPasswordCandidates(body));
+  for (const att of Array.isArray(msg.attachments) ? msg.attachments : []) {
+    const filename = attachmentName(att);
+    appendPasswordCandidates(candidates, extractZipPasswordCandidatesFromFilename(filename));
+    appendPasswordCandidates(candidates, extractZipPasswordCandidates(filename));
+  }
+  return candidates.slice(0, ZIP_PASSWORD_CANDIDATE_MAX);
+}
+
+function appendPasswordCandidates(candidates: string[], values: string[]): void {
+  for (const value of values) {
+    const candidate = sanitizePasswordCandidate(value);
+    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+    if (candidates.length >= ZIP_PASSWORD_CANDIDATE_MAX) return;
+  }
+}
+
 function extractZipPasswordCandidates(text: string): string[] {
   const candidates: string[] = [];
   const patterns = [
     /(?:パスワード|暗号|解凍(?:用)?PW|PW|password|passwd|pass)\s*(?:は|:|：|=)?\s*([^\s"'`<>、。,\n\r]+)/gi,
+    /(?:password|passwd|pass|pw)[_-]([A-Za-z0-9._!#$%&()*+\-/:;=?@[\\\]^_{|}~]{4,64})(?=[_.-]?(?:zip|docx|xlsx|pptx)?(?:$|[_.-]))/gi,
     /([A-Za-z0-9._!#$%&()*+\-/:;=?@[\\\]^_{|}~]{4,64})\s*(?:です|でお願いします|になります)/g,
   ];
   for (const pattern of patterns) {
@@ -997,6 +1064,18 @@ function extractZipPasswordCandidates(text: string): string[] {
       if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
       if (candidates.length >= ZIP_PASSWORD_CANDIDATE_MAX) return candidates;
     }
+  }
+  return candidates;
+}
+
+function extractZipPasswordCandidatesFromFilename(filename: string): string[] {
+  const stem = filename.replace(/\.[A-Za-z0-9]{1,8}$/u, '');
+  const tokens = stem.split(/[_\-\s]+/u).filter(Boolean);
+  const candidates: string[] = [];
+  for (let i = 0; i < tokens.length - 1; i += 1) {
+    if (!/^(?:password|passwd|pass|pw)$/iu.test(tokens[i] ?? '')) continue;
+    const candidate = sanitizePasswordCandidate(tokens[i + 1] ?? '');
+    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
   }
   return candidates;
 }

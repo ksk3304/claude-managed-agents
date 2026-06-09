@@ -586,6 +586,18 @@ function inputSchemaForTool(name: MakotoToolName): Record<string, unknown> {
           labels: arrayProp('Optional label filters.'),
           limit: numberProp('Optional search cap. 1-20, default 10.'),
           max_chars: numberProp('Optional body character cap for get.'),
+          include_attachment_text: booleanProp(
+            'For get. Include extracted text from supported attachments. Default true.',
+          ),
+          max_attachment_chars: numberProp('Optional attachment text character cap for get.'),
+          zip_passwords: arrayProp(
+            'Optional ZIP password candidates supplied by the user, used only for encrypted ZIP attachments.',
+          ),
+          include_spam: booleanProp('Optional search flag. Default true.'),
+          include_blocked: booleanProp('Optional search flag for blocked messages. Default false.'),
+          include_unauthenticated: booleanProp(
+            'Optional search flag for unauthenticated messages. Default false.',
+          ),
         },
         ['action'],
       );
@@ -703,6 +715,10 @@ function stringProp(description: string): Record<string, unknown> {
 
 function numberProp(description: string): Record<string, unknown> {
   return { type: 'integer', description };
+}
+
+function booleanProp(description: string): Record<string, unknown> {
+  return { type: 'boolean', description };
 }
 
 function arrayProp(description: string): Record<string, unknown> {

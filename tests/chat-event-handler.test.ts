@@ -1311,6 +1311,7 @@ describe('handleChatEvent', () => {
     const payloadText = JSON.stringify(payloads[0]);
     expect(payloadText).toContain('<agentmail_attachment_read_instructions>');
     expect(payloadText).toContain('include_attachment_text:true');
+    expect(payloadText).toContain('zip_passwords');
     expect(payloadText).toContain('sandbox filesystem');
     const sessionEvent = runtimeEvents(env).find(
       (row) => row.event_type === 'cma_session_created',

@@ -3318,7 +3318,8 @@ function buildAgentMailAttachmentReadHint(
     '過去履歴に「添付を読めない」「sandboxに無い」とあっても古い結果の可能性があるため、現在の tool 能力で再確認する。',
     'sandbox filesystem、/mnt/session/uploads、env、bash、curl、Python で AgentMail を探さない。',
     '`agentmail_read` custom tool で対象メールを search し、get では `include_attachment_text:true` と `max_attachment_chars:60000` を指定する。',
-    '返り値の `message.attachment_text.items[].text` を根拠に、添付本文を読んだ上で要約・確認事項・返信草案を作る。',
+    'ユーザー発話にZIPパスワードが明示されている場合は、get に `zip_passwords:["<password>"]` を指定する。',
+    '返り値の `message.attachment_text.items[].text` を根拠に、Office/ZIP/Text添付本文を読んだ上で要約・確認事項・返信草案を作る。',
     '本当に `attachment_text` が無い、または notice が取得不能を示す場合だけ、確認した tool 結果を根拠に読めないと伝える。',
     '</agentmail_attachment_read_instructions>',
   ].join('\n');
