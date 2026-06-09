@@ -146,6 +146,59 @@ describe('AgentMailClient.getMessage', () => {
 });
 
 describe('AgentMailClient.getMessageAttachment', () => {
+  it('follows AgentMail download_url descriptors without forwarding Authorization', async () => {
+    const calls: Array<{ url: string; authorization: string | undefined }> = [];
+    const fetchMock = makeFetchMock(async (url, init) => {
+      calls.push({
+        url,
+        authorization: (init.headers as Record<string, string>)['authorization'],
+      });
+      if (url.endsWith('/messages/msg_x/attachments/att_x')) {
+        return jsonResponse(200, {
+          attachment_id: 'att_x',
+          download_url: 'https://signed.agentmail-download.test/att_x?sig=ok',
+          filename: 'sample.docx',
+        });
+      }
+      if (url === 'https://signed.agentmail-download.test/att_x?sig=ok') {
+        return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
+          status: 200,
+          headers: { 'content-type': 'application/octet-stream' },
+        });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+
+    const data = await client.getMessageAttachment(INBOX, 'msg_x', 'att_x');
+
+    expect([...data]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    expect(calls).toEqual([
+      {
+        url: `https://api.agentmail.to/v0/inboxes/${INBOX}/messages/msg_x/attachments/att_x`,
+        authorization: `Bearer ${API_KEY}`,
+      },
+      {
+        url: 'https://signed.agentmail-download.test/att_x?sig=ok',
+        authorization: undefined,
+      },
+    ]);
+  });
+
+  it('blocks non-HTTPS attachment download_url values', async () => {
+    const fetchMock = makeFetchMock(async () =>
+      jsonResponse(200, {
+        attachment_id: 'att_x',
+        download_url: 'http://signed.agentmail-download.test/att_x',
+      }),
+    );
+    const client = new AgentMailClient(API_KEY, { fetchImpl: fetchMock });
+
+    await expect(client.getMessageAttachment(INBOX, 'msg_x', 'att_x')).rejects.toThrow(
+      /egress denied/,
+    );
+  });
+
   it('rejects oversized downloads using Content-Length before reading the body', async () => {
     const fetchMock = makeFetchMock(async () =>
       new Response('too large', {
