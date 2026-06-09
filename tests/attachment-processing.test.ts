@@ -584,6 +584,30 @@ describe('extractXlsxText', () => {
     expect(res.text).toContain('Hello\tWorld');
     expect(res.text).toContain('inline\t42');
   });
+
+  it('extracts namespaced worksheet cells with direct string values', () => {
+    const sharedStrings = '<?xml version="1.0"?><x:sst xmlns:x="main" />';
+    const sheet =
+      '<?xml version="1.0"?><x:worksheet xmlns:x="main"><x:sheetData>' +
+      '<x:row r="4"><x:c r="A4" t="str"><x:v>合言葉</x:v></x:c>' +
+      '<x:c r="B4" t="str"><x:v>くじら雲-322-xlsx</x:v></x:c></x:row>' +
+      '<x:row r="5"><x:c r="A5" t="str"><x:v>判定文</x:v></x:c>' +
+      '<x:c r="B5" t="str"><x:v>XLSX添付読取成功</x:v></x:c></x:row>' +
+      '</x:sheetData></x:worksheet>';
+    const workbook =
+      '<?xml version="1.0"?><x:workbook xmlns:x="main"><x:sheets>' +
+      '<x:sheet name="添付読取テスト" sheetId="1" r:id="rId1"/>' +
+      '</x:sheets></x:workbook>';
+    const xlsx = zipSync({
+      'xl/sharedStrings.xml': strToU8(sharedStrings),
+      'xl/workbook.xml': strToU8(workbook),
+      'xl/worksheets/sheet1.xml': strToU8(sheet),
+    });
+    const res = extractXlsxText(xlsx, 1000);
+    expect(res.truncated).toBe(false);
+    expect(res.text).toContain('合言葉\tくじら雲-322-xlsx');
+    expect(res.text).toContain('判定文\tXLSX添付読取成功');
+  });
 });
 
 describe('extractPptxText', () => {
