@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -35,7 +36,16 @@ export function buildDefaultDeployMessage(env = process.env) {
   if (explicit) return explicit;
 
   const head = readHeadCommit();
-  return head ? `cf-repo=${head}` : "cf-repo=unknown";
+  const parts = [head ? `cf-repo=${head}` : "cf-repo=unknown"];
+  const manifestPath = (env.DEPLOY_GUARD_MANIFEST || "").trim();
+  if (manifestPath) {
+    const absPath = resolve(repoRoot, manifestPath);
+    if (existsSync(absPath)) {
+      const hash = createHash("sha256").update(readFileSync(absPath)).digest("hex").slice(0, 12);
+      parts.push(`manifest=${hash}`);
+    }
+  }
+  return parts.join(" ");
 }
 
 export function isWorkersAuthFailure(output) {

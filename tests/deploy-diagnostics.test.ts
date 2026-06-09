@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   buildDefaultDeployMessage,
   buildDeployFailureMessage,
@@ -43,6 +45,17 @@ describe("deploy diagnostics", () => {
   it("prefers CF_DEPLOY_MESSAGE for deploy lineage", () => {
     expect(buildDefaultDeployMessage({ CF_DEPLOY_MESSAGE: "cf-repo=abc issue=246" })).toBe(
       "cf-repo=abc issue=246",
+    );
+  });
+
+  it("adds deploy manifest hash to the default deploy message", () => {
+    const expected = createHash("sha256")
+      .update(readFileSync("package.json"))
+      .digest("hex")
+      .slice(0, 12);
+
+    expect(buildDefaultDeployMessage({ DEPLOY_GUARD_MANIFEST: "package.json" })).toContain(
+      `manifest=${expected}`,
     );
   });
 });
