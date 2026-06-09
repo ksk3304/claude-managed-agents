@@ -385,6 +385,7 @@ describe("deploy guard", () => {
 
   it("allows a makoto-prime prompt deployment marker when local prompt bundle matches", () => {
     const root = makeGitRoot();
+    const codeCommit = git(root, ["rev-parse", "HEAD"]);
     mkdirSync(path.join(root, "src/data"), { recursive: true });
     writeFileSync(
       path.join(root, "src/data/persona-spec.ts"),
@@ -405,6 +406,11 @@ describe("deploy guard", () => {
             "persona=94601c72a58c tools=938bb2c3c403 issue=331",
         },
       },
+      {
+        id: "code-deploy",
+        created_on: "2026-06-08T11:20:36Z",
+        annotations: { "workers/message": `cf-repo=${codeCommit}` },
+      },
     ];
 
     const lineage = collectServingLineage(root, readDeployTarget(root), {
@@ -412,9 +418,64 @@ describe("deploy guard", () => {
     });
 
     expect(lineage.ok).toBe(true);
-    expect(lineage.servingContained).toBe(false);
+    expect(lineage.effective.source).toBe("latest_prompt_deployment");
+    expect(lineage.effective.codeCommit).toBe(codeCommit);
+    expect(lineage.servingContained).toBe(true);
     expect(lineage.servingPromptBundlePreserved).toBe(true);
     expect(lineage.failures).toEqual([]);
+  });
+
+  it("uses previous code deployment as manifest base when latest deployment is a prompt bundle", () => {
+    const root = makeGitRoot();
+    const codeCommit = git(root, ["rev-parse", "HEAD"]);
+    mkdirSync(path.join(root, "src/data"), { recursive: true });
+    writeFileSync(
+      path.join(root, "src/data/persona-spec.ts"),
+      'export const PERSONA_SPEC_SHA256_HEX12 = "94601c72a58c";\n',
+    );
+    writeFileSync(
+      path.join(root, "src/data/tools-spec.ts"),
+      'export const TOOLS_SPEC_SHA256_HEX12 = "938bb2c3c403";\n',
+    );
+    writeFileSync(path.join(root, "fix.txt"), "candidate\n");
+    git(root, ["add", "fix.txt"]);
+    git(root, ["commit", "-m", "fix candidate"]);
+    const head = git(root, ["rev-parse", "HEAD"]);
+    const manifestPath = writeManifest(root, {
+      base: codeCommit,
+      rollback: codeCommit,
+      allowed: [head],
+    });
+    const makotoPrimeCommit = "3d9da9caa19956bf89e0b7751ca9294815d34289";
+
+    const result = evaluateDeployGuard(root, {
+      fetchRemote: false,
+      manifestPath,
+      env: {
+        GITHUB_ACTIONS: "true",
+        GITHUB_REF_NAME: "main",
+      },
+      deployments: [
+        {
+          id: "prompt-deploy",
+          created_on: "2026-06-08T11:30:36Z",
+          annotations: {
+            "workers/message":
+              `makoto-prime=${makotoPrimeCommit} cf-repo=${makotoPrimeCommit} ` +
+              "persona=94601c72a58c tools=938bb2c3c403 issue=331",
+          },
+        },
+        {
+          id: "code-deploy",
+          created_on: "2026-06-08T11:20:36Z",
+          annotations: { "workers/message": `cf-repo=${codeCommit}` },
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.servingLineage.effective.codeCommit).toBe(codeCommit);
+    expect(result.deployManifest.range).toEqual([head]);
   });
 
   it("blocks deploy when a must-preserve commit would be dropped", () => {

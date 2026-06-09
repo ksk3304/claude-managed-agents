@@ -257,20 +257,26 @@ export function findEffectiveServingCommit(deployments, versions = []) {
   const latestCommit = extractCfRepoCommit(deploymentMessage(latest, versionsById));
   if (latestCommit) {
     const message = deploymentMessage(latest, versionsById);
+    const promptDeployment = isMakotoPrimePromptDeploymentMessage(message);
+    const previousCode = promptDeployment
+      ? findPreviousCodeDeployment(ordered.slice(1), versionsById)
+      : null;
     return {
-      ok: true,
+      ok: !promptDeployment || Boolean(previousCode?.commit),
       latestHadCfRepo: true,
-      source: 'latest_deployment',
+      source: promptDeployment ? 'latest_prompt_deployment' : 'latest_deployment',
       commit: latestCommit,
       message,
       latestDeploymentId: latest?.id ?? '',
-      codeDeploymentId: latest?.id ?? '',
+      codeCommit: previousCode?.commit ?? latestCommit,
+      codeMessage: previousCode?.message ?? message,
+      codeDeploymentId: previousCode?.deploymentId ?? latest?.id ?? '',
     };
   }
   for (const deployment of ordered.slice(1)) {
     const message = deploymentMessage(deployment, versionsById);
     const commit = extractCfRepoCommit(message);
-    if (commit) {
+    if (commit && !isMakotoPrimePromptDeploymentMessage(message)) {
       return {
         ok: true,
         latestHadCfRepo: false,
@@ -278,6 +284,8 @@ export function findEffectiveServingCommit(deployments, versions = []) {
         commit,
         message,
         latestDeploymentId: latest?.id ?? '',
+        codeCommit: commit,
+        codeMessage: message,
         codeDeploymentId: deployment?.id ?? '',
       };
     }
@@ -290,6 +298,25 @@ export function findEffectiveServingCommit(deployments, versions = []) {
     latestDeploymentId: latest?.id ?? '',
     codeDeploymentId: '',
   };
+}
+
+function isMakotoPrimePromptDeploymentMessage(message = '') {
+  return Boolean(
+    extractDeployMarker(message, 'makoto-prime') &&
+      extractDeployMarker(message, 'persona') &&
+      extractDeployMarker(message, 'tools'),
+  );
+}
+
+function findPreviousCodeDeployment(deployments, versionsById) {
+  for (const deployment of deployments) {
+    const message = deploymentMessage(deployment, versionsById);
+    const commit = extractCfRepoCommit(message);
+    if (commit && !isMakotoPrimePromptDeploymentMessage(message)) {
+      return { commit, message, deploymentId: deployment?.id ?? '' };
+    }
+  }
+  return null;
 }
 
 export function readDeployTarget(root) {
@@ -569,7 +596,10 @@ export function collectDeployManifestGuard(root, git, servingLineage, options = 
     failures.push(`deploy manifest environment must be production, got ${manifest.environment}`);
   }
 
-  const servingBase = String(manifest.serving_base_commit ?? servingLineage?.effective?.commit ?? '');
+  const expectedServingBase = String(
+    servingLineage?.effective?.codeCommit || servingLineage?.effective?.commit || '',
+  );
+  const servingBase = String(manifest.serving_base_commit ?? expectedServingBase);
   const rollbackTarget = String(manifest.rollback_target_commit ?? '');
   if (servingBase && !revParseCommit(root, servingBase)) {
     failures.push(`deploy manifest serving_base_commit not found locally: ${servingBase}`);
@@ -577,9 +607,9 @@ export function collectDeployManifestGuard(root, git, servingLineage, options = 
   if (rollbackTarget && !revParseCommit(root, rollbackTarget)) {
     failures.push(`deploy manifest rollback_target_commit not found locally: ${rollbackTarget}`);
   }
-  if (servingLineage?.effective?.commit && servingBase && shortCommit(servingLineage.effective.commit) !== shortCommit(revParseCommit(root, servingBase) || servingBase)) {
+  if (expectedServingBase && servingBase && shortCommit(expectedServingBase) !== shortCommit(revParseCommit(root, servingBase) || servingBase)) {
     failures.push(
-      `deploy manifest serving_base_commit ${shortCommit(servingBase)} does not match current serving cf-repo ${shortCommit(servingLineage.effective.commit)}`,
+      `deploy manifest serving_base_commit ${shortCommit(servingBase)} does not match current serving code cf-repo ${shortCommit(expectedServingBase)}`,
     );
   }
 
@@ -751,15 +781,25 @@ export function collectServingLineage(root, target, options = {}) {
   let servingError = '';
   let servingPromptBundlePreserved = false;
   let servingPromptBundleReason = '';
-  if (effective.commit) {
-    const check = commitIsAncestor(root, effective.commit);
+  const codeCommit = effective.codeCommit || effective.commit;
+  if (codeCommit) {
+    const check = commitIsAncestor(root, codeCommit);
     servingContained = check.ok;
     servingError = check.error;
     if (!check.ok) {
+      failures.push(`HEAD does not contain current serving cf-repo code line (${shortCommit(codeCommit)})`);
+    }
+  } else if (effective.commit) {
+    failures.push('could not determine current serving code cf-repo from Cloudflare deployment metadata');
+  }
+
+  if (effective.commit && effective.commit !== codeCommit) {
+    const latestCheck = commitIsAncestor(root, effective.commit);
+    if (!latestCheck.ok) {
       const promptPreserve = currentPromptBundlePreservesDeployment(
         root,
         effective.message,
-        check.error,
+        latestCheck.error,
       );
       servingPromptBundlePreserved = promptPreserve.ok;
       servingPromptBundleReason = promptPreserve.reason;
@@ -768,6 +808,9 @@ export function collectServingLineage(root, target, options = {}) {
         if (promptPreserve.reason) failures.push(promptPreserve.reason);
       }
     }
+  } else if (effective.commit && effective.commit === codeCommit) {
+    servingPromptBundlePreserved = false;
+    servingPromptBundleReason = '';
   }
 
   const mustPreserveChecks = mustPreserve.map((entry) => {
@@ -943,12 +986,18 @@ export function renderReport(result) {
         `[deploy-guard] serving_cf_repo=${shortCommit(lineage.effective.commit)}` +
           ` source=${lineage.effective.source}`,
       );
+      if (lineage.effective.codeCommit && lineage.effective.codeCommit !== lineage.effective.commit) {
+        lines.push(
+          `[deploy-guard] serving_code_cf_repo=${shortCommit(lineage.effective.codeCommit)}` +
+            ` code_deployment=${lineage.effective.codeDeploymentId || '(unknown)'}`,
+        );
+      }
     }
     if (lineage.effective?.source === 'previous_code_deployment') {
       lines.push('[deploy-guard] note: latest deployment has no cf-repo; using previous marked code deployment as effective lineage');
     }
     if (lineage.servingContained) {
-      lines.push('[deploy-guard] OK HEAD contains current serving cf-repo');
+      lines.push('[deploy-guard] OK HEAD contains current serving code cf-repo');
     }
     if (lineage.servingPromptBundlePreserved) {
       lines.push(`[deploy-guard] OK current serving prompt bundle preserved: ${lineage.servingPromptBundleReason}`);
