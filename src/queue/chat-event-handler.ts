@@ -156,6 +156,19 @@ import type { EmailSendMarker } from '../types/agentmail';
 import { recordRuntimeEvent, stableHash } from '../lib/observability';
 import { postChatPlaceholderResult } from '../lib/chat-placeholder';
 import { externalSideEffectsDisabled } from '../lib/staging-safety';
+import {
+  briefDateLabelFromEventKey,
+  briefExpiresAtMs,
+  briefJobIdFromEventKey,
+  buildBriefSuggestionFollowupContext,
+  buildFullBriefRequestContext,
+  isBriefSuggestionFollowup,
+  isFullBriefRequest,
+  parseBriefSuggestionMarkers,
+  readLatestBriefSuggestion,
+  storeBriefSuggestions,
+  stripBriefSkipMarker,
+} from '../lib/brief-suggestion';
 
 const CHAT_SCOPE_LOCK_TTL_MS = 10 * 60 * 1000;
 const MORNING_BRIEF_EVENT_KEY_PREFIX = 'scheduled:morning_brief_seto:';
@@ -568,6 +581,54 @@ export async function handleChatEvent(
     return { kind: 'committed' };
   }
 
+  const originalBodyText = bodyText;
+  const fullBriefRequested = !isAutonomousEvent && isFullBriefRequest(originalBodyText);
+  if (!isAutonomousEvent && isBriefSuggestionFollowup(originalBodyText)) {
+    try {
+      const row = await readLatestBriefSuggestion(env.DB, {
+        userSlug: userMapping.user_slug,
+        nowMs: Date.now(),
+      });
+      if (row) {
+        const context = buildBriefSuggestionFollowupContext(row);
+        bodyText = `${context}\n\n${bodyText}`;
+        await recordRuntimeEvent(env, {
+          eventKey,
+          messageId: message.name,
+          userSlug: userMapping.user_slug,
+          eventType: 'brief_suggestion_followup_context_injected',
+          source: 'chat-event-handler',
+          detail: {
+            suggestion_id: row.suggestion_id,
+            suggestion_event_key: row.event_key,
+            task_key: row.task_key,
+          },
+        });
+      }
+    } catch (error) {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'brief_suggestion_followup_context_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
+  if (fullBriefRequested) {
+    bodyText = `${buildFullBriefRequestContext()}\n\n${bodyText}`;
+    await recordRuntimeEvent(env, {
+      eventKey,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'full_brief_context_injected',
+      source: 'chat-event-handler',
+      detail: { trigger_chars: originalBodyText.length },
+    });
+  }
+
   const threadSessionKey = chatThreadSessionKey(senderEmail, spaceName, threadName);
   const chatScopeKey = threadSessionKey ?? `chat_event_scope:${eventKey}`;
   const chatScopeLock = getThreadLock(env, chatScopeKey);
@@ -915,7 +976,7 @@ export async function handleChatEvent(
   //     ここで /mail や /schedule の skill 自体を invoke することはしない
   //     (= Python の `_resolve_skill_run` までは中間版で port していないため、
   //     intent 検出は session ephemeral 化と prefix log の効果に限定)。
-  let intent = isAutonomousEvent
+  let intent = isAutonomousEvent || fullBriefRequested
     ? null
     : detectActionSkillIntent(bodyText, ACTION_SKILL_INTENT_TABLE);
   if (!isAutonomousEvent && intent === null && isMailSendApprovalTurn(bodyText, historyBlock)) {
@@ -1700,7 +1761,82 @@ export async function handleChatEvent(
   if (finalMarkerExtraction.markerFound) {
     console.log(`[chat-event] final marker extracted eventKey=${eventKey}`);
   }
-  const heartbeatNothingExtraction = extractHeartbeatNothingText(finalMarkerExtraction.text);
+  const briefSuggestionParsed = isSetoBriefEvent(eventKey)
+    ? parseBriefSuggestionMarkers(finalMarkerExtraction.text)
+    : { suggestions: [], failures: [], cleanedText: finalMarkerExtraction.text };
+  for (const failure of briefSuggestionParsed.failures) {
+    console.warn(
+      `[chat-event] BRIEF_SUGGESTION parse failure eventKey=${eventKey} reason=${failure.reason} raw=${failure.raw.slice(0, 200)}`,
+    );
+    await recordRuntimeEvent(env, {
+      eventKey,
+      sessionId,
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      eventType: 'brief_suggestion_parse_failed',
+      level: 'warn',
+      source: 'chat-event-handler',
+      detail: { reason: failure.reason },
+    });
+  }
+  const briefSkipExtraction = isSetoBriefEvent(eventKey)
+    ? stripBriefSkipMarker(briefSuggestionParsed.cleanedText)
+    : { text: briefSuggestionParsed.cleanedText, skip: false };
+  if (briefSkipExtraction.skip) {
+    console.log(`[chat-event] brief skip marker suppressed eventKey=${eventKey}`);
+    if (placeholderName) {
+      await safeDeletePlaceholder(env, placeholderName, eventKey);
+    }
+    await safeCommit(env, eventKey, claim, {
+      messageId: message.name,
+      userSlug: userMapping.user_slug,
+      reason: 'brief_skip_marker',
+      stage: 'final_chat_reply',
+      outcome: 'committed',
+      detail: { marker: 'BRIEF_SKIP' },
+    });
+    return { kind: 'committed' };
+  }
+  if (briefSuggestionParsed.suggestions.length > 0) {
+    const dateLabel = briefDateLabelFromEventKey(eventKey, body.receivedAtMs);
+    try {
+      const stored = await storeBriefSuggestions(env.DB, {
+        userSlug: userMapping.user_slug,
+        eventKey,
+        jobId: briefJobIdFromEventKey(eventKey),
+        dateLabel,
+        createdAtMs: Date.now(),
+        expiresAtMs: briefExpiresAtMs(dateLabel),
+        visibleText: briefSkipExtraction.text,
+        suggestions: briefSuggestionParsed.suggestions,
+      });
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'brief_suggestions_stored',
+        source: 'chat-event-handler',
+        detail: {
+          stored,
+          date_label: dateLabel,
+          job_id: briefJobIdFromEventKey(eventKey),
+        },
+      });
+    } catch (error) {
+      await recordRuntimeEvent(env, {
+        eventKey,
+        sessionId,
+        messageId: message.name,
+        userSlug: userMapping.user_slug,
+        eventType: 'brief_suggestions_store_failed',
+        level: 'warn',
+        source: 'chat-event-handler',
+        detail: { error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
+  const heartbeatNothingExtraction = extractHeartbeatNothingText(briefSkipExtraction.text);
   if (heartbeatNothingExtraction.suppress) {
     console.log(`[chat-event] heartbeat nothing marker suppressed eventKey=${eventKey}`);
     if (placeholderName) {
@@ -2490,7 +2626,7 @@ function scrubActionMarkerLeakForChat(
   }
   const normalized = text.toLowerCase();
   const rawMarkerSyntax =
-    /`?\b(email_send|chat_post|schedule_action)\b`?\s*:\s*\{/i.test(text);
+    /`?\b(email_send|chat_post|schedule_action|brief_suggestion)\b`?\s*:\s*\{/i.test(text);
   const processingStateTalk =
     text.includes('処理中') ||
     text.includes('処理しています') ||
@@ -2504,6 +2640,7 @@ function scrubActionMarkerLeakForChat(
     (normalized.includes('email_send') ||
       normalized.includes('chat_post') ||
       normalized.includes('schedule_action') ||
+      normalized.includes('brief_suggestion') ||
       text.includes('マーカー'));
   const leaks =
     rawMarkerSyntax || botProcessingMarkerTalk;
@@ -2519,10 +2656,10 @@ function scrubActionMarkerLeakForChat(
 function redactActionMarkerTermsForChat(text: string): string {
   return text
     .replace(
-      /`?\b(email_send|chat_post|schedule_action)\b`?\s*:\s*\{[\s\S]*?\}/gi,
+      /`?\b(email_send|chat_post|schedule_action|brief_suggestion)\b`?\s*:\s*\{[\s\S]*?\}/gi,
       '（内部用の実行記法を伏せました）',
     )
-    .replace(/`?\b(email_send|chat_post|schedule_action)\b`?/gi, '内部用マーカー')
+    .replace(/`?\b(email_send|chat_post|schedule_action|brief_suggestion)\b`?/gi, '内部用マーカー')
     .replace(/bot\s*側/gi, '内部側')
     .replace(/bot側/gi, '内部側');
 }
