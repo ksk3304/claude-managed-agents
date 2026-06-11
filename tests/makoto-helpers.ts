@@ -39,6 +39,7 @@ interface MakotoTables {
   cma_session_binds: FakeRow[];
   cma_session_payload_audit: FakeRow[];
   heartbeat_tasks: Map<string, FakeRow>;
+  brief_suggestions: Map<string, FakeRow>;
 }
 
 export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
@@ -55,6 +56,7 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
     cma_session_binds: [],
     cma_session_payload_audit: [],
     heartbeat_tasks: new Map(),
+    brief_suggestions: new Map(),
   };
 
   function exec(
@@ -442,6 +444,73 @@ export function makeMakotoDb(): D1Database & { _tables: MakotoTables } {
         payload_chars,
       });
       return { results: [], meta: { changes: 1 } };
+    }
+
+    // ----- brief_suggestions -----
+    if (
+      /^INSERT OR REPLACE INTO brief_suggestions \(suggestion_id, tenant_id, user_slug, date_label, job_id, event_key, suggestion_rank, task_key, task_title, support_action, promised_outcome, urgency_note, visible_text, raw_json, status, created_at_ms, expires_at_ms\) VALUES \(\?1, \?2, \?3, \?4, \?5, \?6, \?7, \?8, \?9, \?10, \?11, \?12, \?13, \?14, 'active', \?15, \?16\)$/i.test(
+        trimmed,
+      )
+    ) {
+      const [
+        suggestion_id,
+        tenant_id,
+        user_slug,
+        date_label,
+        job_id,
+        event_key,
+        suggestion_rank,
+        task_key,
+        task_title,
+        support_action,
+        promised_outcome,
+        urgency_note,
+        visible_text,
+        raw_json,
+        created_at_ms,
+        expires_at_ms,
+      ] = params;
+      tables.brief_suggestions.set(String(suggestion_id), {
+        suggestion_id,
+        tenant_id,
+        user_slug,
+        date_label,
+        job_id,
+        event_key,
+        suggestion_rank,
+        task_key,
+        task_title,
+        support_action,
+        promised_outcome,
+        urgency_note,
+        visible_text,
+        raw_json,
+        status: 'active',
+        created_at_ms,
+        expires_at_ms,
+      });
+      return { results: [], meta: { changes: 1 } };
+    }
+    if (
+      /^SELECT suggestion_id, tenant_id, user_slug, date_label, job_id, event_key, suggestion_rank, task_key, task_title, support_action, promised_outcome, urgency_note, visible_text, created_at_ms, expires_at_ms, status FROM brief_suggestions WHERE tenant_id = \?1 AND user_slug = \?2 AND status = 'active' AND expires_at_ms > \?3 ORDER BY created_at_ms DESC, suggestion_rank ASC LIMIT 1$/i.test(
+        trimmed,
+      )
+    ) {
+      const [tenantId, userSlug, nowMs] = params as [string, string, number];
+      const row = [...tables.brief_suggestions.values()]
+        .filter(
+          (r) =>
+            r.tenant_id === tenantId &&
+            r.user_slug === userSlug &&
+            r.status === 'active' &&
+            Number(r.expires_at_ms) > Number(nowMs),
+        )
+        .sort((a, b) => {
+          const createdDiff = Number(b.created_at_ms) - Number(a.created_at_ms);
+          if (createdDiff !== 0) return createdDiff;
+          return Number(a.suggestion_rank) - Number(b.suggestion_rank);
+        })[0];
+      return { results: row ? [row] : [] };
     }
     const obsDelete = trimmed.match(
       /^DELETE FROM (cma_chat_webhook_payloads|cma_worker_runtime_events|cma_session_binds|cma_session_payload_audit) WHERE expire_at_ms < \?$/i,

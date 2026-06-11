@@ -4059,6 +4059,171 @@ describe('handleChatEvent', () => {
     );
   });
 
+  it('scheduled brief stores hidden suggestion contract and strips marker from Chat text', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.eventKey = 'scheduled:morning_brief_seto:2026-06-11:contract';
+    msg.claim.owner = 'cron-morning-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_morning_contract',
+      events: [
+        {
+          type: 'agent.message',
+          content: [
+            {
+              type: 'text',
+              text:
+                '===BRIEF_FINAL===\n' +
+                'BRIEF_SUGGESTION:{"items":[{"rank":1,"task_key":"issue-416","task_title":"Issue 416整理","support_action":"論点を整理する","promised_outcome":"PR候補まで絞る"}]}\n' +
+                '瀬戸さん、おはようございます。Issue 416は僕が論点を整理すると、PR候補まで絞れます。必要なら言ってください。',
+            },
+          ],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.patches[0]!.text).toContain('瀬戸さん、おはようございます。');
+    expect(chatApiMock.patches[0]!.text).not.toContain('BRIEF_SUGGESTION');
+    const rows = [
+      ...(env.DB as unknown as ReturnType<typeof makeMakotoDb>)._tables.brief_suggestions.values(),
+    ];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      user_slug: 'alice',
+      date_label: '2026-06-11',
+      task_key: 'issue-416',
+      task_title: 'Issue 416整理',
+      support_action: '論点を整理する',
+      promised_outcome: 'PR候補まで絞る',
+    });
+    expect(runtimeEvents(env).some((row) => row.event_type === 'brief_suggestions_stored')).toBe(
+      true,
+    );
+  });
+
+  it('midday brief skip marker deletes placeholder and posts no final text', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({});
+    msg.eventKey = 'scheduled:midday_brief_seto:2026-06-11:skip';
+    msg.claim.owner = 'cron-midday-brief-seto:test-owner';
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+
+    installFakeAnthropic({
+      sessionId: 'sesn_midday_skip',
+      events: [
+        {
+          type: 'agent.message',
+          content: [{ type: 'text', text: '===BRIEF_FINAL===\n===BRIEF_SKIP===' }],
+        },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(chatApiMock.posts).toHaveLength(1);
+    expect(chatApiMock.posts[0]!.text).toBe('... MAKOTOくんが入力中');
+    expect(chatApiMock.patches).toHaveLength(0);
+    expect(chatApiMock.deletes).toEqual(['spaces/AAA/messages/m_1']);
+    expect(commitDecision(env, 'brief_skip_marker')).toBeDefined();
+  });
+
+  it('brief follow-up phrase injects the latest stored task/action/goal context', async () => {
+    const env = buildEnv();
+    const db = env.DB as unknown as ReturnType<typeof makeMakotoDb>;
+    db._tables.brief_suggestions.set('suggestion-1', {
+      suggestion_id: 'suggestion-1',
+      tenant_id: 'makoto-prime',
+      user_slug: 'alice',
+      date_label: '2026-06-11',
+      job_id: 'morning_brief_seto',
+      event_key: 'scheduled:morning_brief_seto:2026-06-11:contract',
+      suggestion_rank: 1,
+      task_key: 'issue-416',
+      task_title: 'Issue 416整理',
+      support_action: '論点を整理する',
+      promised_outcome: 'PR候補まで絞る',
+      urgency_note: null,
+      visible_text: '瀬戸さん、おはようございます。',
+      created_at_ms: Date.now(),
+      expires_at_ms: Date.now() + 60_000,
+      status: 'active',
+    });
+    const msg = buildQueueMsg({ text: 'じゃあお願い' });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const sendCapturePayloads: unknown[] = [];
+
+    installFakeAnthropic({
+      sessionId: 'sesn_brief_followup',
+      sendCapturePayloads,
+      events: [
+        { type: 'agent.message', content: [{ type: 'text', text: '論点整理に入ります。' }] },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(JSON.stringify(sendCapturePayloads)).toContain('<brief_suggestion_context>');
+    expect(JSON.stringify(sendCapturePayloads)).toContain('Issue 416整理');
+    expect(JSON.stringify(sendCapturePayloads)).toContain('PR候補まで絞る');
+    expect(runtimeEvents(env).some((row) => row.event_type === 'brief_suggestion_followup_context_injected')).toBe(
+      true,
+    );
+  });
+
+  it('full brief trigger injects explicit full brief context', async () => {
+    const env = buildEnv();
+    const msg = buildQueueMsg({
+      text: '今日の予定とTODO見せて',
+      threadName: 'spaces/AAA/threads/TFULLBRIEF',
+    });
+    await preClaim(env, msg.eventKey, msg.claim.owner);
+    await putMapping(env, 'alice@example.com');
+    const threadKey = chatThreadSessionKey(
+      'alice@example.com',
+      'spaces/AAA',
+      'spaces/AAA/threads/TFULLBRIEF',
+    );
+    expect(threadKey).not.toBeNull();
+    await env.MAKOTO_KV.put(threadKey!, 'sesn_existing_full_brief');
+    const created: unknown[] = [];
+    const sendCapturePayloads: unknown[] = [];
+    const sendCaptureSessionIds: string[] = [];
+
+    installFakeAnthropic({
+      sessionId: 'sesn_full_brief',
+      createCapture: created,
+      sendCapturePayloads,
+      sendCaptureSessionIds,
+      events: [
+        { type: 'agent.message', content: [{ type: 'text', text: '今日の全体を要約します。' }] },
+        { type: 'session.status_idle', stop_reason: 'end_turn' },
+      ],
+    });
+
+    const result = await handleChatEvent(env, {} as ExecutionContext, msg);
+
+    expect(result.kind).toBe('committed');
+    expect(created).toEqual([]);
+    expect(sendCaptureSessionIds).toEqual(['sesn_existing_full_brief']);
+    expect(JSON.stringify(sendCapturePayloads)).toContain('<full_brief_request>');
+    expect(runtimeEvents(env).some((row) => row.event_type === 'full_brief_context_injected')).toBe(
+      true,
+    );
+  });
+
   it('autonomous scheduled shared event bypasses mention filter and replies in the provided thread', async () => {
     const env = buildEnv();
     const msg = buildQueueMsg({

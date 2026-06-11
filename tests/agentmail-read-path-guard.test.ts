@@ -7,6 +7,7 @@ const SRC_ROOT = join(process.cwd(), 'src');
 const INBOX_LIST_OWNER = 'src/lib/agentmail-api.ts';
 const INCLUDE_SPAM_OWNERS = new Set([
   INBOX_LIST_OWNER,
+  'src/lib/makoto-capability-registry.ts',
   'src/tools/agentmail-read.ts',
   'src/data/tools-spec.ts',
 ]);
